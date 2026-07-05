@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# VS Code
+.vscode/
+# !.vscode/extensions.json
+
+# Claude Code
+.claude/
+
+# Backups / scratch
+_old/
+*_old/
+* - Copy.*
+*.bak
+*.orig
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Project-generated
+results/
