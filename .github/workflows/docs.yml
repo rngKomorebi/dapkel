@@ -47,5 +47,27 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - id: pages
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const { data } = await github.rest.repos.getPages({
+                owner: context.repo.owner,
+                repo: context.repo.repo
+              });
+              core.setOutput(
+                "can_deploy",
+                data.build_type === "workflow" ? "true" : "false"
+              );
+            } catch (error) {
+              if (error.status === 404) {
+                core.info("Pages is not enabled for this repository; skipping deploy.");
+                core.setOutput("can_deploy", "false");
+                return;
+              }
+              throw error;
+            }
       - id: deployment
+        if: ${{ steps.pages.outputs.can_deploy == 'true' }}
         uses: actions/deploy-pages@v4
