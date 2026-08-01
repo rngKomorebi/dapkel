@@ -1,2 +1,14 @@
+# Runtime dependencies, mirroring [project.dependencies] in pyproject.toml.
+# pyproject.toml is the source of truth; this file exists only for the
+# "clone the repo, then pip install -r" path. Prefer:
+#
+#     pip install -e ".[dev,docs]"
+#
+# which installs these plus the test and documentation tooling.
+komorebi_mpl>=0.0.5
+matplotlib>=3.8
 numpy>=1.24
-matplotlib==3.10.8
+pandas>=2.0
+pyarrow>=14
+scipy>=1.10
+tqdm>=4.60

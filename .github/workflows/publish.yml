@@ -1,16 +1,81 @@
 name: Publish to PyPI
 
+# Fires when you publish a release on the GitHub web UI (Releases -> Draft a
+# new release -> create the tag there -> Publish release). Creating the tag is
+# the only version bump needed: setuptools_scm derives the package version from
+# it, so nothing in the repo records a version number.
 on:
   release:
     types: [published]
 
 jobs:
-  build:
-    name: Build distribution
+  check:
+    name: Check tag against CHANGELOG
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Derive version from the release tag
+        id: version
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          version="${tag#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([abrc.].*)?$ ]]; then
+            echo "::error::Tag '$tag' is not a valid version tag." \
+                 "Use vMAJOR.MINOR.PATCH, e.g. v0.1.0."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Fails the release if CHANGELOG.md has no section for this version, so
+      # a tag can never ship without its entry.
+      - name: Extract release notes
+        run: |
+          python tools/changelog.py "${{ steps.version.outputs.version }}" \
+            > release-notes.md
+          cat release-notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+
+  test:
+    name: Test before release
+    needs: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the package with test extras
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  build:
+    name: Build distribution
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # setuptools_scm reads the tag the release was cut from.
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
@@ -25,6 +90,16 @@ jobs:
 
       - name: Check distribution metadata
         run: twine check dist/*
+
+      # The built version comes from the tag via setuptools_scm. If it does not
+      # match, the checkout is not sitting exactly on the tagged commit and the
+      # artifact would carry a '.dev0+g<sha>' local version PyPI rejects.
+      - name: Verify built version matches the tag
+        run: |
+          expected="${{ needs.check.outputs.version }}"
+          built=$(ls dist/*.tar.gz | sed -E 's|.*/dapkel-(.+)\.tar\.gz|\1|')
+          echo "tag says: $expected / built: $built"
+          test "$built" = "$expected"
 
       - name: Upload distribution artifacts
         uses: actions/upload-artifact@v4
@@ -50,3 +125,30 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  release-notes:
+    name: Fill release notes from CHANGELOG
+    needs: [check, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # editing the release body
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+
+      - name: Update the release body
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          {
+            cat release-notes.md
+            echo
+            echo "---"
+            echo "Install: \`pip install dapkel==$VERSION\`"
+          } > body.md
+          gh release edit "$TAG" \
+            --repo "${{ github.repository }}" \
+            --notes-file body.md
