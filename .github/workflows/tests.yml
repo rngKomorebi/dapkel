@@ -18,7 +18,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.10", "3.13"]
+        # Every version the package claims support for in pyproject.toml.
+        # Keep these two lists in step when you add or drop a version.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
