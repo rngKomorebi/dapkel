@@ -1,0 +1,83 @@
+site_name: dapkel
+site_description: Data Analysis Package for the Kelpie v2 SPAD camera
+site_url: https://rngkomorebi.github.io/dapkel/
+repo_url: https://github.com/rngKomorebi/dapkel
+edit_uri: edit/main/docs/
+
+# Unresolved references and stale nav entries are build errors, not warnings,
+# so prose that drifts away from the code fails instead of shipping.
+strict: true
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: numpy
+            show_source: true
+            show_root_heading: true
+            show_root_full_path: false
+            members_order: source
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            merge_init_into_class: true
+            docstring_section_style: table
+            filters: ["!^_"]
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  # Lets docs/changelog.md pull in the repo's CHANGELOG.md verbatim, so the
+  # two can never disagree.
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Analyses:
+      - Decoding .bin files: guide/unpack.md
+      - Data quality: guide/data_quality.md
+      - Dark count rate: guide/dcr.md
+      - Cross-talk: guide/crosstalk.md
+      - Hitmaps: guide/hitmap.md
+      - TDC calibration: guide/tdc_calibration.md
+      - Coincidences: guide/coincidences.md
+  - Reference:
+      - dapkel.core: api/core.md
+      - Adding an analysis: adding_an_analysis.md
+      - Triangular delta-t background: ort_triangle_background.md
+      - Changelog: changelog.md

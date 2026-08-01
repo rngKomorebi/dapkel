@@ -1,35 +1,11 @@
-"""Module for computing and plotting dark count rate (DCR) maps.
+"""Dark count rate (DCR) maps, per quadrant and full-sensor.
 
-This script utilizes an unpacking module used specifically for the
-Kelpie v2 DDR3 binary data output.
+DCR is accumulated photon counts divided by the time the sensor was actually
+collecting. That live time is NOT the frame period: under the current
+``short_window`` firmware only the user-set ``acq_window`` of each ~9 us frame is
+photon-sensitive, so ``acq_window`` is required.
 
-This file can also be imported as a module and contains the following
-functions:
-
-    * compute_dcr_32 - unpack the '.bin' files for a single SPAD tag
-    and compute the (32, 32) dark count rate map. Use this on its own
-    when only the numbers are needed, with no plot.
-
-    * compute_dcr_64 - unpack the '.bin' files for all four SPAD tags
-    (S0C, S1C, S2C, S3C) and assemble the (64, 64) dark count rate map.
-    Use this on its own when only the numbers are needed, with no
-    plot.
-
-    * plot_heatmap - plot a dark count rate map as a 2D heatmap, given
-    an already computed DCR map.
-
-    * plot_distribution - plot the sorted per-pixel dark count rate
-    distribution, given an already computed DCR map.
-
-    * collect_and_plot_dcr_32 - given the data file parameters (path,
-    number of frames, frame length), unpack and compute the (32, 32)
-    dark count rate map for a single SPAD tag once and save both the
-    heatmap and the distribution plot.
-
-    * collect_and_plot_dcr_64 - given the data file parameters (path,
-    number of frames, frame length), unpack and compute the full
-    sensor (64, 64) dark count rate map once and save both the
-    heatmap and the distribution plot.
+See ``docs/guide/dcr.md``.
 """
 
 from __future__ import annotations
@@ -39,85 +15,48 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
-from tqdm import tqdm
 
-from dapkel.functions.unpack import unpack
+from dapkel.core import io, plots, reduce, store, timing
 
-CLK_PERIOD = 5e-9  # 200 MHz
-_FREE_RUNNING_US = 9.0  # base frame period when exp_time=0 is sent to the exe
-# actual = user_exp_time + 9 µs  (0 → 9 µs, 10 µs → 19 µs)
+# Re-exported for backwards compatibility: CLK_PERIOD now lives in
+# 'dapkel.core.timing'. Kept importable as 'dcr_analysis.CLK_PERIOD'.
+from dapkel.core.timing import CLK_PERIOD  # noqa: F401
 
+__all__ = [
+    # stage 1 - compute the DCR map from raw '.bin' files
+    "compute_dcr_32",
+    "compute_dcr_64",
+    # stage 1 - compute and persist ('.npy' + '.meta.json' sidecar)
+    "compute_and_save_dcr_32",
+    "compute_and_save_dcr_64",
+    # stage 2 - plot from an already computed map
+    "plot_heatmap",
+    "plot_distribution",
+    # drivers - folder in, figures on disk
+    "collect_and_plot_dcr_32",
+    "collect_and_plot_dcr_64",
+]
+
+#: Analysis name: the stage-1 file stem and results sub-folder.
+_KIND = "dcr"
+
+# SPAD (micropixel) layout inside one 2x2 macropixel, as (drow, dcol) array
+# offsets. The indices run CLOCKWISE, not row-major::
+#
+#     S0 (0,0)   S1 (0,1)
+#     S3 (1,0)   S2 (1,1)
+#
+# Kept identical to hitmap_analysis and crosstalk_analysis so the (64, 64)
+# assembly and the cross-talk directions agree.
 _SPAD_LAYOUT = {
     "S0C": (0, 0),
     "S1C": (0, 1),
-    "S2C": (1, 0),
-    "S3C": (1, 1),
+    "S2C": (1, 1),
+    "S3C": (1, 0),
 }
 
 
-def _resolve_frame_time(
-    folder: str, explicit: float | None, nframes: int
-) -> tuple[float, str]:
-    """Return (frame_time_seconds, human-readable source string).
 
-    Mirrors the GUI's _run_analysis logic exactly:
-      1. explicit --exp-time supplied → exp_time + 9 µs overhead
-      2. frame_rate_cnt.txt present  → ticks * CLK_PERIOD / nframes
-      3. fallback                    → 9 µs free-running base
-    """
-    if explicit is not None:
-        ft = explicit + _FREE_RUNNING_US * 1e-6
-        return (
-            ft,
-            f"exp_time={explicit * 1e6:.1f} µs + {_FREE_RUNNING_US:.0f} µs overhead",
-        )
-
-    cnt_file = os.path.join(folder, "frame_rate_cnt.txt")
-    try:
-        ticks = int(open(cnt_file).read().strip())
-        if ticks > 0:
-            ft = ticks * CLK_PERIOD / nframes
-            return ft, f"frame_rate_cnt.txt → {ft * 1e6:.4f} µs"
-    except (OSError, ValueError):
-        pass
-
-    ft = _FREE_RUNNING_US * 1e-6
-    return ft, f"fallback free-running ({_FREE_RUNNING_US} µs)"
-
-
-def _sorted_bin_files(folder: str, tag: str) -> list[str]:
-    """Find and naturally sort the '.bin' files for a SPAD tag.
-
-    Parameters
-    ----------
-    folder : str
-        Path to the folder with the '.bin' data files.
-    tag : str
-        SPAD quadrant tag ('S0C', 'S1C', 'S2C', 'S3C'), or '' to match
-        every '.bin' file in the folder.
-
-    Returns
-    -------
-    list[str]
-        Sorted list of paths to the matching '.bin' files.
-
-    Raises
-    ------
-    FileNotFoundError
-        Raised when no '.bin' files match the tag in the folder.
-    """
-    pattern = f"*_{tag}*.bin" if tag else "*.bin"
-    files = sorted(
-        glob.glob(os.path.join(folder, pattern)),
-        key=lambda fp: int(
-            "".join(filter(str.isdigit, os.path.basename(fp))) or "0"
-        ),
-    )
-    if not files:
-        raise FileNotFoundError(
-            f"No .bin files matching '{pattern}' found in:\n  {folder}"
-        )
-    return files
 
 
 def _accumulate_dcr(
@@ -150,10 +89,13 @@ def _accumulate_dcr(
     ValueError
         Raised when the total acquisition time works out to zero.
     """
-    photon_sum = np.zeros((32, 32), dtype=np.float64)
-    for fp in tqdm(files):
-        _, pc = unpack(fp, nframes, compute_time_series=False)
-        photon_sum += pc.sum(axis=2)
+    photon_sum = reduce.accumulate_frames(
+        files,
+        lambda ts, pc: pc.sum(axis=2),
+        nframes=nframes,
+        need_time_series=False,
+        label=label,
+    )
     total_time = nframes * len(files) * frame_time
     if total_time == 0:
         raise ValueError(
@@ -168,12 +110,15 @@ def compute_dcr_32(
     nframes: int,
     exp_time: float | None = None,
     tag: str = "",
+    *,
+    firmware_version: str = "short_window",
+    acq_window: float | None = None,
 ) -> np.ndarray:
     """Unpack the binary data and compute the (32, 32) DCR map.
 
-    Finds the '.bin' files for the requested SPAD tag, unpacks them,
-    and computes the dark count rate map for a single quadrant. Use
-    this directly when only the DCR numbers are needed, with no plot.
+    Normalised by the *live* time per frame, which depends on the firmware
+    (see 'core.timing.resolve_live_time'): ``'short_window'`` counts only
+    ``acq_window`` as live, ``'full_window'`` the whole frame.
 
     Parameters
     ----------
@@ -182,35 +127,58 @@ def compute_dcr_32(
     nframes : int
         Number of frames stored in each '.bin' file.
     exp_time : float | None, optional
-        Value passed to Kelpie_v2.exe, in seconds. 0 → 9 µs actual,
-        10e-6 → 19 µs actual. If None, the frame length is read from
-        'frame_rate_cnt.txt', falling back to 9 µs. The default is
-        None.
+        Legacy exposure time in seconds (``firmware_version='full_window'``
+        only): 0 → 9 µs actual, 10e-6 → 19 µs. If None, read from
+        'frame_rate_cnt.txt', falling back to 9 µs. The default is None.
     tag : str, optional
         SPAD quadrant tag ('S0C', 'S1C', 'S2C', 'S3C'). The default is
         "", which matches every '.bin' file in the folder.
+    firmware_version : str, optional
+        ``'short_window'`` (default) or ``'full_window'``; see
+        'resolve_live_time'.
+    acq_window : float | None, optional
+        Photon-sensitive window per frame, in seconds (required for
+        ``firmware_version='short_window'``, e.g. ``200e-9``). The default
+        is None.
 
     Returns
     -------
     np.ndarray
         The (32, 32) dark count rate map, in counts per second.
+
+    Raises
+    ------
+    ValueError
+        Raised when ``firmware_version='short_window'`` but no ``acq_window``
+        is given.
     """
-    frame_time, ft_source = _resolve_frame_time(folder, exp_time, nframes)
-    files = _sorted_bin_files(folder, tag)
-    return _accumulate_dcr(files, nframes, frame_time, label=tag)
+    live, _ = timing.resolve_live_time(
+        folder, firmware_version, nframes,
+        acq_window=acq_window, exp_time=exp_time,
+    )
+    if live is None:
+        raise ValueError(
+            "firmware_version='short_window' needs acq_window (the "
+            "photon-sensitive window per frame, in seconds, e.g. 200e-9)."
+        )
+    # The DCR quadrant tags are matched with a leading underscore ('*_S0C*')
+    # so a tag cannot match a filename that merely contains those characters.
+    files = io.find_bin_files(folder, tag, require_separator=True)
+    return _accumulate_dcr(files, nframes, live, label=tag)
 
 
 def compute_dcr_64(
     folder: str,
     nframes: int,
     exp_time: float | None = None,
+    *,
+    firmware_version: str = "short_window",
+    acq_window: float | None = None,
 ) -> np.ndarray:
     """Unpack the binary data and compute the (64, 64) DCR map.
 
-    Finds the '.bin' files for each of the four SPAD tags, unpacks
-    them, and assembles the dark count rate map for the full sensor.
-    Use this directly when only the DCR numbers are needed, with no
-    plot.
+    Interleaves the four quadrant maps onto the full sensor. Normalised by
+    the live time per frame; see 'compute_dcr_32'.
 
     Parameters
     ----------
@@ -219,10 +187,15 @@ def compute_dcr_64(
     nframes : int
         Number of frames stored in each '.bin' file.
     exp_time : float | None, optional
-        Value passed to Kelpie_v2.exe, in seconds. 0 → 9 µs actual,
-        10e-6 → 19 µs actual. If None, the frame length is read from
-        'frame_rate_cnt.txt', falling back to 9 µs. The default is
-        None.
+        Legacy exposure time in seconds (``firmware_version='full_window'``
+        only). If None, read from 'frame_rate_cnt.txt', falling back to
+        9 µs. The default is None.
+    firmware_version : str, optional
+        ``'short_window'`` (default) or ``'full_window'``; see
+        'resolve_live_time'.
+    acq_window : float | None, optional
+        Photon-sensitive window per frame, in seconds (required for
+        ``firmware_version='short_window'``). The default is None.
 
     Returns
     -------
@@ -234,8 +207,20 @@ def compute_dcr_64(
     FileNotFoundError
         Raised when no '.bin' files for any of the four SPAD tags are
         found in the folder.
+    ValueError
+        Raised when ``firmware_version='short_window'`` but no ``acq_window``
+        is given.
     """
-    frame_time, ft_source = _resolve_frame_time(folder, exp_time, nframes)
+    live, _ = timing.resolve_live_time(
+        folder, firmware_version, nframes,
+        acq_window=acq_window, exp_time=exp_time,
+    )
+    if live is None:
+        raise ValueError(
+            "firmware_version='short_window' needs acq_window (the "
+            "photon-sensitive window per frame, in seconds, e.g. 200e-9)."
+        )
+    frame_time = live
 
     tag_files = {}
     for tag in _SPAD_LAYOUT:
@@ -252,32 +237,23 @@ def compute_dcr_64(
             "No S0C/S1C/S2C/S3C .bin files found in:\n  " + folder
         )
 
-    dcr_map = np.zeros((64, 64), dtype=np.float64)
-    for tag, (dr, dc) in _SPAD_LAYOUT.items():
-        if tag not in tag_files:
-            continue
-        dcr_32 = _accumulate_dcr(
-            tag_files[tag],
-            nframes,
-            frame_time,
-            label=tag,
-        )
-        rows = np.arange(32) * 2 + dr
-        cols = np.arange(32) * 2 + dc
-        dcr_map[np.ix_(rows, cols)] = dcr_32
-
-    return dcr_map
+    quadrants = {
+        tag: _accumulate_dcr(files, nframes, frame_time, label=tag)
+        for tag, files in tag_files.items()
+    }
+    return reduce.assemble_64(quadrants, _SPAD_LAYOUT)
 
 
-def plot_heatmap(dcr: np.ndarray, cmap: str = "PuBuGn_r") -> plt.Figure:
+def plot_heatmap(dcr: np.ndarray, cmap: str | None = None) -> plt.Figure:
     """Plot a dark count rate map as a 2D heatmap.
 
     Parameters
     ----------
     dcr : np.ndarray
         Dark count rate map, e.g. from 'compute_dcr_32'/'compute_dcr_64'.
-    cmap : str, optional
-        Matplotlib colormap name. The default is "PuBuGn_r".
+    cmap : str | None, optional
+        Matplotlib colormap name. The default is None — use the active
+        style's ``image.cmap``.
 
     Returns
     -------
@@ -285,23 +261,15 @@ def plot_heatmap(dcr: np.ndarray, cmap: str = "PuBuGn_r") -> plt.Figure:
         The generated figure.
     """
     rows, cols = dcr.shape
-    median = float(np.median(dcr))
-    vmax = float(np.percentile(dcr, 99))  # clip hot pixels for colorscale
-
-    plt.rcParams.update({"font.size": 30})
-    fig, ax = plt.subplots(figsize=(10, 10))
-
-    im = ax.imshow(dcr, cmap=cmap, aspect="equal", vmax=vmax)
-
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-    title = f"DCR map  {rows}×{cols} SPADs"
-
-    title = f"\nmedian {median:.0f}  max {dcr.max():.0f}  cps"
-    ax.set_title(title)
-    ax.set_xlabel("Column")
-    ax.set_ylabel("Row")
-    return fig
+    median, maximum, _ = plots.map_stats(dcr)
+    return plots.sensor_map(
+        dcr,
+        title=(
+            f"DCR map  {rows}×{cols} SPADs\n"
+            f"median {median:.0f}  max {maximum:.0f}  cps"
+        ),
+        cmap=cmap,
+    )
 
 
 def plot_distribution(dcr: np.ndarray) -> plt.Figure:
@@ -317,73 +285,136 @@ def plot_distribution(dcr: np.ndarray) -> plt.Figure:
     plt.Figure
         The generated figure.
     """
-    median = float(np.median(dcr))
-    mean = float(dcr.mean())
-
-    sorted_dcr = np.sort(dcr.ravel())
-    pct = np.linspace(0, 100, len(sorted_dcr))
-
-    plt.rcParams.update({"font.size": 30})
-    fig, ax = plt.subplots(figsize=(16, 10))
-
-    ax.semilogy(
-        pct,
-        sorted_dcr,
-        ".",
-        markersize=2,
-        alpha=0.7,
-        label="_nolegend_",
-    )
-    ax.axhline(
-        median,
-        linestyle="--",
-        linewidth=2,
-        label=f"Median  {median:.0f} cps",
-    )
-    ax.axhline(
-        mean,
-        linestyle="--",
-        linewidth=1,
-        label=f"Mean    {mean:.0f} cps",
+    return plots.sorted_distribution(
+        dcr,
+        ylabel="DCR  (cps)",
+        title="Sorted DCR distribution",
+        logy=True,  # DCR spans decades
+        fmt=".0f",
+        unit="cps",
     )
 
-    ax.set_xlim(0, 100)
-    ax.set_xticks([0, 25, 50, 75, 100])
-    ax.set_xlabel("Pixel percentile  (%)")
-    ax.set_ylabel("DCR  (cps)")
-    title = "Sorted DCR distribution"
-    ax.set_title(title)
-    ax.grid(True, which="both", linewidth=0.5, alpha=0.6)
-    ax.legend()
-    fig.tight_layout()
-    return fig
 
 
-def _save_figure(
-    fig: plt.Figure, results_dir: str, file_name: str
-) -> str | None:
-    """Save a figure into the results folder.
+def _dcr_meta(
+    path: str,
+    nframes: int,
+    tag: str,
+    exp_time: float | None,
+    firmware_version: str,
+    acq_window: float | None,
+) -> dict:
+    """Build the acquisition metadata sidecar for a saved DCR map."""
+    frame_live_s, live_source = timing.resolve_live_time(
+        path,
+        firmware_version,
+        nframes,
+        acq_window=acq_window,
+        exp_time=exp_time,
+    )
+    return {
+        "tag": tag,
+        "nframes": int(nframes),
+        "firmware_version": firmware_version,
+        "acq_window_s": acq_window,
+        "exp_time_s": exp_time,
+        "frame_live_s": frame_live_s,
+        "live_time_source": live_source,
+        "unit": "cps",
+    }
+
+
+def compute_and_save_dcr_32(
+    path: str,
+    nframes: int,
+    exp_time: float | None = None,
+    tag: str = "",
+    *,
+    firmware_version: str = "short_window",
+    acq_window: float | None = None,
+) -> str:
+    """Compute the (32, 32) DCR map and save it under ``processed/``.
+
+    The stage-1 half of the DCR analysis: unpack once, write the array plus a
+    '.meta.json' sidecar, and return the path. 'collect_and_plot_dcr_32' can
+    then replot it with ``from_saved=True`` without re-unpacking.
 
     Parameters
     ----------
-    fig : plt.Figure
-        Figure to save.
-    results_dir : str
-        Folder the figure should be saved into. Created if missing.
-    file_name : str
-        Name of the '.png' file to save the figure as.
+    path : str
+        Path to the folder with the '.bin' data files.
+    nframes : int
+        Number of frames stored in each '.bin' file.
+    exp_time : float | None, optional
+        Value passed to Kelpie_v2.exe, in seconds. The default is None.
+    tag : str, optional
+        SPAD quadrant tag ('S0C', 'S1C', 'S2C', 'S3C'). The default is "".
+    firmware_version : str, optional
+        ``'short_window'`` (default) or ``'full_window'``.
+    acq_window : float | None, optional
+        Photon-sensitive window per frame, in seconds. The default is None.
 
     Returns
     -------
-    str | None
-        Path the figure was saved to.
+    str
+        Path to the saved '.npy'.
     """
-    os.makedirs(results_dir, exist_ok=True)
-    out_path = os.path.join(results_dir, file_name)
+    dcr = compute_dcr_32(
+        path, nframes, exp_time, tag,
+        firmware_version=firmware_version, acq_window=acq_window,
+    )
+    return store.save_map(
+        dcr,
+        path,
+        kind=_KIND,
+        tag=tag,
+        meta=_dcr_meta(
+            path, nframes, tag, exp_time, firmware_version, acq_window
+        ),
+    )
 
-    fig.savefig(out_path)
-    print(f"\n> > > Plot is saved as {file_name} in {results_dir} < < <")
-    return out_path
+
+def compute_and_save_dcr_64(
+    path: str,
+    nframes: int,
+    exp_time: float | None = None,
+    *,
+    firmware_version: str = "short_window",
+    acq_window: float | None = None,
+) -> str:
+    """Assemble the (64, 64) full-sensor DCR map and save it.
+
+    Parameters
+    ----------
+    path : str
+        Path to the folder with the four SPAD quadrants' '.bin' files.
+    nframes : int
+        Number of frames stored in each '.bin' file.
+    exp_time : float | None, optional
+        Value passed to Kelpie_v2.exe, in seconds. The default is None.
+    firmware_version : str, optional
+        ``'short_window'`` (default) or ``'full_window'``.
+    acq_window : float | None, optional
+        Photon-sensitive window per frame, in seconds. The default is None.
+
+    Returns
+    -------
+    str
+        Path to the saved '.npy'.
+    """
+    dcr = compute_dcr_64(
+        path, nframes, exp_time,
+        firmware_version=firmware_version, acq_window=acq_window,
+    )
+    return store.save_map(
+        dcr,
+        path,
+        kind=_KIND,
+        tag="64",
+        meta=_dcr_meta(
+            path, nframes, "64", exp_time, firmware_version, acq_window
+        ),
+    )
 
 
 def collect_and_plot_dcr_32(
@@ -393,15 +424,16 @@ def collect_and_plot_dcr_32(
     tag: str = "",
     daughterboard_number: str | None = None,
     motherboard_number: str | None = None,
-    cmap: str = "PuBuGn_r",
+    cmap: str | None = None,
+    *,
+    firmware_version: str = "short_window",
+    acq_window: float | None = None,
+    from_saved: bool = False,
 ) -> np.ndarray:
     """Unpack, compute, and plot the (32, 32) DCR map for a SPAD tag.
 
-    Convenience wrapper: unpacks the data once via 'compute_dcr_32',
-    then plots and saves both the heatmap and the sorted distribution
-    into the 'results/dcr' folder created (if it does not already
-    exist) in the same folder where the data are, without unpacking
-    the data twice.
+    Computes (and saves) the map, then writes both the heatmap and the
+    sorted distribution to ``results/dcr``.
 
     Parameters
     ----------
@@ -423,9 +455,19 @@ def collect_and_plot_dcr_32(
         Camera motherboard number, used together with
         'daughterboard_number' to look up the hot/warm pixel mask.
         Mask support is not implemented yet. The default is None.
-    cmap : str, optional
-        Matplotlib colormap name for the heatmap. The default is
-        "PuBuGn_r".
+    cmap : str | None, optional
+        Matplotlib colormap name for the heatmap. The default is None —
+        use the active style's ``image.cmap``.
+    firmware_version : str, optional
+        ``'short_window'`` (default) or ``'full_window'``; see
+        'resolve_live_time'.
+    acq_window : float | None, optional
+        Photon-sensitive window per frame, in seconds (required for
+        ``firmware_version='short_window'``). The default is None.
+    from_saved : bool, optional
+        Load the map saved by 'compute_and_save_dcr_32' instead of
+        re-unpacking the '.bin' files - use this to retry a colormap. The
+        default is False, which computes and then saves the array.
 
     Returns
     -------
@@ -433,7 +475,6 @@ def collect_and_plot_dcr_32(
         The (32, 32) dark count rate map, in counts per second.
 
     """
-
     # TODO: once per-board hot/warm pixel mask files are available,
     # use daughterboard_number/motherboard_number to load and apply
     # the mask here (see daplis.functions.utils.apply_mask).
@@ -443,18 +484,34 @@ def collect_and_plot_dcr_32(
         "plotting the heatmap and distribution < < <\n"
     )
 
-    dcr = compute_dcr_32(path, nframes, exp_time, tag)
+    if from_saved:
+        dcr, _ = store.load_map(path, kind=_KIND, tag=tag)
+    else:
+        dcr = compute_dcr_32(
+            path, nframes, exp_time, tag,
+            firmware_version=firmware_version, acq_window=acq_window,
+        )
+        store.save_map(
+            dcr,
+            path,
+            kind=_KIND,
+            tag=tag,
+            meta=_dcr_meta(
+                path, nframes, tag, exp_time, firmware_version, acq_window
+            ),
+            quiet=True,
+        )
 
     name = os.path.basename(os.path.normpath(path))
     tag_suffix = tag if tag else "dcr"
-    results_dir = os.path.join(path, "results", "dcr")
+    results_dir = store.results_dir(path, _KIND, create=False)
 
     fig_heatmap = plot_heatmap(dcr, cmap=cmap)
-    _save_figure(fig_heatmap, results_dir, f"{name}_{tag_suffix}_heatmap.png")
+    store.save_figure(fig_heatmap, results_dir, f"{name}_{tag_suffix}_heatmap.png")
     plt.close(fig_heatmap)
 
     fig_distribution = plot_distribution(dcr)
-    _save_figure(
+    store.save_figure(
         fig_distribution,
         results_dir,
         f"{name}_{tag_suffix}_distribution.png",
@@ -470,15 +527,16 @@ def collect_and_plot_dcr_64(
     exp_time: float | None = None,
     daughterboard_number: str | None = None,
     motherboard_number: str | None = None,
-    cmap: str = "PuBuGn_r",
+    cmap: str | None = None,
+    *,
+    firmware_version: str = "short_window",
+    acq_window: float | None = None,
+    from_saved: bool = False,
 ) -> np.ndarray:
     """Unpack, compute, and plot the (64, 64) full sensor DCR map.
 
-    Convenience wrapper: unpacks the data once via 'compute_dcr_64',
-    then plots and saves both the heatmap and the sorted distribution
-    into the 'results/dcr' folder created (if it does not already
-    exist) in the same folder where the data are, without unpacking
-    the data twice.
+    Computes (and saves) the map, then writes both the heatmap and the
+    sorted distribution to ``results/dcr``.
 
     Parameters
     ----------
@@ -498,9 +556,19 @@ def collect_and_plot_dcr_64(
         'daughterboard_number' to look up the hot/warm pixel mask.
         Mask support is not implemented yet. The default is None.
 
-    cmap : str, optional
-        Matplotlib colormap name for the heatmap. The default is
-        "PuBuGn_r".
+    cmap : str | None, optional
+        Matplotlib colormap name for the heatmap. The default is None —
+        use the active style's ``image.cmap``.
+    firmware_version : str, optional
+        ``'short_window'`` (default) or ``'full_window'``; see
+        'resolve_live_time'.
+    acq_window : float | None, optional
+        Photon-sensitive window per frame, in seconds (required for
+        ``firmware_version='short_window'``). The default is None.
+    from_saved : bool, optional
+        Load the map saved by 'compute_and_save_dcr_64' instead of
+        re-unpacking the '.bin' files. The default is False, which computes
+        and then saves the array.
 
     Returns
     -------
@@ -509,7 +577,6 @@ def collect_and_plot_dcr_64(
 
 
     """
-
     # TODO: once per-board hot/warm pixel mask files are available,
     # use daughterboard_number/motherboard_number to load and apply
     # the mask here (see daplis.functions.utils.apply_mask).
@@ -519,20 +586,36 @@ def collect_and_plot_dcr_64(
         "the heatmap and distribution < < <\n"
     )
 
-    dcr = compute_dcr_64(path, nframes, exp_time)
+    if from_saved:
+        dcr, _ = store.load_map(path, kind=_KIND, tag="64")
+    else:
+        dcr = compute_dcr_64(
+            path, nframes, exp_time,
+            firmware_version=firmware_version, acq_window=acq_window,
+        )
+        store.save_map(
+            dcr,
+            path,
+            kind=_KIND,
+            tag="64",
+            meta=_dcr_meta(
+                path, nframes, "64", exp_time, firmware_version, acq_window
+            ),
+            quiet=True,
+        )
 
     name = os.path.basename(os.path.normpath(path))
-    results_dir = os.path.join(path, "results", "dcr")
+    results_dir = store.results_dir(path, _KIND, create=False)
 
     fig_heatmap = plot_heatmap(dcr, cmap=cmap)
-    _save_figure(
+    store.save_figure(
         fig_heatmap,
         results_dir,
         f"{name}_full_heatmap.png",
     )
 
     fig_distribution = plot_distribution(dcr)
-    _save_figure(
+    store.save_figure(
         fig_distribution,
         results_dir,
         f"{name}_full_distribution.png",

@@ -28,5 +28,12 @@ _old/
 .DS_Store
 Thumbs.db
 
-# Project-generated
+# Project-generated: stage-1 arrays and stage-2 figures. These sit next to the
+# raw data, which normally lives outside the repo - this is a safety net for
+# when it doesn't.
+processed/
 results/
+*.bin
+
+# mkdocs build output
+site/

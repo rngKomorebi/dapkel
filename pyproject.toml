@@ -12,28 +12,108 @@ license = {file = "LICENSE"}
 authors = [
     {name = "Sergei Kulkov", email = "sergei.kulkov23@gmail.com"},
 ]
+keywords = [
+    "SPAD",
+    "single-photon",
+    "photon counting",
+    "TDC",
+    "Kelpie",
+    "coincidences",
+    "dark count rate",
+    "cross-talk",
+]
 classifiers = [
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Physics",
+    "Typing :: Typed",
 ]
 dependencies = [
     "numpy>=1.24",
-    "matplotlib==3.10.8"
+    "matplotlib>=3.8",
+    "komorebi_mpl>=0.0.5",
+    "pandas>=2.0",
+    "pyarrow>=14",
+    "scipy>=1.10",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "ruff>=0.6",
+    "build>=1.2",
+    "twine>=5",
+]
+docs = [
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.24",
 ]
 
 [project.urls]
 Homepage = "https://github.com/rngKomorebi/dapkel"
+Documentation = "https://rngkomorebi.github.io/dapkel/"
 Repository = "https://github.com/rngKomorebi/dapkel"
 Issues = "https://github.com/rngKomorebi/dapkel/issues"
 Changelog = "https://github.com/rngKomorebi/dapkel/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+# Without this, setuptools treats any __init__-less directory under src as a
+# namespace package - which is how the archived '_old/' MATLAB port ended up
+# inside the wheel despite being git-ignored.
+namespaces = false
+exclude = ["dapkel.functions._old*"]
+
+[tool.setuptools.package-data]
+# Ship the packaged TDC calibration LUTs with the wheel/sdist.
+"dapkel.params" = ["calibration_data/*.npy"]
+# Mark the package as type-annotated (PEP 561).
+"dapkel" = ["py.typed"]
 
 [tool.setuptools_scm]
+# The version comes from the git tag. Only match well-formed release tags
+# ("v0.1.0"): a stray tag like "v.0.0.1" otherwise aborts the build outright
+# with "Can't parse version from tag".
+git_describe_command = [
+    "git", "describe", "--dirty", "--tags", "--long", "--match", "v[0-9]*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+src = ["src", "tests"]
+extend-exclude = ["src/dapkel/functions/_old"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "D",    # pydocstyle - every public function keeps its docstring
+]
+ignore = [
+    "D105",  # magic methods need no docstring
+    "D107",  # __init__ is documented on the class
+    "D203",  # incompatible with D211
+    "D213",  # incompatible with D212
+    "E501",  # line length is handled by the formatter
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests document themselves through their names; docstrings are optional.
+"tests/*" = ["D103"]
