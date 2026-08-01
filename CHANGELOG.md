@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `core.store.confirm_rewrite` — the guard every `rewrite=True` now routes
+  through. Silent on a fresh run; when data really is about to be destroyed it
+  names each target with its size and timestamp, then counts down
+  `store.REWRITE_DELAY_S` (5 s) so Ctrl-C can still save an overnight
+  acquisition. `delta_t`'s two `rewrite` parameters use it.
+- `delta_t.combine_delta_t_parts` — assemble a run's part files into its
+  combined feather. Recovers a run that died partway through: every part
+  flushed before the crash is complete and readable.
+- `delta_t.calculate_and_save_timestamp_differences` gained `part_size_mb`
+  (default 64 MB) and `keep_parts` (default True).
+
+### Changed
+
+- **Delta-t stage 1 streams to disk instead of accumulating the whole run.**
+  Differences are flushed to
+  `processed/<dataset>_delta_t_parts/<dataset>_delta_t_<i>.feather` as they are
+  found and concatenated one Arrow record batch at a time, so the loop's memory
+  ceiling is one part plus one unpacked file regardless of file count. Over
+  ~10 000 files the old path failed twice over — the buffers exhausted RAM, and
+  the single final write then asked pyarrow for a multi-GB contiguous
+  allocation on top of what was already held.
+- `combine_delta_t_feathers` pools batch-by-batch rather than reading every
+  feather into a DataFrame first, so combining many runs no longer needs the
+  whole pooled data set resident twice.
+- Delta-t feathers pad short pair columns with Arrow nulls rather than NaN
+  values. Both read back as NaN through `to_pandas`, so this is invisible
+  downstream and older feathers still read correctly; it just keeps padding
+  distinguishable from data when parts are counted.
+
 ## [0.1.0] - 2026-08-01
 
 The package grows from "unpack and plot DCR" into the full Kelpie analysis

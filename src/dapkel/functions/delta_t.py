@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 from scipy.optimize import curve_fit
 from tqdm import tqdm
 
@@ -36,6 +37,7 @@ from dapkel.functions.unpack import unpack
 __all__ = [
     # stage 1 - difference timestamps and persist to feather
     "calculate_and_save_timestamp_differences",
+    "combine_delta_t_parts",
     "combine_delta_t_feathers",
     # fit models and fitting
     "gaussian",
@@ -52,6 +54,20 @@ _KIND = "coincidences"
 # Average raw-code -> picosecond conversion: ~100 ns oscillator period over
 # ~1300 codes. Replace with a per-code LUT (density test) via 'time_lut'.
 _TS_CODE_PS = 77.0
+
+# Default size cap for one part file, in MB. Chosen against what else is
+# resident during the loop rather than in the abstract: 'unpack' already holds
+# a (32, 32, nframes) float64 array, which is ~82 MB at 10 000 frames, so the
+# part buffer stops being the binding constraint well below that and there is
+# nothing to gain from paying the per-part write and open cost more often. A
+# smaller cap (10 MB) is perfectly safe, just ~6x more part files.
+_PART_MB = 64.0
+
+# Suffix of the folder holding one run's part files, as
+# '<dataset>_delta_t_parts/<dataset>_delta_t_<i>.feather'. Note the parts do
+# NOT match the '*_delta_t.feather' glob 'combine_delta_t_feathers' uses, so
+# they can never be pooled twice.
+_PARTS_SUFFIX = "_parts"
 
 
 
@@ -131,12 +147,23 @@ def calculate_and_save_timestamp_differences(
     spad: int | str = "average",
     nframes: int | None = None,
     max_files: int | None = None,
+    part_size_mb: float = _PART_MB,
+    keep_parts: bool = True,
 ) -> str:
     """Unpack ORT data, compute blob-vs-blob delta-t, and save to feather.
 
     Writes ``path/processed/<name>_delta_t.feather`` with **one column per
-    pixel pair** (named ``"ra,ca-rb,cb"``), NaN-padded to a common length;
-    every requested pair gets a column even if it saw no coincidences.
+    pixel pair** (named ``"ra,ca-rb,cb"``), padded to a common length; every
+    requested pair gets a column even if it saw no coincidences.
+
+    The differences are **streamed to disk as they are found**, not held until
+    the end: the running buffer is flushed to
+    ``processed/<name>_delta_t_parts/<name>_delta_t_<i>.feather`` whenever it
+    would exceed ``part_size_mb``, and the parts are concatenated into the
+    final feather one record batch at a time. Memory therefore stays flat in
+    the number of '.bin' files, and a run that dies at file 9 000 of 10 000
+    leaves every completed part on disk - recover them with
+    'combine_delta_t_parts'.
 
     With ``apply_TDC_calibration=True`` (default) the board's density-test LUT
     converts timestamps to picoseconds *before* differencing, saving
@@ -151,8 +178,12 @@ def calculate_and_save_timestamp_differences(
         Two groups ``[group_a, group_b]`` — the signal and idler blobs read
         off the hitmap, each a list of ``(row, col)`` pixels.
     rewrite : bool, optional
-        Overwrite an existing '.feather' for this data set. A guard against
-        accidental overwrites. The default is False.
+        Overwrite an existing '.feather' (and part folder) for this data set.
+        A guard against accidental overwrites: the default is False, which
+        raises instead. When True and something really is about to be
+        destroyed, 'store.confirm_rewrite' names it and counts down five
+        seconds first, so a stale ``rewrite=True`` can still be caught with
+        Ctrl-C.
     tag : str, optional
         Filename fragment selecting the files. The default is ``'ORT'``.
     mode : str, optional
@@ -189,6 +220,15 @@ def calculate_and_save_timestamp_differences(
         Frames per file. When None (default) it is derived from file size.
     max_files : int | None, optional
         Process at most this many files. The default is None (all files).
+    part_size_mb : float, optional
+        Flush a part file once the buffered differences would exceed this
+        many MB. The default is 64.0; see '_PART_MB' for why. Lower it to cap
+        memory harder, raise it for fewer, larger parts.
+    keep_parts : bool, optional
+        Keep the part folder after the final feather has been assembled. The
+        default is True: the parts are the crash insurance, and they cost
+        disk rather than memory. Set False to have this run's own parts
+        removed once the combined feather is complete.
 
     Returns
     -------
@@ -205,13 +245,20 @@ def calculate_and_save_timestamp_differences(
         files = files[:max_files]
 
     name = os.path.basename(os.path.normpath(path))
-    out_path = os.path.join(
-        store.processed_dir(path), f"{name}_delta_t.feather"
-    )
+    stem = f"{name}_delta_t"
+    processed = store.processed_dir(path)
+    out_path = os.path.join(processed, f"{stem}.feather")
+    parts_dir = os.path.join(processed, f"{stem}{_PARTS_SUFFIX}")
+
     if os.path.isfile(out_path) and not rewrite:
         raise FileExistsError(
             f"{out_path} already exists. Pass rewrite=True to overwrite."
         )
+    if rewrite:
+        # Name the part folder too: a previous run's parts are also data, and
+        # stale ones left in place would be folded into this run's output.
+        store.confirm_rewrite([out_path, parts_dir])
+        _clear_parts(parts_dir)
 
     # Resolve the density-test LUT to apply (per-pixel, code -> ps). None
     # leaves the raw codes in place (saved as delta_code).
@@ -253,10 +300,11 @@ def calculate_and_save_timestamp_differences(
     print(
         f"\n> > > Collecting delta-t (mode='{mode}', tag='{tag}') from "
         f"{len(files)} file(s) into {len(labels)} pixel-pair column(s), "
-        f"saving to {os.path.basename(out_path)} < < <\n"
+        f"streaming {part_size_mb:.0f} MB parts to "
+        f"{os.path.basename(parts_dir)}{os.sep} < < <\n"
     )
 
-    pair_chunks: dict[str, list[np.ndarray]] = {lbl: [] for lbl in labels}
+    writer = _PartWriter(parts_dir, stem, labels, unit, part_size_mb)
     for fp in tqdm(files, desc=tag or "delta_t"):
         nf = nframes if nframes is not None else io.frames_in_file(fp)
         ts, _ = unpack(fp, nf, compute_time_series=True)
@@ -266,16 +314,27 @@ def calculate_and_save_timestamp_differences(
         deltas = cd.calculate_differences(
             pixel_ts, pixels, delta_window=delta_window, mode=mode
         )
-        for label, arr in deltas.items():
-            if arr.size:
-                pair_chunks[label].append(arr)
+        writer.add(deltas)
+    parts = writer.close()
 
-    # One column per pair, NaN-padded to the longest pair's length.
-    pair_arrays = {
-        lbl: (np.concatenate(v) if v else np.empty(0, dtype=np.float64))
-        for lbl, v in pair_chunks.items()
-    }
-    total = _write_delta_feather(out_path, pair_arrays, labels, unit)
+    if parts:
+        print(
+            f"\n> > > Combining {len(parts)} part file(s) into "
+            f"{os.path.basename(out_path)} < < <"
+        )
+        total, _, _ = _combine_delta_feathers(parts, out_path)
+    else:
+        # Not one coincidence anywhere. Still write the empty table so the
+        # requested pair columns and the unit are on record.
+        total = _write_delta_feather(
+            out_path,
+            {lbl: np.empty(0, dtype=np.float64) for lbl in labels},
+            labels,
+            unit,
+        )
+
+    if not keep_parts:
+        _clear_parts(parts_dir, only=parts)
 
     print(
         f"\n> > > {total} differences across {len(labels)} pixel-pair "
@@ -284,22 +343,146 @@ def calculate_and_save_timestamp_differences(
     return out_path
 
 
+class _PartWriter:
+    """Buffer per-pair deltas and flush them to size-capped part feathers.
+
+    Stage 1 used to keep every difference from every '.bin' file in RAM and
+    write a single feather at the end. Over ~10 000 files that fails twice:
+    the accumulated lists exhaust memory, and the final write asks pyarrow
+    for one multi-GB contiguous allocation on top of what is already held.
+
+    Buffering to a fixed cap instead makes the loop's memory ceiling one part
+    plus one unpacked file, independent of how many files are processed, and
+    turns the single all-or-nothing write into many small ones - so a run
+    that dies partway through has still written everything up to its last
+    flush.
+    """
+
+    def __init__(
+        self,
+        parts_dir: str,
+        stem: str,
+        labels: Sequence[str],
+        unit: str,
+        part_size_mb: float,
+    ) -> None:
+        self.parts_dir = parts_dir
+        self.stem = stem
+        self.labels = list(labels)
+        self.unit = unit
+        self.part_bytes = max(int(part_size_mb * 1024 * 1024), 1)
+        self.parts: list[str] = []
+        self.total = 0
+        self._buf: dict[str, list[np.ndarray]] = {
+            lbl: [] for lbl in self.labels
+        }
+        self._lens: dict[str, int] = dict.fromkeys(self.labels, 0)
+
+    @property
+    def _buffered_bytes(self) -> int:
+        """Bytes the buffer would occupy once written.
+
+        Parts are written wide and padded, so what lands on disk - and what
+        has to be built in memory to get there - is ``n_pairs`` x the longest
+        column, not the sum of the columns. Budgeting on the padded size is
+        what keeps one busy pair from inflating the part.
+        """
+        return len(self.labels) * max(self._lens.values(), default=0) * 8
+
+    def add(self, deltas: dict[str, np.ndarray]) -> None:
+        """Buffer one file's differences, flushing if the cap is reached."""
+        for label, arr in deltas.items():
+            if arr.size and label in self._buf:
+                self._buf[label].append(arr)
+                self._lens[label] += int(arr.size)
+                self.total += int(arr.size)
+        if self._buffered_bytes >= self.part_bytes:
+            self.flush()
+
+    def flush(self) -> str | None:
+        """Write the buffer as the next part; a no-op when it is empty."""
+        if not any(self._lens.values()):
+            return None
+        part = os.path.join(
+            self.parts_dir, f"{self.stem}_{len(self.parts)}.feather"
+        )
+        pair_arrays = {
+            lbl: (
+                np.concatenate(chunks)
+                if chunks
+                else np.empty(0, dtype=np.float64)
+            )
+            for lbl, chunks in self._buf.items()
+        }
+        _write_delta_feather(part, pair_arrays, self.labels, self.unit)
+        self.parts.append(part)
+        self._buf = {lbl: [] for lbl in self.labels}
+        self._lens = dict.fromkeys(self.labels, 0)
+        return part
+
+    def close(self) -> list[str]:
+        """Flush whatever is left and return every part written."""
+        self.flush()
+        return self.parts
+
+
+def _part_index(part_path: str) -> int:
+    """Sort key for '<stem>_<i>.feather': the trailing integer, else -1."""
+    stem = os.path.basename(part_path).removesuffix(".feather")
+    _, _, tail = stem.rpartition("_")
+    return int(tail) if tail.isdigit() else -1
+
+
+def _find_parts(parts_dir: str) -> list[str]:
+    """Return a part folder's '.feather' files in write order."""
+    if not os.path.isdir(parts_dir):
+        return []
+    found = glob.glob(os.path.join(parts_dir, "*_delta_t_*.feather"))
+    return sorted(found, key=_part_index)
+
+
+def _clear_parts(parts_dir: str, only: Sequence[str] | None = None) -> None:
+    """Remove part files, leaving anything else in the folder alone.
+
+    Only ever touches ``*_delta_t_*.feather`` inside ``parts_dir`` - either
+    all of them (a ``rewrite=True`` that the countdown has already announced)
+    or, with ``only``, just the ones this run wrote.
+    """
+    targets = list(only) if only is not None else _find_parts(parts_dir)
+    for part in targets:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+    if os.path.isdir(parts_dir) and not os.listdir(parts_dir):
+        try:
+            os.rmdir(parts_dir)
+        except OSError:
+            pass
+
+
 def _write_delta_feather(
     out_path: str,
     pair_arrays: dict[str, np.ndarray],
     labels: Sequence[str],
     unit: str,
 ) -> int:
-    """Write a wide, NaN-padded one-column-per-pair delta-t '.feather'.
+    """Write a wide, null-padded one-column-per-pair delta-t '.feather'.
 
-    Each pair's 1D array becomes a column (in ``labels`` order), padded with
-    NaN to the longest pair's length. The ``delta_unit`` (``'code'`` / ``'ps'``)
-    is stored in the schema metadata so the reader knows the column units.
+    Each pair's 1D array becomes a column (in ``labels`` order), padded to the
+    longest pair's length. The ``delta_unit`` (``'code'`` / ``'ps'``) is stored
+    in the schema metadata so the reader knows the column units.
 
     The Arrow table is assembled column-by-column (one ``pyarrow`` array per
     pair) rather than through a single consolidated ``pandas`` block; for the
     combined feathers, where the padded width (n_pairs x longest pair) can
     reach several GiB, that avoids a single huge contiguous allocation.
+
+    The padding is Arrow *nulls* rather than NaN values. Both read back as NaN
+    through ``to_pandas``, so this is invisible downstream, but it keeps
+    padding distinguishable from data: 'combine_delta_feathers' can then count
+    the real differences in a part from its null count instead of scanning it.
+    Feathers written before this change pad with NaN and still read correctly.
 
     Parameters
     ----------
@@ -323,12 +506,14 @@ def _write_delta_feather(
     columns: list[pa.Array] = []
     for lbl in labels:
         arr = np.asarray(pair_arrays[lbl], dtype=np.float64)
+        col = pa.array(arr)
         if arr.size < maxlen:
-            col = np.full(maxlen, np.nan, dtype=np.float64)
-            col[: arr.size] = arr
-        else:
-            col = arr
-        columns.append(pa.array(col))
+            # Concatenating a null run beats materialising a padded copy:
+            # the data buffer stays the one numpy already owns.
+            col = pa.concat_arrays(
+                [col, pa.nulls(maxlen - arr.size, pa.float64())]
+            )
+        columns.append(col)
         del col
 
     # Feather V2 == the Arrow IPC file format; the plain ipc writer keeps the
@@ -373,6 +558,181 @@ def _read_delta_feather(feather_path: str) -> tuple[pd.DataFrame, str | None]:
     return table.to_pandas(), unit
 
 
+def _real_values(col: pa.Array) -> int:
+    """Count a column's actual differences, ignoring padding.
+
+    Parts written by this module pad with nulls; feathers written before that
+    change pad with NaN. Both are excluded, so the total reported after a
+    combine is the number of differences either way.
+    """
+    n = len(col) - col.null_count
+    if n:
+        n -= int(pc.sum(pc.is_nan(col)).as_py() or 0)
+    return int(n)
+
+
+def _combine_delta_feathers(
+    sources: Sequence[str], out_path: str
+) -> tuple[int, list[str], str]:
+    """Concatenate delta-t feathers into one, a record batch at a time.
+
+    The obvious implementation - read every source into a DataFrame, pool the
+    columns, write once - needs the whole pooled data set resident twice over,
+    which is exactly what fails on a large run. Arrow IPC files are a sequence
+    of record batches sharing a schema, so instead each source's batches are
+    re-emitted into a single output file: peak memory is one batch (one part),
+    whatever the total.
+
+    Columns are the union of the sources' pair labels in first-seen order; a
+    source missing a pair contributes nulls for it, which is the same padding
+    a pair that never fired gets anyway.
+
+    Parameters
+    ----------
+    sources : Sequence[str]
+        Delta-t feathers to concatenate, in output order.
+    out_path : str
+        Path to write the combined '.feather' to.
+
+    Returns
+    -------
+    total : int
+        Number of real (non-padding) differences written.
+    labels : list[str]
+        The combined column order.
+    unit : str
+        The shared ``delta_unit``, or ``'code'`` if none was recorded.
+
+    Raises
+    ------
+    ValueError
+        Raised when the sources mix ``delta_unit`` ('code' and 'ps').
+    """
+    labels: list[str] = []
+    seen: set[str] = set()
+    units: set[str] = set()
+    for src in sources:
+        with pa.ipc.open_file(src) as reader:
+            schema = reader.schema
+        src_unit = (schema.metadata or {}).get(b"delta_unit", b"").decode()
+        if src_unit:
+            units.add(src_unit)
+        for label in schema.names:
+            if label not in seen:
+                seen.add(label)
+                labels.append(label)
+
+    if len(units) > 1:
+        raise ValueError(
+            f"Cannot combine feathers with mixed delta_unit {sorted(units)}."
+        )
+    unit = units.pop() if units else "code"
+
+    out_schema = pa.schema(
+        [pa.field(label, pa.float64()) for label in labels],
+        metadata={
+            b"delta_unit": unit.encode(),
+            b"n_pairs": str(len(labels)).encode(),
+        },
+    )
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    total = 0
+    with pa.ipc.new_file(out_path, out_schema) as writer:
+        for src in sources:
+            with pa.ipc.open_file(src) as reader:
+                present = set(reader.schema.names)
+                for i in range(reader.num_record_batches):
+                    batch = reader.get_batch(i)
+                    if not batch.num_rows:
+                        continue
+                    columns: list[pa.Array] = []
+                    for label in labels:
+                        if label in present:
+                            col = batch.column(
+                                batch.schema.get_field_index(label)
+                            )
+                            total += _real_values(col)
+                        else:
+                            col = pa.nulls(batch.num_rows, pa.float64())
+                        columns.append(col)
+                    writer.write_batch(
+                        pa.record_batch(columns, schema=out_schema)
+                    )
+    return total, labels, unit
+
+
+def combine_delta_t_parts(
+    parts_dir: str,
+    out_path: str | None = None,
+    *,
+    rewrite: bool = False,
+) -> str:
+    """Assemble one run's delta-t part files into its combined feather.
+
+    'calculate_and_save_timestamp_differences' does this itself at the end of
+    a successful run. Call it by hand to recover a run that died partway
+    through: every part flushed before the crash is complete and usable, so
+    the differences up to the last flush are not lost.
+
+    Parameters
+    ----------
+    parts_dir : str
+        The ``processed/<dataset>_delta_t_parts`` folder to assemble.
+    out_path : str | None, optional
+        Where to write the combined '.feather'. The default is None, meaning
+        ``processed/<dataset>_delta_t.feather`` - the same path the run would
+        have written, beside the part folder.
+    rewrite : bool, optional
+        Overwrite an existing combined feather. The default is False, which
+        raises instead. When True, 'store.confirm_rewrite' counts down first.
+
+    Returns
+    -------
+    str
+        Path to the saved combined '.feather'.
+
+    Raises
+    ------
+    FileNotFoundError
+        Raised when the folder holds no part files.
+    FileExistsError
+        Raised when the output exists and ``rewrite`` is False.
+    """
+    parts = _find_parts(parts_dir)
+    if not parts:
+        raise FileNotFoundError(
+            f"No *_delta_t_<i>.feather part files in:\n  {parts_dir}"
+        )
+
+    if out_path is None:
+        stem = os.path.basename(os.path.normpath(parts_dir)).removesuffix(
+            _PARTS_SUFFIX
+        )
+        out_path = os.path.join(
+            os.path.dirname(os.path.normpath(parts_dir)), f"{stem}.feather"
+        )
+
+    if os.path.isfile(out_path):
+        if not rewrite:
+            raise FileExistsError(
+                f"{out_path} already exists. Pass rewrite=True to overwrite."
+            )
+        store.confirm_rewrite(out_path)
+
+    print(
+        f"\n> > > Assembling {len(parts)} part file(s) from "
+        f"{os.path.basename(os.path.normpath(parts_dir))} into "
+        f"{os.path.basename(out_path)} < < <"
+    )
+    total, labels, unit = _combine_delta_feathers(parts, out_path)
+    print(
+        f"\n> > > {total} differences across {len(labels)} pixel-pair "
+        f"column(s) -> {out_path} (unit '{unit}') < < <"
+    )
+    return out_path
+
+
 def combine_delta_t_feathers(
     path: str,
     *,
@@ -388,9 +748,15 @@ def combine_delta_t_feathers(
     them per pixel-pair column — concatenating the differences of matching
     pairs and taking the union of pairs across runs — and writes a single
     combined '.feather' into ``path/<combined_dirname>``. The combined table
-    keeps the one-column-per-pair, NaN-padded layout and the ``delta_unit``
+    keeps the one-column-per-pair, padded layout and the ``delta_unit``
     metadata, so it plots exactly like a single-run feather (pass it to
     'collect_and_plot_timestamp_differences' via ``feather_path``).
+
+    The pooling streams a record batch at a time (see
+    '_combine_delta_feathers'), so combining a hundred runs costs one batch of
+    memory rather than the whole pooled data set. Per-run part folders are not
+    picked up: their files end in ``_<i>.feather``, so the ``*_delta_t.feather``
+    search skips them and nothing is counted twice.
 
     Parameters
     ----------
@@ -403,7 +769,8 @@ def combine_delta_t_feathers(
         Base name for the combined file (``<out_name>_delta_t.feather``). The
         default is None (``<folder name>_combined``).
     rewrite : bool, optional
-        Overwrite an existing combined feather. The default is False.
+        Overwrite an existing combined feather. The default is False, which
+        raises instead. When True, 'store.confirm_rewrite' counts down first.
     feathers : Sequence[str] | None, optional
         Explicit list of feather paths to combine, bypassing the recursive
         search under ``path``. The default is None (auto-discover).
@@ -445,42 +812,19 @@ def combine_delta_t_feathers(
 
     name = out_name or f"{os.path.basename(os.path.normpath(path))}_combined"
     out_path = os.path.join(combined_dir, f"{name}_delta_t.feather")
-    if os.path.isfile(out_path) and not rewrite:
-        raise FileExistsError(
-            f"{out_path} already exists. Pass rewrite=True to overwrite."
-        )
+    if os.path.isfile(out_path):
+        if not rewrite:
+            raise FileExistsError(
+                f"{out_path} already exists. Pass rewrite=True to overwrite."
+            )
+        store.confirm_rewrite(out_path)
 
     print(
         f"\n> > > Combining {len(feathers)} delta-t feather(s) under "
         f"{path} into {os.path.basename(out_path)} < < <\n"
     )
 
-    pair_chunks: dict[str, list[np.ndarray]] = {}
-    labels: list[str] = []  # first-seen order across all feathers
-    units: set[str] = set()
-    for fp in feathers:
-        df, unit = _read_delta_feather(fp)
-        if unit is not None:
-            units.add(unit)
-        for col in df.columns:
-            vals = df[col].to_numpy(dtype=np.float64)
-            vals = vals[~np.isnan(vals)]
-            if col not in pair_chunks:
-                pair_chunks[col] = []
-                labels.append(col)
-            pair_chunks[col].append(vals)
-
-    if len(units) > 1:
-        raise ValueError(
-            f"Cannot combine feathers with mixed delta_unit {sorted(units)}."
-        )
-    unit = units.pop() if units else "code"
-
-    pair_arrays = {
-        c: (np.concatenate(v) if v else np.empty(0, dtype=np.float64))
-        for c, v in pair_chunks.items()
-    }
-    total = _write_delta_feather(out_path, pair_arrays, labels, unit)
+    total, labels, unit = _combine_delta_feathers(feathers, out_path)
 
     print(
         f"\n> > > Combined {len(feathers)} feather(s): {total} differences "

@@ -73,6 +73,14 @@ fail `tests/test_api_surface.py`:
 - saving/loading arrays with metadata, and saving figures → `core.store`
   (`save_map` / `load_map` / `save_figure`, and `processed_dir` / `results_dir`
   for the paths — never hand-build `os.path.join(path, "results", ...)`)
+- the warning before an overwrite → `core.store.confirm_rewrite`
+
+That last one is a rule, not just a convenience: **if your analysis takes a
+`rewrite` parameter, it must call `store.confirm_rewrite` with every artifact
+that parameter is about to destroy** before writing anything. It is silent on a
+fresh run and only costs time when there is genuinely something to lose. The
+accident it exists for is a `rewrite=True` left in the script from the previous
+acquisition, quietly eating an overnight measurement.
 
 If you need something close to but not quite one of these, **extend the core
 function with a parameter** rather than writing a variant next to it. Variants

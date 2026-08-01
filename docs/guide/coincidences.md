@@ -57,12 +57,78 @@ array of plausible integers and this whole pipeline still produces a
 peak-shaped histogram — it is simply meaningless. See
 [Data quality](data_quality.md).
 
+## Large runs: the differences are streamed, not accumulated
+
+`calculate_and_save_timestamp_differences` writes as it goes. Whenever the
+buffered differences would exceed `part_size_mb` (default 64 MB) they are
+flushed to a part file, and the parts are concatenated into the final feather
+one Arrow record batch at a time:
+
+```
+processed/
+  <dataset>_delta_t_parts/
+    <dataset>_delta_t_0.feather      <- flushed during the run
+    <dataset>_delta_t_1.feather
+    ...
+  <dataset>_delta_t.feather          <- the combined result
+```
+
+This matters at scale. Holding a whole 10 000-file run in memory and writing it
+once fails twice over: the buffers exhaust RAM, and the single write then asks
+pyarrow for a multi-GB contiguous allocation on top of what is already held.
+Streaming makes the loop's memory ceiling *one part plus one unpacked file*,
+whatever the file count.
+
+Two consequences worth knowing:
+
+- **A crashed run is recoverable.** Every part flushed before the crash is a
+  complete, readable feather. Assemble them with
+  [`combine_delta_t_parts`][dapkel.functions.delta_t.combine_delta_t_parts],
+  or plot a single part directly via `feather_path`.
+- **The parts are kept by default** (`keep_parts=True`) — they are the
+  insurance, and they cost disk rather than memory. Pass `keep_parts=False`
+  to have the run remove its own parts once the combined feather is written.
+
+Why 64 MB and not 10: `unpack` already holds a `(32, 32, nframes)` float64
+array — about 82 MB at 10 000 frames — so below that the part buffer is not the
+binding constraint, and a smaller cap only multiplies the number of part files.
+A smaller value is perfectly safe if you want the memory ceiling lower.
+
+## Overwriting: the five-second countdown
+
+Every `rewrite=True` in this module routes through
+[`store.confirm_rewrite`][dapkel.core.store.confirm_rewrite]. On a fresh run it
+does nothing at all. When something really is about to be destroyed it names
+each target with its size and timestamp, then counts down five seconds before
+proceeding:
+
+```
+!!  rewrite=True - the following data WILL BE OVERWRITTEN:
+!!    .../processed/SPDC_delta_t.feather  (1.4 GB, written 2026-07-30 02:11)
+!!    .../processed/SPDC_delta_t_parts/  (23 file(s), 1.4 GB)
+!!  Press Ctrl-C within 5 s to abort and copy it somewhere safe.
+```
+
+The pause is a plain `time.sleep`, so Ctrl-C raises straight out of the
+analysis with the data on disk untouched. This is aimed at the common accident:
+a `rewrite=True` left in the script from the previous acquisition, silently
+eating an overnight run. Set `store.REWRITE_DELAY_S = 0` in an unattended
+pipeline that has its own guard.
+
+Note the part folder is named in the warning as well — a rewrite clears the
+previous run's parts, otherwise they would be pooled into the new output.
+
 ## Pooling runs
 
 `combine_delta_t_feathers` pools the per-run delta-t feathers under a parent
 folder (many acquisitions of the same measurement) into one combined `.feather`
 in a `combined` sub-folder of `processed/`. It never folds a previous combined
-output back into itself.
+output back into itself, and it streams batch-by-batch just as the part
+combiner does, so pooling a hundred runs costs one batch of memory rather than
+the whole pooled data set.
+
+Part files are not picked up by the search: they end in `_<i>.feather`, which
+the `*_delta_t.feather` glob does not match, so nothing is ever counted twice.
 
 ## API
 

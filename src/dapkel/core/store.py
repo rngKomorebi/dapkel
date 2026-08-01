@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from collections.abc import Sequence
+from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -29,6 +32,7 @@ import numpy as np
 __all__ = [
     "PROCESSED_DIR",
     "RESULTS_DIR",
+    "REWRITE_DELAY_S",
     "processed_dir",
     "results_dir",
     "map_file_name",
@@ -37,6 +41,7 @@ __all__ = [
     "save_map",
     "load_map",
     "save_figure",
+    "confirm_rewrite",
 ]
 
 #: Sub-folder holding stage-1 artifacts (arrays + metadata).
@@ -44,6 +49,12 @@ PROCESSED_DIR = "processed"
 
 #: Sub-folder holding stage-2 artifacts (figures).
 RESULTS_DIR = "results"
+
+#: Seconds 'confirm_rewrite' counts down before an overwrite goes ahead.
+#: The point is to make a `rewrite=True` left over from a previous run
+#: recoverable: an overnight acquisition is worth five seconds of everyone's
+#: time. Set to 0 in unattended pipelines that have their own guard.
+REWRITE_DELAY_S = 5.0
 
 
 def processed_dir(folder: str, *, create: bool = True) -> str:
@@ -267,3 +278,94 @@ def save_figure(fig: plt.Figure, results_dir: str, file_name: str) -> str:
     fig.savefig(out_path)
     print(f"\n> > > Plot is saved as {file_name} in {results_dir} < < <")
     return out_path
+
+
+def _human_bytes(n: float) -> str:
+    """Format a byte count for the rewrite warning."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _describe_target(path: str) -> str:
+    """Describe one doomed artifact: how big it is and when it was written."""
+    try:
+        if os.path.isdir(path):
+            files = [
+                os.path.join(root, f)
+                for root, _, names in os.walk(path)
+                for f in names
+            ]
+            size = sum(os.path.getsize(f) for f in files)
+            return (
+                f"{path}{os.sep}  ({len(files)} file(s), {_human_bytes(size)})"
+            )
+        stamp = datetime.fromtimestamp(os.path.getmtime(path))
+        return (
+            f"{path}  ({_human_bytes(os.path.getsize(path))}, written "
+            f"{stamp:%Y-%m-%d %H:%M})"
+        )
+    except OSError:
+        # Sizing is decoration; never let it swallow the warning itself.
+        return path
+
+
+def confirm_rewrite(
+    paths: str | Sequence[str], *, delay: float | None = None
+) -> bool:
+    """Warn, then pause, before existing artifacts are overwritten.
+
+    Call this from any analysis whose ``rewrite=True`` is about to destroy
+    stage-1 data. Nothing is printed and nothing is waited for on a fresh run
+    (no target exists), so the pause only ever costs something when there is
+    genuinely something to lose - typically a ``rewrite=True`` left in the
+    script from the previous acquisition.
+
+    The countdown is a plain ``time.sleep``, so Ctrl-C during it raises
+    'KeyboardInterrupt' out of the analysis and the data on disk is untouched.
+
+    Parameters
+    ----------
+    paths : str | Sequence[str]
+        Artifact(s) about to be overwritten. Files and directories are both
+        accepted; entries that do not exist are ignored. Pass every target,
+        including part-file folders, so the warning names them all.
+    delay : float | None, optional
+        Seconds to count down. The default is None, meaning
+        'REWRITE_DELAY_S' (5 s). Pass 0 to warn without pausing.
+
+    Returns
+    -------
+    bool
+        True if something existed and is about to be overwritten, False on a
+        fresh run.
+    """
+    targets = [paths] if isinstance(paths, str) else list(paths)
+    existing = [p for p in targets if os.path.exists(p)]
+    if not existing:
+        return False
+
+    wait = REWRITE_DELAY_S if delay is None else float(delay)
+
+    print("\n" + "!" * 72)
+    print("!!  rewrite=True - the following data WILL BE OVERWRITTEN:")
+    for p in existing:
+        print(f"!!    {_describe_target(p)}")
+    if wait > 0:
+        print(
+            f"!!  Press Ctrl-C within {wait:.0f} s to abort and copy it "
+            "somewhere safe."
+        )
+    print("!" * 72)
+
+    remaining = wait
+    while remaining > 0:
+        print(f"  overwriting in {remaining:.0f} s ... ", end="", flush=True)
+        step = min(1.0, remaining)
+        time.sleep(step)
+        remaining -= step
+    if wait > 0:
+        print("\n  overwriting now.\n")
+    return True
