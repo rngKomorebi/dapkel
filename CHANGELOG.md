@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.1] - 2026-08-02
 
 ### Added
 
@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flushed before the crash is complete and readable.
 - `delta_t.calculate_and_save_timestamp_differences` gained `part_size_mb`
   (default 64 MB) and `keep_parts` (default True).
+- `tools/release.py` — promotes the changelog's `[Unreleased]` section to a
+  numbered, dated, linked release. The publish workflow reads the changelog as
+  it was *at the tagged commit*, so notes left under `[Unreleased]` can never
+  ship; forgetting to rename the section meant deleting and recreating the tag.
 
 ### Changed
 
@@ -132,6 +136,7 @@ Initial commit.
 
 - Functions for unpacking raw, binary data and analyzing dark count rate.
 
-[Unreleased]: https://github.com/rngKomorebi/dapkel/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rngKomorebi/dapkel/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/rngKomorebi/dapkel/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rngKomorebi/dapkel/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/rngKomorebi/dapkel/releases/tag/v0.0.1

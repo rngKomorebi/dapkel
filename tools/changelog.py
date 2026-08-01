@@ -83,9 +83,18 @@ def notes_for(version: str, changelog: pathlib.Path = DEFAULT_CHANGELOG) -> str:
 
     if version not in sections:
         released = [v for v in sections if v.lower() != "unreleased"]
+        hint = ""
+        if sections.get("Unreleased", "").strip():
+            # By far the likeliest cause: the notes were written but the
+            # section was never renamed, so they are unreleasable as they are.
+            hint = (
+                f"\n\n'## [Unreleased]' has notes waiting. Promote them:\n"
+                f"    python tools/release.py {version}\n"
+                f"then commit that and re-create the tag on the new commit."
+            )
         sys.exit(
             f"CHANGELOG.md has no '## [{version}]' section.\n"
-            f"Add one before tagging. Sections present: {released}"
+            f"Add one before tagging. Sections present: {released}{hint}"
         )
 
     body = sections[version]
@@ -105,6 +114,11 @@ def main() -> None:
         help="path to CHANGELOG.md (default: repository root)",
     )
     args = parser.parse_args()
+    # The notes contain em-dashes and the like. Windows consoles default to
+    # cp1252, which mangles them (or raises) when the output is redirected
+    # into the release body.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     sys.stdout.write(notes_for(args.version, args.changelog) + "\n")
 
 
