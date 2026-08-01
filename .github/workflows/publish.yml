@@ -70,6 +70,8 @@ jobs:
 
   build:
     name: Build distribution
+    # 'check' is needed for its version output, not just for ordering: without
+    # it in `needs`, needs.check.outputs.version is empty in this job.
     needs: [check, test]
     runs-on: ubuntu-latest
     steps:
@@ -97,7 +99,7 @@ jobs:
       - name: Verify built version matches the tag
         run: |
           expected="${{ needs.check.outputs.version }}"
-          built=$(ls dist/*.tar.gz | sed -E 's|.*/dapkel-(.+)\.tar\.gz|\1|')
+          built=$(ls dist/*.tar.gz | sed -E 's|.*-([^-]+)\.tar\.gz$|\1|')
           echo "tag says: $expected / built: $built"
           test "$built" = "$expected"
 

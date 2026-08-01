@@ -41,6 +41,8 @@ jobs:
 
   deploy:
     needs: build
+    # deploy-pages 404s if Pages has never been enabled for the repo. Skip
+    # rather than fail, so the docs still build on a repo without Pages set up.
     if: ${{ github.event.repository.has_pages == true }}
     runs-on: ubuntu-latest
     environment:
