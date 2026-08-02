@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-08-02
+
+### Added
+
+- **A second stage 1 that writes no feather at all.**
+  `delta_t.calculate_and_save_delta_counts` runs the same acquisition loop but
+  bins the differences onto a fixed native grid as it finds them, saving only
+  the counts to `processed/<name>_delta_counts.npy`. The artifact is sized by
+  the grid rather than the data: 106 MB for 256 pairs whether the run is 100
+  files or 10 000, against a 3.22 GB feather for the same run and ~135 GB for
+  a long one. Every pair is then plottable at once, and `bin_width_ps` /
+  `plot_window_ps` stop being compute-time decisions. For raw codes it is
+  exactly lossless — `delta_code` is an integer, so counts-per-code is a
+  re-encoding. It is offered *beside* the feather path, not instead of it: no
+  per-event data survives, so re-calibrating with a different LUT, re-cutting
+  `delta_window` and anything needing individual differences are all gone.
+- `delta_t.load_delta_counts` and `delta_t.rebin_delta_counts` read the grid
+  back and reduce it onto any coarser histogram in memory, and
+  `delta_t.collect_and_plot_delta_counts` is the matching plot driver. It
+  returns `(counts, centers, fit)` and shares its fitting and drawing code
+  with `collect_and_plot_timestamp_differences`, so a difference between the
+  two paths can only come from the histogram.
+- Crash insurance for the counts path is one file rather than a part folder:
+  the grid is rewritten every `flush_every` files and the next call resumes.
+  Two runs cannot interleave, so the part-mixing hazard does not arise. The
+  sidecar carries `total_in_grid`, and a checkpoint that does not sum to it —
+  a crash between writing the array and writing the sidecar — is discarded
+  rather than resumed, which would otherwise re-count files.
+
+### Fixed
+
+- **The "streaming" feather read was not streaming a single-batch feather.**
+  `pa.ipc.open_file(path)` materialises a whole record batch the moment one is
+  asked for. That is invisible on a feather assembled from 64 MB parts, but
+  every feather written before the parts rewrite - and anything
+  `_write_delta_feather` writes directly - is a *single* batch, so the read
+  loaded the entire file: measured at +794 MB for a 0.79 GB feather, meaning a
+  9.42 GB one asked for 9.42 GB in one allocation, on a 16.8 GB machine. Every
+  batch-reading site now memory-maps instead, so `get_batch` costs nothing and
+  the OS pages in only the columns touched. The same 9.42 GB, 320-column
+  feather now histograms in 18 s with **no** resident growth.
+- **Re-binning onto an incommensurate width put a sawtooth in the histogram.**
+  A 71 ps bin over a 7.7 ps grid holds 9 or 10 cells depending on where it
+  lands, so a smooth distribution acquires an ~11% bin-to-bin ripple; on real
+  data it moved the peak bin by 8%. `collect_and_plot_delta_counts` now snaps
+  the width to an **odd** whole number of cells and the window to a whole
+  number of bins. Odd matters: bins are centred on zero, so their edges lie at
+  half-integer multiples of the width, which for an odd cell count fall on
+  cell boundaries and for an even one fall through cell centres — splitting a
+  cell at every boundary. Verified bin-for-bin on a 3.22 GB run: zero
+  difference from the feather path at 9, 11 and 13 cells per bin, ~1% at 8, 10
+  and 12. Snapping also puts zero exactly on a bin centre, which the feather
+  path's `arange(-W - w/2, ...)` edges only manage when the window happens to
+  be a whole multiple of the width.
+
+### Known
+
+- The feather path's outermost bin at each end is under-filled: it cuts data
+  at `abs(delta) <= plot_window_ps` but draws edges half a bin beyond it. The
+  counts path fills those bins properly, which is most of the ~1% difference
+  in fitted `sigma` between the two. Not changed here — it would alter every
+  existing feather-path result.
+
 ## [0.1.3] - 2026-08-02
 
 ### Fixed
@@ -214,7 +277,9 @@ Initial commit.
 
 - Functions for unpacking raw, binary data and analyzing dark count rate.
 
-[Unreleased]: https://github.com/rngKomorebi/dapkel/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/rngKomorebi/dapkel/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/rngKomorebi/dapkel/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/rngKomorebi/dapkel/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/rngKomorebi/dapkel/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/rngKomorebi/dapkel/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/rngKomorebi/dapkel/releases/tag/v0.0.1

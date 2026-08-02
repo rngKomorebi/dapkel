@@ -154,6 +154,97 @@ dt.collect_and_plot_timestamp_differences(
 )
 ```
 
+## The other stage 1: histogram straight off the `.bin`
+
+Everything above keeps every difference and histograms it later. That is the
+baseline — nothing is thrown away — but the artifact grows with the run, and
+the binning is still chosen at plot time, so every change of mind costs another
+pass over hundreds of GB.
+
+[`calculate_and_save_delta_counts`][dapkel.functions.delta_t.calculate_and_save_delta_counts]
+runs the same loop and bins the differences onto a fixed native grid as it
+finds them, keeping only the counts. It writes no feather at all:
+
+```
+processed/
+  <dataset>_delta_counts.npy         <- (n_pairs, n_cells) int64
+  <dataset>_delta_counts.meta.json   <- grid, pair labels, totals, progress
+```
+
+The size is set by the **grid**, not by the data. A 256-pair run on the default
+grid is 106 MB whether it came from 100 files or 10 000 — measured against a
+3.22 GB feather for the same run, and the same 106 MB for one that reaches
+135 GB. That is what makes every pair plottable at once instead of whichever
+columns you could afford to stream.
+
+### Choosing the grid
+
+Two arguments, `grid_ps` (cell width) and `support_ps` (half-range):
+
+| data | default cell | why |
+|---|---|---|
+| raw codes (`apply_TDC_calibration=False`) | one code, ~77 ps | `delta_code` is an **integer**, so counts-per-code is a re-encoding, not a summary — exactly lossless |
+| calibrated (`unit='ps'`) | 1/10 code, ~7.7 ps | the per-pixel LUT smears the code lattice; 7.7 ps is ~5× finer than the jitter |
+
+`support_ps` defaults to 200 ns — one oscillator period, the entire range a
+difference can physically occupy. Anything landing outside is reported as
+`n_outside` rather than dropped silently; if that is not ~0, widen it.
+
+### Re-binning is free, and exact
+
+`plot_window_ps` becomes a slice and `bin_width_ps` a reduce, both in memory:
+
+```python
+dt.collect_and_plot_delta_counts(
+    path, pairs=["6,10-21,22"], bin_width_ps=71,
+    plot_window_ps=10e3, background="triangle", osc_period_ps=200e3,
+)
+```
+
+By default the binning is **snapped** onto the grid, and the snap is not
+cosmetic:
+
+- the width goes to a whole number of cells, or bins hold 9 then 10 then 9
+  cells and a smooth distribution picks up an ~11% sawtooth;
+- that number is made **odd**. Bins are centred on zero, so their edges sit at
+  half-integer multiples of the width — odd puts those edges on cell
+  *boundaries*, even puts them through cell *centres*, splitting a cell at
+  every boundary. Measured on a real 3.22 GB run: **exactly zero** difference
+  from the feather path at 9, 11 and 13 cells per bin, ~1% at 8, 10 and 12;
+- the window goes to a whole number of bins, so zero is a bin centre.
+
+So with snapping on, this is not an approximation of the feather histogram —
+it is the same histogram. Pass `snap_to_grid=False` to take your numbers
+literally, and you will be warned about the sawtooth you are asking for.
+
+The one honest disagreement is the outermost bin at each end. The feather path
+cuts data at `abs(delta) <= plot_window_ps` but draws edges half a bin beyond
+it, so its first and last bins can only ever be part filled; the counts path
+fills them. That, not the method, is why fitted `sigma` differs by ~1%.
+
+### What you give up
+
+No per-event data survives, so there is no re-calibrating with a different LUT,
+no re-cutting `delta_window`, and nothing that needs individual differences —
+time ordering, splitting by acquisition, higher-order correlations. It also
+does not make stage 1 meaningfully faster: unpacking dominates either way. The
+win is artifact size and replot latency. Keep the feather until you are sure
+you want none of that back.
+
+### Crash insurance without a part folder
+
+The grid is rewritten every `flush_every` files (default 50), so a run that
+dies leaves a valid artifact covering everything up to its last checkpoint, and
+the next call resumes from it. There is only ever one file, so two runs cannot
+interleave — the failure mode `combine_delta_t_parts` exists to guard against
+simply does not arise here.
+
+The sidecar records `files_done` and `total_in_grid`. The array is moved into
+place before the sidecar, so a crash between the two moves could pair a newer
+array with an older sidecar; resuming on that would re-count files and inflate
+the total. The resume path checks the array against `total_in_grid` and starts
+over rather than continue from something inconsistent.
+
 ## Overwriting: the five-second countdown
 
 Every `rewrite=True` in this module routes through

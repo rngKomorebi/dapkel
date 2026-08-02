@@ -771,3 +771,66 @@ def test_untagged_parts_from_two_runs_are_flagged(tmp_path, capsys):
 
     dt._part_runs(str(parts_dir))
     assert "looks like two runs" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# reading a feather must not depend on how many batches it was written in
+# --------------------------------------------------------------------------
+
+
+def test_sources_are_memory_mapped_not_read_into_memory(tmp_path):
+    """'pa.ipc.open_file(path)' materialises a whole record batch on demand.
+
+    Invisible on a feather assembled from 64 MB parts, fatal on one written in
+    a single batch - which is every feather the pre-parts code produced. A
+    9.4 GB single-batch file then asks for 9.4 GB in one allocation, and the
+    "streaming" read streams nothing.
+    """
+    path = str(tmp_path / "one_batch.feather")
+    dt._write_delta_feather(
+        path, {lbl: np.arange(100.0) for lbl in LABELS}, LABELS, "ps"
+    )
+
+    with dt._open_delta_feather(path) as reader:
+        source = reader
+        assert reader.num_record_batches == 1
+        # Copied out, so it must survive the mapping being torn down.
+        kept = reader.get_batch(0).column(0).to_numpy(zero_copy_only=False) + 0
+
+    del source
+    np.testing.assert_array_equal(kept, np.arange(100.0))
+
+
+def test_one_batch_and_many_batches_histogram_identically(tmp_path):
+    """The batch layout is a storage detail, never a result."""
+    rng = np.random.default_rng(11)
+    chunks = [{lbl: rng.normal(scale=300, size=250) for lbl in LABELS}
+              for _ in range(8)]
+
+    single = str(tmp_path / "single.feather")
+    dt._write_delta_feather(
+        single,
+        {lbl: np.concatenate([c[lbl] for c in chunks]) for lbl in LABELS},
+        LABELS,
+        "ps",
+    )
+
+    writer = _writer(tmp_path)
+    for chunk in chunks:
+        writer.add(chunk)
+    parts = writer.close()
+    many = str(tmp_path / "many.feather")
+    dt._combine_delta_feathers(parts, many)
+
+    assert len(parts) > 1, "the fixture must actually roll over"
+    with dt._open_delta_feather(many) as reader:
+        assert reader.num_record_batches > 1
+
+    edges = dt._delta_hist_edges(77.0, 3080.0)
+    kwargs = dict(edges=edges, time_unit_ps=77.0, plot_window_ps=3080.0,
+                  pairs=None, quiet=True)
+    one_counts, one_stats = dt._stream_delta_histogram([single], **kwargs)
+    many_counts, many_stats = dt._stream_delta_histogram([many], **kwargs)
+
+    np.testing.assert_array_equal(one_counts, many_counts)
+    assert one_stats["total"] == many_stats["total"] > 0

@@ -23,12 +23,13 @@ See ``docs/guide/coincidences.md`` and ``docs/ort_triangle_background.md``.
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import hashlib
 import json
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -51,6 +52,10 @@ __all__ = [
     "combine_delta_t_feathers",
     # stage 1b - stream the feather down to a histogram
     "compute_and_save_delta_histogram",
+    # stage 1' - histogram straight off the '.bin', no feather at all
+    "calculate_and_save_delta_counts",
+    "load_delta_counts",
+    "rebin_delta_counts",
     # fit models and fitting
     "gaussian",
     "gaussian_plus_triangle",
@@ -58,6 +63,7 @@ __all__ = [
     "fit_gaussian_on_triangle",
     # drivers - load saved feathers, figures on disk
     "collect_and_plot_timestamp_differences",
+    "collect_and_plot_delta_counts",
 ]
 
 #: Analysis name: the results sub-folder for the figures.
@@ -95,7 +101,36 @@ _MANIFEST_SUFFIX = "_manifest.json"
 # expensive streaming pass is paid once per binning rather than per plot.
 _HIST_SUFFIX = "_delta_hist.npy"
 
+# File name suffix of the counts artifact 'calculate_and_save_delta_counts'
+# writes into 'processed/'. This is the *alternative* stage 1: instead of
+# writing every difference and histogramming it later, the differences are
+# binned onto a fixed native grid inside the per-file loop and only the counts
+# are kept. Nothing downstream needs more than counts, so the artifact is a
+# ~100 MB array where the feather is 3-135 GB, and it is a re-encoding rather
+# than a summary for raw-code data (see '_delta_grid').
+_COUNTS_SUFFIX = "_delta_counts.npy"
 
+# Sub-divisions of one TDC code used as the native grid when the differences
+# are already calibrated (unit 'ps'). A per-pixel LUT smears the code grid, so
+# there is no exact integer lattice to land on; 1/10 of a code (~7.7 ps) is
+# ~5x finer than the detector's own jitter, which makes the displacement it
+# introduces (<= 3.85 ps) irrelevant to any fitted sigma. Raw codes need no
+# subdivision - they *are* integers - so this applies to 'ps' data only.
+_GRID_SUBDIV = 10
+
+# Default half-range of the counts grid, in ps. A difference cannot exceed one
+# oscillator period, so a grid this wide holds the entire physical support and
+# the window only ever gets narrowed afterwards, in memory. Widen it for a
+# longer period; anything landing outside is counted in 'n_outside' rather
+# than silently dropped.
+_SUPPORT_PS = 200000.0
+
+# Files between checkpoint writes during the counts pass. The whole grid is
+# rewritten each time, which costs one ~100 MB write - cheap against unpacking
+# 50 files, and it means a run that dies has a complete, valid artifact for
+# every file up to its last checkpoint. This replaces the part folder: there
+# is only ever one file, so two runs cannot interleave.
+_FLUSH_EVERY = 50
 
 
 def _structure_pixel_timestamps(
@@ -788,6 +823,31 @@ def _write_delta_feather(
     return total
 
 
+@contextlib.contextmanager
+def _open_delta_feather(src: str) -> Iterator[pa.ipc.RecordBatchFileReader]:
+    """Open a delta-t feather **memory-mapped**, for batch-at-a-time reading.
+
+    ``pa.ipc.open_file(path)`` reads a whole record batch into memory the
+    moment one is asked for. That is invisible on a feather assembled from
+    64 MB parts, but everything written in a single batch - which is every
+    feather the pre-parts code produced, and anything '_write_delta_feather'
+    writes directly - then loads *entirely*. Measured: +794 MB for a 0.79 GB
+    single-batch feather, so a 9.4 GB one asks for 9.4 GB in one allocation
+    and the "streaming" read is streaming in name only.
+
+    Memory mapping makes 'get_batch' cost nothing (+0 MB, same file) and lets
+    the OS page in only the columns actually touched.
+
+    Anything derived from a batch must be *copied* before this context exits -
+    a zero-copy 'to_numpy' is a view into the mapping, which is unmapped on
+    the way out. Boolean masking, arithmetic and 'write_batch' all copy, which
+    is why every caller here is safe.
+    """
+    with pa.memory_map(src, "rb") as source:
+        with pa.ipc.open_file(source) as reader:
+            yield reader
+
+
 def _read_delta_feather(feather_path: str) -> tuple[pd.DataFrame, str | None]:
     """Read a delta-t '.feather' into a DataFrame plus its unit.
 
@@ -871,7 +931,7 @@ def _combine_delta_feathers(
     seen: set[str] = set()
     units: set[str] = set()
     for src in sources:
-        with pa.ipc.open_file(src) as reader:
+        with _open_delta_feather(src) as reader:
             schema = reader.schema
         src_unit = (schema.metadata or {}).get(b"delta_unit", b"").decode()
         if src_unit:
@@ -899,7 +959,7 @@ def _combine_delta_feathers(
     total = 0
     with pa.ipc.new_file(out_path, out_schema) as writer:
         for src in sources:
-            with pa.ipc.open_file(src) as reader:
+            with _open_delta_feather(src) as reader:
                 present = set(reader.schema.names)
                 for i in range(reader.num_record_batches):
                     batch = reader.get_batch(i)
@@ -1268,7 +1328,7 @@ def _pooled_columns(
     names: list[str] = []
     units: set[str] = set()
     for src in sources:
-        with pa.ipc.open_file(src) as reader:
+        with _open_delta_feather(src) as reader:
             schema = reader.schema
         src_unit = (schema.metadata or {}).get(b"delta_unit", b"").decode()
         if src_unit:
@@ -1351,7 +1411,7 @@ def _stream_delta_histogram(
     # Batch counts come from the footer, so the bar knows its length up front.
     plan: list[tuple[str, int]] = []
     for src in sources:
-        with pa.ipc.open_file(src) as reader:
+        with _open_delta_feather(src) as reader:
             plan.append((src, reader.num_record_batches))
 
     counts = np.zeros(len(edges) - 1, dtype=np.int64)
@@ -1367,7 +1427,7 @@ def _stream_delta_histogram(
         disable=quiet,
     )
     for src, n_batches in plan:
-        with pa.ipc.open_file(src) as reader:
+        with _open_delta_feather(src) as reader:
             present = set(reader.schema.names)
             indices = [
                 reader.schema.get_field_index(c)
@@ -1562,6 +1622,633 @@ def compute_and_save_delta_histogram(
             "hist_path": hist_path,
             "reused": False,
         },
+    )
+
+
+def _pair_labels(
+    pixels: Sequence[Sequence[Pixel]], mode: str
+) -> tuple[list[str], list[Pixel]]:
+    """Build the ordered pair-column labels for two pixel groups.
+
+    Same construction 'calculate_and_save_timestamp_differences' does inline,
+    and it must stay that way: the two stage-1 paths are only comparable if
+    they agree on which pairs exist and in what order. Merge them into one
+    call site once we have decided which path to keep.
+
+    Parameters
+    ----------
+    pixels : Sequence[Sequence[tuple[int, int]]]
+        Two groups ``[group_a, group_b]``.
+    mode : str
+        ``'all_pairs'`` or ``'1v1'``.
+
+    Returns
+    -------
+    labels : list[str]
+        ``"ra,ca-rb,cb"`` per pair, in a deterministic order.
+    all_pixels : list[tuple[int, int]]
+        Every pixel mentioned, de-duplicated, first-seen order.
+
+    Raises
+    ------
+    ValueError
+        Raised on an unknown ``mode``, or unequal groups under ``'1v1'``.
+    """
+    if mode not in ("all_pairs", "1v1"):
+        raise ValueError(f"mode must be 'all_pairs' or '1v1', got {mode!r}")
+
+    group_a = cd.as_pixel_list(pixels[0])
+    group_b = cd.as_pixel_list(pixels[1])
+    if mode == "1v1":
+        if len(group_a) != len(group_b):
+            raise ValueError(
+                "mode='1v1' needs equal-length groups "
+                f"(got {len(group_a)} and {len(group_b)})."
+            )
+        pair_list = list(zip(group_a, group_b, strict=True))
+    else:
+        pair_list = [(a, b) for a in group_a for b in group_b]
+
+    labels = [f"{a[0]},{a[1]}-{b[0]},{b[1]}" for a, b in pair_list]
+    return labels, list(dict.fromkeys(group_a + group_b))
+
+
+def _resolve_time_lut(
+    apply_TDC_calibration: bool,
+    daughterboard_number: str | None,
+    motherboard_number: str | None,
+    spad: int | str,
+) -> np.ndarray | None:
+    """Load the density-test LUT to apply before differencing, or None.
+
+    Mirrors what 'calculate_and_save_timestamp_differences' does inline; see
+    '_pair_labels' on why the duplication is deliberate for now.
+
+    Returns
+    -------
+    np.ndarray | None
+        The code -> ps lookup table, or None to keep raw codes.
+
+    Raises
+    ------
+    ValueError
+        Raised when calibration is asked for without naming a board.
+    """
+    if not apply_TDC_calibration:
+        return None
+    if daughterboard_number is None or motherboard_number is None:
+        raise ValueError(
+            "apply_TDC_calibration=True but no board was given. Pass "
+            "daughterboard_number and motherboard_number, or set "
+            "apply_TDC_calibration=False to save raw codes."
+        )
+    return tc.load_board_lut(daughterboard_number, motherboard_number, spad)
+
+
+def _delta_grid(
+    grid_ps: float, support_ps: float
+) -> tuple[int, int, np.ndarray]:
+    """Define the native counts grid: bins centred on zero, spanning support.
+
+    Bin ``i`` covers ``[(i - zero) - 0.5, (i - zero) + 0.5] * grid_ps``, so
+    **zero sits at a bin centre by construction**. That is the one thing the
+    feather path cannot promise: its edges come from
+    ``arange(-W - w/2, ...)``, which only centres a bin on zero when the
+    window is an exact multiple of the width.
+
+    For raw codes (``grid_ps`` = one code) the grid is not an approximation at
+    all: ``delta_code`` is an integer, so counts-per-code carries exactly the
+    information the feather did, at ~8 bytes per *bin* instead of per *event*.
+
+    Parameters
+    ----------
+    grid_ps : float
+        Width of one grid cell, in ps.
+    support_ps : float
+        Half-range to cover, in ps. Rounded up to a whole number of cells.
+
+    Returns
+    -------
+    n_bins : int
+        Number of cells, always odd.
+    zero_index : int
+        Index of the cell holding zero.
+    edges : np.ndarray
+        The ``n_bins + 1`` cell edges, in ps.
+    """
+    if grid_ps <= 0:
+        raise ValueError(f"grid_ps must be positive, got {grid_ps}")
+    if support_ps <= 0:
+        raise ValueError(f"support_ps must be positive, got {support_ps}")
+    zero_index = int(np.ceil(support_ps / grid_ps))
+    n_bins = 2 * zero_index + 1
+    edges = (np.arange(n_bins + 1) - zero_index - 0.5) * grid_ps
+    return n_bins, zero_index, edges
+
+
+def _counts_signature(
+    files: Sequence[str],
+    *,
+    labels: Sequence[str],
+    mode: str,
+    valid_min: float,
+    delta_window: float | None,
+    unit: str,
+    grid_ps: float,
+    support_ps: float,
+) -> dict:
+    """Everything that must match for a partial counts run to be resumed.
+
+    The file list is fingerprinted by (name, size) - a checkpoint is only
+    resumable against the same files in the same order, since progress is
+    recorded as "the first N of them".
+    """
+    digest = hashlib.sha1()
+    for fp in files:
+        digest.update(f"{os.path.basename(fp)}:{os.path.getsize(fp)};".encode())
+    return {
+        "n_files": len(files),
+        "files_digest": digest.hexdigest(),
+        "labels_digest": hashlib.sha1(
+            "|".join(labels).encode()
+        ).hexdigest(),
+        "n_labels": len(labels),
+        "mode": mode,
+        "valid_min": float(valid_min),
+        "delta_window": None if delta_window is None else float(delta_window),
+        "unit": unit,
+        "grid_ps": float(grid_ps),
+        "support_ps": float(support_ps),
+    }
+
+
+def _accumulate_delta_counts(
+    counts: np.ndarray,
+    deltas: dict[str, np.ndarray],
+    rows: dict[str, int],
+    *,
+    grid_ps: float,
+    zero_index: int,
+) -> tuple[int, int]:
+    """Bin one file's differences into the resident counts grid, in place.
+
+    'np.add.at' rather than 'np.bincount': bincount pays for the whole grid on
+    every call, and a single file contributes a handful of differences per
+    pair, so the fixed cost would dwarf the data by orders of magnitude.
+
+    Returns
+    -------
+    total : int
+        Differences seen.
+    outside : int
+        Differences beyond the grid's support. Counted, never dropped
+        silently - if this is not ~0 the support is too narrow and the
+        triangular background is being clipped.
+    """
+    n_bins = counts.shape[1]
+    total = 0
+    outside = 0
+    for label, arr in deltas.items():
+        row = rows.get(label)
+        if row is None or not arr.size:
+            continue
+        arr = arr[np.isfinite(arr)]
+        if not arr.size:
+            continue
+        total += int(arr.size)
+        idx = np.rint(arr / grid_ps).astype(np.int64) + zero_index
+        keep = (idx >= 0) & (idx < n_bins)
+        outside += int(arr.size - np.count_nonzero(keep))
+        np.add.at(counts[row], idx[keep], 1)
+    return total, outside
+
+
+def _write_counts_checkpoint(
+    counts_path: str, counts: np.ndarray, meta: dict
+) -> None:
+    """Write the counts grid and its sidecar as atomically as two files allow.
+
+    Both are written to temporaries and moved into place, array first. A crash
+    in the microseconds between the two moves leaves a newer array beside an
+    older sidecar, which would make a resume re-run files already counted - so
+    the sidecar carries ``total_in_grid`` and the resume path refuses to
+    continue unless the array sums to it.
+    """
+    tmp_npy = counts_path + ".tmp.npy"
+    tmp_meta = store.meta_path(counts_path) + ".tmp"
+    np.save(tmp_npy, counts)
+    with open(tmp_meta, "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, indent=2)
+    os.replace(tmp_npy, counts_path)
+    os.replace(tmp_meta, store.meta_path(counts_path))
+
+
+def calculate_and_save_delta_counts(
+    path: str,
+    pixels: Sequence[Sequence[Pixel]],
+    rewrite: bool = False,
+    *,
+    tag: str = "ORT",
+    mode: str = "all_pairs",
+    delta_window: float | None = None,
+    valid_min: float = 0.0,
+    apply_TDC_calibration: bool = True,
+    daughterboard_number: str | None = None,
+    motherboard_number: str | None = None,
+    spad: int | str = "average",
+    nframes: int | None = None,
+    max_files: int | None = None,
+    grid_ps: float | None = None,
+    support_ps: float = _SUPPORT_PS,
+    flush_every: int = _FLUSH_EVERY,
+    resume: bool = True,
+) -> str:
+    """Unpack ORT data and histogram delta-t directly - no feather.
+
+    The alternative to 'calculate_and_save_timestamp_differences'. Same loop
+    (unpack -> per-pixel timestamps -> 'calc_diff.calculate_differences'), but
+    the differences are binned onto a fixed native grid as they are found and
+    only the counts are kept. Writes
+    ``processed/<name>_delta_counts.npy``: one row per pixel pair, one column
+    per grid cell.
+
+    The size is set by the *grid*, not by the data - a 10 000-file run and a
+    100-file run produce the same ~100 MB artifact, against 3-135 GB of
+    feather. That is what makes every pair plottable at once, and it makes
+    re-binning free: 'rebin_delta_counts' turns the grid into any coarser
+    histogram in memory, so ``bin_width_ps`` and ``plot_window_ps`` stop being
+    compute-time decisions.
+
+    **What it gives up.** No per-event data survives, so there is no
+    re-calibrating with a different LUT, no re-cutting ``delta_window``, and
+    no analysis that needs individual differences (time ordering, splitting by
+    acquisition, higher-order correlations). Keep the feather until you have
+    decided you never want those.
+
+    **How exact it is.** For raw codes (``apply_TDC_calibration=False``) the
+    default grid is one code and the result is *lossless* - integers binned
+    onto their own lattice. For calibrated data the LUT smears the lattice, so
+    each difference is displaced by up to ``grid_ps / 2`` (~3.85 ps at the
+    default), which is far below the detector jitter but is not bit-exact
+    against the feather.
+
+    Crash insurance is one file rather than a part folder: the grid is
+    rewritten every ``flush_every`` files, so a run that dies leaves a valid
+    artifact covering everything up to its last checkpoint, and ``resume``
+    picks it up. Two runs cannot interleave, because there is only ever one
+    file to write.
+
+    Parameters
+    ----------
+    path : str
+        Path to the folder with the ORT '.bin' data files.
+    pixels : Sequence[Sequence[tuple[int, int]]]
+        Two groups ``[group_a, group_b]`` - the signal and idler blobs.
+    rewrite : bool, optional
+        Overwrite a *complete* counts artifact for this data set. The default
+        is False, which raises instead. An incomplete one is resumed rather
+        than overwritten (see ``resume``).
+    tag : str, optional
+        Filename fragment selecting the files. The default is ``'ORT'``.
+    mode : str, optional
+        ``'all_pairs'`` (default) or ``'1v1'``.
+    delta_window : float | None, optional
+        Keep only differences with ``abs(delta) <= delta_window``. In code
+        units, or ps if calibrating. The default is None (keep all). Note this
+        is frozen into the artifact - unlike the feather, it cannot be
+        narrowed afterwards, so prefer leaving it None and cutting at plot
+        time.
+    valid_min : float, optional
+        A frame is valid when ``time_series > valid_min``. The default is 0.0.
+    apply_TDC_calibration : bool, optional
+        Apply the per-pixel code -> ps LUT before differencing. The default is
+        True, which requires ``daughterboard_number`` and
+        ``motherboard_number``.
+    daughterboard_number : str | None, optional
+        Daughterboard id (e.g. ``'D0'``). The default is None.
+    motherboard_number : str | None, optional
+        Motherboard id (e.g. ``'M0'``). The default is None.
+    spad : int | str, optional
+        Which SPAD's LUT to use. The default is ``'average'``.
+    nframes : int | None, optional
+        Frames per file. When None (default) it is derived from file size.
+    max_files : int | None, optional
+        Process at most this many files. The default is None (all files).
+    grid_ps : float | None, optional
+        Width of one grid cell, in ps. The default is None, meaning one TDC
+        code (~77 ps) for raw-code data - where that is exact - and one tenth
+        of a code (~7.7 ps) for calibrated data.
+    support_ps : float, optional
+        Half-range of the grid, in ps. The default is 200 000 (200 ns), one
+        oscillator period. Differences beyond it are counted in
+        ``n_outside``.
+    flush_every : int, optional
+        Files between checkpoint writes. The default is 50.
+    resume : bool, optional
+        Continue an incomplete artifact for the same inputs instead of
+        starting over. The default is True.
+
+    Returns
+    -------
+    str
+        Path to the saved '.npy'.
+
+    Raises
+    ------
+    FileExistsError
+        Raised when a complete artifact exists and ``rewrite`` is False.
+    ValueError
+        Raised on a bad ``mode``, unequal ``'1v1'`` groups, a calibration
+        request with no board, or a non-positive grid.
+    """
+    files = io.find_bin_files(path, tag)
+    if max_files is not None:
+        files = files[:max_files]
+
+    labels, all_pixels = _pair_labels(pixels, mode)
+    time_lut = _resolve_time_lut(
+        apply_TDC_calibration, daughterboard_number, motherboard_number, spad
+    )
+    unit = "ps" if time_lut is not None else "code"
+
+    if grid_ps is None:
+        grid_ps = (
+            _TS_CODE_PS / _GRID_SUBDIV if unit == "ps" else _TS_CODE_PS
+        )
+    # In code units the grid and the support are counts of codes, not ps.
+    grid = grid_ps if unit == "ps" else grid_ps / _TS_CODE_PS
+    support = support_ps if unit == "ps" else support_ps / _TS_CODE_PS
+    n_bins, zero_index, _ = _delta_grid(grid, support)
+
+    name = os.path.basename(os.path.normpath(path))
+    counts_path = os.path.join(
+        store.processed_dir(path), f"{name}{_COUNTS_SUFFIX}"
+    )
+    signature = _counts_signature(
+        files,
+        labels=labels,
+        mode=mode,
+        valid_min=valid_min,
+        delta_window=delta_window,
+        unit=unit,
+        grid_ps=grid_ps,
+        support_ps=support_ps,
+    )
+
+    counts = np.zeros((len(labels), n_bins), dtype=np.int64)
+    rows = {label: i for i, label in enumerate(labels)}
+    start = 0
+    total = 0
+    outside = 0
+
+    existing = store.read_meta(counts_path) if os.path.isfile(counts_path) else {}
+    if existing.get("signature") == signature:
+        if existing.get("complete"):
+            if not rewrite:
+                raise FileExistsError(
+                    f"{counts_path} already covers all {len(files)} file(s). "
+                    "Pass rewrite=True to recompute."
+                )
+            store.confirm_rewrite([counts_path])
+        elif resume:
+            saved, _ = store.load_map(npy_path=counts_path)
+            # The sidecar is moved into place after the array, so a crash
+            # between the two moves can pair a newer array with an older
+            # sidecar. Resuming on that would re-count files, and a silently
+            # inflated coincidence total is worse than starting again.
+            if (
+                saved.shape == counts.shape
+                and int(saved.sum()) == existing.get("total_in_grid")
+            ):
+                counts = saved
+                start = int(existing.get("files_done", 0))
+                total = int(existing.get("total", 0))
+                outside = int(existing.get("n_outside", 0))
+                print(
+                    f"\n> > > Resuming {os.path.basename(counts_path)} at "
+                    f"file {start} of {len(files)} < < <"
+                )
+            else:
+                print(
+                    f"\n  {os.path.basename(counts_path)} is inconsistent "
+                    "with its sidecar (interrupted mid-write); starting over."
+                )
+    elif os.path.isfile(counts_path) and not rewrite:
+        raise FileExistsError(
+            f"{counts_path} exists but was computed from different inputs "
+            "(files, pairs, grid or calibration). Pass rewrite=True to "
+            "replace it."
+        )
+    elif os.path.isfile(counts_path):
+        store.confirm_rewrite([counts_path])
+
+    def _meta(files_done: int, complete: bool) -> dict:
+        return {
+            "signature": signature,
+            "labels": labels,
+            "unit": unit,
+            "grid_ps": float(grid_ps),
+            # The cell width in the *stored* unit - codes when uncalibrated.
+            # Keeping both means the ps-per-code assumption is not baked in:
+            # a code grid can be re-scaled at load time, exactly as the
+            # feather path's 'time_unit_ps' does.
+            "grid_native": float(grid),
+            "support_ps": float(support_ps),
+            "n_bins": int(n_bins),
+            "zero_index": int(zero_index),
+            "tag": tag,
+            "files_done": int(files_done),
+            "n_files": len(files),
+            "complete": bool(complete),
+            "total": int(total),
+            "n_outside": int(outside),
+            "total_in_grid": int(counts.sum()),
+        }
+
+    print(
+        f"\n> > > Histogramming delta-t straight from {len(files) - start} "
+        f"'.bin' file(s) (mode='{mode}', tag='{tag}') onto a "
+        f"{len(labels)} x {n_bins} grid of {grid_ps:.2f} ps cells spanning "
+        f"+/-{support_ps:.0f} ps - "
+        f"{counts.nbytes / 1024**2:.0f} MB, no feather < < <\n"
+    )
+
+    for i, fp in enumerate(
+        tqdm(files[start:], desc=tag or "delta_counts"), start=start + 1
+    ):
+        nf = nframes if nframes is not None else io.frames_in_file(fp)
+        ts, _ = unpack(fp, nf, compute_time_series=True)
+        pixel_ts = _structure_pixel_timestamps(
+            ts, all_pixels, valid_min, time_lut
+        )
+        deltas = cd.calculate_differences(
+            pixel_ts, pixels, delta_window=delta_window, mode=mode
+        )
+        seen, out = _accumulate_delta_counts(
+            counts, deltas, rows, grid_ps=grid, zero_index=zero_index
+        )
+        total += seen
+        outside += out
+        if i % flush_every == 0:
+            _write_counts_checkpoint(counts_path, counts, _meta(i, False))
+
+    _write_counts_checkpoint(counts_path, counts, _meta(len(files), True))
+
+    print(
+        f"\n> > > {total} difference(s) across {len(labels)} pixel-pair "
+        f"row(s) binned onto {n_bins} cells; {outside} outside "
+        f"+/-{support_ps:.0f} ps. Saved to {counts_path} "
+        f"(unit '{unit}') < < <"
+    )
+    if outside:
+        print(
+            f"  NOTE: {100 * outside / max(total, 1):.2f}% of differences "
+            "fell outside the grid and are counted but not binned. Raise "
+            "support_ps to keep them."
+        )
+    return counts_path
+
+
+def load_delta_counts(
+    path: str | None = None,
+    *,
+    counts_path: str | None = None,
+    pairs: Sequence[str] | None = None,
+    pool: bool = True,
+    time_unit_ps: float = _TS_CODE_PS,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Load a saved counts grid and its cell centres.
+
+    Parameters
+    ----------
+    path : str | None, optional
+        Data folder whose ``processed/`` holds the artifact. May be None when
+        ``counts_path`` is given.
+    counts_path : str | None, optional
+        Explicit '.npy' to load, ignoring ``path``. The default is None.
+    pairs : Sequence[str] | None, optional
+        Restrict to these pixel-pair labels. The default is None (all).
+    pool : bool, optional
+        Sum the selected pairs into one 1D histogram. The default is True;
+        pass False to keep the ``(n_pairs, n_bins)`` array.
+    time_unit_ps : float, optional
+        Picoseconds per raw TDC code, used to place the cell centres of an
+        *uncalibrated* (``'code'``) grid. The default is ~77 ps. Ignored for a
+        calibrated grid, whose cells are already in ps.
+
+    Returns
+    -------
+    counts : np.ndarray
+        1D pooled counts, or 2D per-pair counts when ``pool=False``.
+    centers : np.ndarray
+        Grid cell centres, in **picoseconds** whatever the stored unit.
+    info : dict
+        The sidecar, plus ``name``, ``root``, ``counts_path``, the selected
+        ``labels``, the effective ``cell_ps`` and any requested pairs that
+        were ``missing``.
+
+    Raises
+    ------
+    ValueError
+        Raised when neither ``path`` nor ``counts_path`` is given.
+    FileNotFoundError
+        Raised when the artifact does not exist.
+    """
+    if counts_path is None:
+        if path is None:
+            raise ValueError("Provide either path or counts_path.")
+        name = os.path.basename(os.path.normpath(path))
+        counts_path = os.path.join(
+            store.processed_dir(path, create=False), f"{name}{_COUNTS_SUFFIX}"
+        )
+    counts_path = os.path.abspath(counts_path)
+    counts, meta = store.load_map(npy_path=counts_path)
+
+    name = os.path.basename(counts_path).removesuffix(_COUNTS_SUFFIX)
+    root = os.path.dirname(os.path.dirname(counts_path))
+
+    labels = list(meta.get("labels", []))
+    missing: list[str] = []
+    if pairs is not None:
+        wanted = [p for p in pairs if p in labels]
+        missing = [p for p in pairs if p not in labels]
+        counts = counts[[labels.index(p) for p in wanted]]
+        labels = wanted
+
+    zero_index = int(meta.get("zero_index", (counts.shape[-1] - 1) // 2))
+    grid_native = float(meta.get("grid_native", meta.get("grid_ps", 1.0)))
+    # A code grid's cells are codes; scale them to ps here rather than at save
+    # time, so a better ps-per-code can be applied without recomputing.
+    cell_ps = (
+        grid_native
+        if meta.get("unit", "ps") == "ps"
+        else grid_native * time_unit_ps
+    )
+    centers = (np.arange(counts.shape[-1]) - zero_index) * cell_ps
+
+    if pool:
+        counts = counts.sum(axis=0)
+
+    info = {
+        **meta,
+        "name": name,
+        "root": root,
+        "counts_path": counts_path,
+        "labels": labels,
+        "missing": missing,
+        "cell_ps": cell_ps,
+    }
+    if not meta.get("complete", True):
+        print(
+            f"  NOTE: {os.path.basename(counts_path)} is incomplete - "
+            f"{meta.get('files_done')} of {meta.get('n_files')} file(s)."
+        )
+    return counts, centers, info
+
+
+def rebin_delta_counts(
+    counts: np.ndarray,
+    centers: np.ndarray,
+    *,
+    bin_width_ps: float,
+    plot_window_ps: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reduce a native counts grid onto a coarser histogram, in memory.
+
+    Each grid cell is assigned whole to the target bin its *centre* falls in.
+    That is exact whenever ``bin_width_ps`` is a whole multiple of the grid
+    cell and the two lattices line up; otherwise a cell straddling a target
+    edge goes entirely one way, which is the rebinning, not the data. Bin on a
+    multiple of the grid when comparing against the feather path.
+
+    Parameters
+    ----------
+    counts : np.ndarray
+        1D pooled counts on the native grid, from 'load_delta_counts'.
+    centers : np.ndarray
+        The grid cell centres in ps, from 'load_delta_counts'.
+    bin_width_ps : float
+        Target bin width, in ps.
+    plot_window_ps : float
+        Target half-range, in ps.
+
+    Returns
+    -------
+    counts : np.ndarray
+        Counts per target bin.
+    edges : np.ndarray
+        The target bin edges - the same '_delta_hist_edges' the feather path
+        uses, so the two histograms are directly comparable.
+    """
+    edges = _delta_hist_edges(bin_width_ps, plot_window_ps)
+    counts = np.asarray(counts).ravel()
+    idx = np.searchsorted(edges, centers, side="right") - 1
+    inside = (idx >= 0) & (idx < len(edges) - 1)
+    return (
+        np.bincount(
+            idx[inside], weights=counts[inside], minlength=len(edges) - 1
+        ).astype(np.int64),
+        edges,
     )
 
 
@@ -1966,6 +2653,86 @@ def collect_and_plot_timestamp_differences(
             "in the acquisition."
         )
 
+    return _fit_and_plot_delta(
+        counts,
+        centers,
+        name=name,
+        results_dir=results_dir,
+        bin_width_ps=bin_width_ps,
+        plot_window_ps=plot_window_ps,
+        fit_window_ps=fit_window_ps,
+        background=background,
+        osc_period_ps=osc_period_ps,
+        label=label,
+        cmap_title=cmap_title,
+        n_in_window=n_in_window,
+        stem="delta_t",
+    )
+
+
+def _fit_and_plot_delta(
+    counts: np.ndarray,
+    centers: np.ndarray,
+    *,
+    name: str,
+    results_dir: str,
+    bin_width_ps: float,
+    plot_window_ps: float,
+    fit_window_ps: float | None,
+    background: str,
+    osc_period_ps: float,
+    label: str,
+    cmap_title: str | None,
+    n_in_window: int,
+    stem: str,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Fit the coincidence peak on a histogram, plot it, and save the figure.
+
+    Shared by both stage-2 drivers *on purpose*: the feather path and the
+    counts path are only comparable if the fitting and the drawing are
+    literally the same code, so that any difference between their results is
+    the histogram and nothing else.
+
+    Parameters
+    ----------
+    counts, centers : np.ndarray
+        The histogram to fit, and its bin centres in ps.
+    name : str
+        Dataset name, for the title and file name.
+    results_dir : str
+        Folder the figure is written to; created if missing.
+    bin_width_ps : float
+        Bar width for the plot, in ps.
+    plot_window_ps : float
+        Half-range the model curve is drawn over, in ps.
+    fit_window_ps : float | None
+        Fit half-range around the tallest bin; ``'flat'`` background only.
+    background : str
+        ``'flat'`` or ``'triangle'``; see
+        'collect_and_plot_timestamp_differences'.
+    osc_period_ps : float
+        Triangle half-base seed, in ps.
+    label : str
+        Short label for the title and file name.
+    cmap_title : str | None
+        Optional title override.
+    n_in_window : int
+        Differences the histogram was built from, for the legend and
+        ``fit['n']``.
+    stem : str
+        File-name fragment identifying which path drew this
+        (``'delta_t'`` / ``'delta_counts'``), so both figures coexist.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray, dict]
+        ``(counts, centers, fit)`` - what both drivers return.
+
+    Raises
+    ------
+    ValueError
+        Raised on an unknown ``background``.
+    """
     if background not in ("flat", "triangle"):
         raise ValueError(
             f"background must be 'flat' or 'triangle', got {background!r}"
@@ -2022,7 +2789,7 @@ def collect_and_plot_timestamp_differences(
     # fig.tight_layout()
 
     os.makedirs(results_dir, exist_ok=True)
-    out_png = os.path.join(results_dir, f"{name}_{label}_delta_t.png")
+    out_png = os.path.join(results_dir, f"{name}_{label}_{stem}.png")
     fig.savefig(out_png)
     # plt.close(fig)
     print(
@@ -2041,6 +2808,220 @@ def collect_and_plot_timestamp_differences(
         )
 
     return counts, centers, fit
+
+
+def _snap_binning(
+    bin_width_ps: float, plot_window_ps: float, cell_ps: float
+) -> tuple[float, float]:
+    """Round a binning onto the counts grid, and say so if it moved.
+
+    Three roundings, each fixing a distinct artifact:
+
+    * the **width** to a whole number of cells, so every bin holds the same
+      number of them. Otherwise the count alternates (9, 10, 9, 10 ...) and a
+      smooth distribution acquires a sawtooth of ``1 / n_cells``;
+    * that number to an **odd** one, which is what makes the rebin exact.
+      Bins are centred on zero, so their edges sit at half-integer multiples
+      of the width; an odd width in cells puts those edges on cell
+      *boundaries*, an even one puts them on cell *centres* - bisecting a
+      cell at every boundary and forcing its whole population one way. On a
+      real run that cost ~1% of the counts, against exactly zero for an odd
+      width;
+    * the **window** to a whole number of bins, so zero lands on a bin centre
+      rather than up to half a bin off it.
+
+    Returns
+    -------
+    tuple[float, float]
+        The snapped ``(bin_width_ps, plot_window_ps)``.
+    """
+    raw = bin_width_ps / cell_ps
+    cells = max(int(round(raw)), 1)
+    if cells % 2 == 0:
+        lower, upper = cells - 1, cells + 1
+        cells = (
+            upper
+            if lower < 1 or abs(upper - raw) <= abs(raw - lower)
+            else lower
+        )
+    width = cells * cell_ps
+    bins = max(int(round(plot_window_ps / width)), 1)
+    window = bins * width
+
+    moved = []
+    if abs(width - bin_width_ps) > 1e-9:
+        moved.append(
+            f"bin_width {bin_width_ps:.2f} -> {width:.2f} ps "
+            f"({cells} cells, odd so bin edges fall between cells)"
+        )
+    if abs(window - plot_window_ps) > 1e-9:
+        moved.append(
+            f"window {plot_window_ps:.0f} -> {window:.0f} ps ({bins} bins)"
+        )
+    if moved:
+        print(
+            f"  snapped to the {cell_ps:.2f} ps grid: {'; '.join(moved)}. "
+            "Every bin now holds the same number of cells and zero is a bin "
+            "centre; pass snap_to_grid=False to take the numbers literally."
+        )
+    return width, window
+
+
+def collect_and_plot_delta_counts(
+    path: str | None = None,
+    *,
+    counts_path: str | None = None,
+    time_unit_ps: float = _TS_CODE_PS,
+    bin_width_ps: float = _TS_CODE_PS,
+    plot_window_ps: float = 3000.0,
+    fit_window_ps: float | None = 1000.0,
+    background: str = "flat",
+    osc_period_ps: float = 100000.0,
+    pairs: Sequence[str] | None = None,
+    label: str = "spdc",
+    cmap_title: str | None = None,
+    snap_to_grid: bool = True,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Rebin a saved counts grid, fit the peak, and plot it.
+
+    The counterpart of 'collect_and_plot_timestamp_differences' for the
+    feather-free path, and deliberately the same function underneath: only the
+    histogram differs, so the two can be compared directly.
+
+    Nothing is read from disk except one ~100 MB array, and the rebinning is
+    in memory, so changing ``bin_width_ps`` or ``plot_window_ps`` costs
+    milliseconds rather than a full pass over the data - and every pixel pair
+    is available at once instead of whichever columns were streamed.
+
+    Parameters
+    ----------
+    path : str | None, optional
+        Data folder whose ``processed/`` holds the counts artifact and whose
+        ``results/`` receives the plot. May be None when ``counts_path`` is
+        given.
+    counts_path : str | None, optional
+        Explicit counts '.npy', ignoring ``path``. The default is None.
+    time_unit_ps : float, optional
+        Picoseconds per raw TDC code, for an uncalibrated grid. The default
+        is ~77 ps.
+    bin_width_ps : float, optional
+        Histogram bin width in ps. The default is ~77 ps (one code). Use a
+        whole multiple of the artifact's grid cell for an exact rebin.
+    plot_window_ps : float, optional
+        Histogram/plot half-range in ps around zero. The default is 3000.0.
+        Unlike the feather path, widening this is free - it is a slice of what
+        is already loaded.
+    fit_window_ps : float | None, optional
+        Fit half-range in ps around the tallest bin. ``'flat'`` background
+        only. The default is 1000.0.
+    background : str, optional
+        ``'flat'`` (default) or ``'triangle'``; see
+        'collect_and_plot_timestamp_differences'.
+    osc_period_ps : float, optional
+        Triangle half-base seed in ps. The default is 100000.0.
+    pairs : Sequence[str] | None, optional
+        Restrict pooling to these pixel-pair labels. The default is None
+        (pool every pair).
+    label : str, optional
+        Short label for the title and output file. The default is ``'spdc'``.
+    cmap_title : str | None, optional
+        Optional override for the plot title. The default is None.
+    snap_to_grid : bool, optional
+        Round ``bin_width_ps`` to a whole number of grid cells and
+        ``plot_window_ps`` to a whole number of bins. The default is True,
+        and you almost always want it - see the note below. Pass False to
+        take the numbers literally.
+
+    Returns
+    -------
+    counts : np.ndarray
+        Counts per bin - the rebinned histogram that was fitted and plotted.
+    centers : np.ndarray
+        Bin centres in picoseconds.
+    fit : dict
+        As 'collect_and_plot_timestamp_differences'.
+
+    Raises
+    ------
+    FileNotFoundError
+        Raised when the counts artifact cannot be found.
+
+    Notes
+    -----
+    Re-binning already-binned data onto an incommensurate width is not a
+    rounding detail, it is a **ripple**. A 71 ps bin over a 7.7 ps grid holds
+    9 or 10 cells depending on where it lands, so a perfectly smooth
+    distribution comes out with an ~11% bin-to-bin sawtooth - on real data
+    that moved the peak bin by 8%.
+
+    With ``snap_to_grid`` the rebin is not merely close to the feather path's
+    histogram, it is **identical to it**, because the target bins then hold a
+    whole odd number of cells and their edges fall between cells rather than
+    through them. Verified bin-for-bin on a 3.22 GB run: zero difference at 9,
+    11 and 13 cells per bin, ~1% at 8, 10 and 12. See '_snap_binning'.
+
+    The one place the two paths still disagree is the outermost bin at each
+    end, where the feather path cuts the data at ``abs(delta) <= window`` but
+    draws edges half a bin beyond it, so those bins can only ever be part
+    filled. Here they are filled properly.
+    """
+    grid_counts, grid_centers, info = load_delta_counts(
+        path,
+        counts_path=counts_path,
+        pairs=pairs,
+        pool=True,
+        time_unit_ps=time_unit_ps,
+    )
+    if info["missing"]:
+        print(f"  no such pixel-pair row(s): {info['missing']}")
+
+    cell_ps = float(info["cell_ps"])
+    if snap_to_grid:
+        bin_width_ps, plot_window_ps = _snap_binning(
+            bin_width_ps, plot_window_ps, cell_ps
+        )
+    else:
+        ratio = bin_width_ps / cell_ps
+        if abs(ratio - round(ratio)) > 1e-9:
+            print(
+                f"  WARNING: bin_width={bin_width_ps:.2f} ps is "
+                f"{ratio:.2f} grid cells, so bins hold {int(ratio)} or "
+                f"{int(ratio) + 1} of them and the histogram carries a "
+                f"~{100 / max(int(ratio), 1):.0f}% sawtooth. Leave "
+                "snap_to_grid=True unless you know you want this."
+            )
+
+    counts, edges = rebin_delta_counts(
+        grid_counts,
+        grid_centers,
+        bin_width_ps=bin_width_ps,
+        plot_window_ps=plot_window_ps,
+    )
+    centers = (edges[:-1] + edges[1:]) / 2
+    n_in_window = int(counts.sum())
+
+    print(
+        f"\n> > > {int(grid_counts.sum())} difference(s) on the "
+        f"{grid_centers.size}-cell grid across {len(info['labels'])} pair "
+        f"row(s); {n_in_window} inside +/-{plot_window_ps:.0f} ps, rebinned "
+        f"to {counts.size} x {bin_width_ps:.0f} ps < < <"
+    )
+
+    return _fit_and_plot_delta(
+        counts,
+        centers,
+        name=info["name"],
+        results_dir=store.results_dir(info["root"], _KIND, create=False),
+        bin_width_ps=bin_width_ps,
+        plot_window_ps=plot_window_ps,
+        fit_window_ps=fit_window_ps,
+        background=background,
+        osc_period_ps=osc_period_ps,
+        label=label,
+        cmap_title=cmap_title,
+        n_in_window=n_in_window,
+        stem="delta_counts",
+    )
 
 
 
