@@ -4,6 +4,13 @@ Drives 'unpack' and 'calc_diff' over a folder, pools the per-pixel-pair
 timestamp differences into a '.feather' table, then histograms, fits and plots
 the coincidence peak.
 
+Both halves stream. Stage 1 flushes size-capped part files as it goes, and the
+read side histograms the feather one Arrow record batch at a time rather than
+loading it - a 10 000-file run's combined feather reaches ~135 GB, which no
+amount of RAM makes loadable. Since a histogram over fixed edges is additive,
+the streamed counts are bin-for-bin what loading the whole table would have
+given; they are saved beside the feather so re-fitting costs a small load.
+
 NOTE on fitting: the ORT accidental background is TRIANGULAR, not flat, because
 the free-running oscillator has no cycle counter. Use
 'fit_gaussian_on_triangle' over a wide window; 'fit_gaussian_peak' (flat
@@ -17,6 +24,7 @@ See ``docs/guide/coincidences.md`` and ``docs/ort_triangle_background.md``.
 from __future__ import annotations
 
 import glob
+import hashlib
 import os
 from collections.abc import Sequence
 
@@ -39,6 +47,8 @@ __all__ = [
     "calculate_and_save_timestamp_differences",
     "combine_delta_t_parts",
     "combine_delta_t_feathers",
+    # stage 1b - stream the feather down to a histogram
+    "compute_and_save_delta_histogram",
     # fit models and fitting
     "gaussian",
     "gaussian_plus_triangle",
@@ -68,6 +78,12 @@ _PART_MB = 64.0
 # NOT match the '*_delta_t.feather' glob 'combine_delta_t_feathers' uses, so
 # they can never be pooled twice.
 _PARTS_SUFFIX = "_parts"
+
+# File name suffix of the histogram artifact 'compute_and_save_delta_histogram'
+# writes into 'processed/'. The counts are what every downstream consumer
+# actually needs, and they are ~5 MB against a ~135 GB feather, so the
+# expensive streaming pass is paid once per binning rather than per plot.
+_HIST_SUFFIX = "_delta_hist.npy"
 
 
 
@@ -537,6 +553,11 @@ def _write_delta_feather(
 def _read_delta_feather(feather_path: str) -> tuple[pd.DataFrame, str | None]:
     """Read a delta-t '.feather' into a DataFrame plus its unit.
 
+    This materialises the whole table (and ``to_pandas`` copies it again), so
+    it is for small feathers only - a single part, or a short run. To read a
+    full-size combined feather, stream it with '_stream_delta_histogram'
+    instead; nothing downstream of stage 1 needs the raw differences.
+
     Parameters
     ----------
     feather_path : str
@@ -834,6 +855,471 @@ def combine_delta_t_feathers(
     return out_path
 
 
+def _resolve_delta_sources(target: str) -> tuple[list[str], str, str]:
+    """Resolve a delta-t target to the feather(s) behind it.
+
+    Accepts either a single '.feather' or a part folder - the parts are
+    complete feathers in their own right, so a run whose combined file is
+    missing (or too big to be worth writing) plots straight from them.
+
+    Parameters
+    ----------
+    target : str
+        Path to a delta-t '.feather', or to a ``*_delta_t_parts`` folder.
+
+    Returns
+    -------
+    sources : list[str]
+        The feather files to stream, in order.
+    name : str
+        Dataset name, for figure titles and artifact file names.
+    root : str
+        The data folder the artifacts belong to - ``processed/`` and
+        ``results/`` sit under it.
+
+    Raises
+    ------
+    FileNotFoundError
+        Raised when a folder was given but holds no part files.
+    """
+    target = os.path.abspath(target)
+    if os.path.isdir(target):
+        sources = _find_parts(target)
+        if not sources:
+            raise FileNotFoundError(
+                f"No *_delta_t_<i>.feather part files in:\n  {target}"
+            )
+        base = os.path.basename(os.path.normpath(target))
+        name = base.removesuffix(_PARTS_SUFFIX).removesuffix("_delta_t")
+    else:
+        sources = [target]
+        base = os.path.basename(target)
+        name = base.removesuffix(".feather").removesuffix("_delta_t")
+    # <root>/processed/<artifact> -> the artifacts belong to <root>.
+    return sources, name, os.path.dirname(os.path.dirname(target))
+
+
+def _locate_delta_target(
+    path: str | None, feather_path: str | None
+) -> tuple[list[str], str, str]:
+    """Find the delta-t feather(s) for a data folder, or take them directly.
+
+    ``feather_path`` wins and ignores ``path`` entirely - that is how a
+    combined or standalone feather is read without its raw-data folder.
+    Otherwise the run's own ``processed/<name>_delta_t.feather`` is used,
+    falling back to its part folder when the combine step never happened.
+
+    Parameters
+    ----------
+    path : str | None
+        Path to the raw-data folder.
+    feather_path : str | None
+        Explicit '.feather' (or part folder) to read.
+
+    Returns
+    -------
+    tuple[list[str], str, str]
+        Sources, dataset name and data folder, as '_resolve_delta_sources'.
+
+    Raises
+    ------
+    ValueError
+        Raised when neither ``path`` nor ``feather_path`` is given.
+    FileNotFoundError
+        Raised when neither a combined feather nor any part file exists.
+    """
+    if feather_path is not None:
+        return _resolve_delta_sources(feather_path)
+    if path is None:
+        raise ValueError(
+            "Provide either path (to locate the feather) or feather_path."
+        )
+
+    name = os.path.basename(os.path.normpath(path))
+    combined = os.path.join(
+        store.processed_dir(path, create=False), f"{name}_delta_t.feather"
+    )
+    if os.path.isfile(combined):
+        return [combined], name, os.path.abspath(path)
+
+    parts_dir = combined.removesuffix(".feather") + _PARTS_SUFFIX
+    parts = _find_parts(parts_dir)
+    if parts:
+        print(
+            f"  no combined feather - streaming the {len(parts)} part "
+            f"file(s) in {os.path.basename(parts_dir)}{os.sep} instead."
+        )
+        return parts, name, os.path.abspath(path)
+
+    raise FileNotFoundError(
+        f"No delta-t feather at {combined}. Run "
+        "calculate_and_save_timestamp_differences first."
+    )
+
+
+def _delta_hist_edges(
+    bin_width_ps: float, plot_window_ps: float
+) -> np.ndarray:
+    """Histogram bin edges: bins centred on 0, spanning +/- the window."""
+    return np.arange(
+        -plot_window_ps - bin_width_ps / 2,
+        plot_window_ps + bin_width_ps,
+        bin_width_ps,
+    )
+
+
+def _hist_signature(
+    sources: Sequence[str],
+    *,
+    time_unit_ps: float,
+    bin_width_ps: float,
+    plot_window_ps: float,
+    pairs: Sequence[str] | None,
+) -> dict:
+    """Everything that changes the histogram, for reuse invalidation.
+
+    The inputs are fingerprinted by (name, size, mtime) rather than content:
+    hashing 135 GB to decide whether to re-read 135 GB would be self-defeating,
+    and stage-1 feathers are written once and not edited in place.
+    """
+    digest = hashlib.sha1()
+    for src in sorted(sources):
+        st = os.stat(src)
+        digest.update(
+            f"{os.path.basename(src)}:{st.st_size}:{st.st_mtime_ns};".encode()
+        )
+    return {
+        "time_unit_ps": float(time_unit_ps),
+        "bin_width_ps": float(bin_width_ps),
+        "plot_window_ps": float(plot_window_ps),
+        "pairs": None if pairs is None else sorted(pairs),
+        "n_sources": len(sources),
+        "sources_digest": digest.hexdigest(),
+    }
+
+
+def _pooled_columns(
+    sources: Sequence[str], pairs: Sequence[str] | None
+) -> tuple[list[str], str, list[str]]:
+    """Decide which columns to pool, and in what unit, from the schemas alone.
+
+    Opening an Arrow IPC file reads its footer, not its data, so this pass
+    over a multi-GB feather is effectively free.
+
+    Returns
+    -------
+    columns : list[str]
+        Column names to pool, in first-seen order.
+    unit : str
+        The shared ``delta_unit`` ('code' / 'ps').
+    missing : list[str]
+        Requested ``pairs`` that no source has a column for.
+
+    Raises
+    ------
+    ValueError
+        Raised when the sources mix ``delta_unit``.
+    """
+    names: list[str] = []
+    units: set[str] = set()
+    for src in sources:
+        with pa.ipc.open_file(src) as reader:
+            schema = reader.schema
+        src_unit = (schema.metadata or {}).get(b"delta_unit", b"").decode()
+        if src_unit:
+            units.add(src_unit)
+        for label in schema.names:
+            if label not in names:
+                names.append(label)
+
+    if len(units) > 1:
+        raise ValueError(
+            f"Cannot pool feathers with mixed delta_unit {sorted(units)}."
+        )
+    unit = units.pop() if units else ""
+
+    # Legacy single-column layouts name the unit in the column itself.
+    if "delta_ps" in names:
+        return ["delta_ps"], unit or "ps", []
+    if "delta_code" in names:
+        return ["delta_code"], unit or "code", []
+
+    if pairs is None:
+        return names, unit or "code", []
+    missing = [p for p in pairs if p not in names]
+    return [p for p in pairs if p in names], unit or "code", missing
+
+
+def _stream_delta_histogram(
+    sources: Sequence[str],
+    *,
+    edges: np.ndarray,
+    time_unit_ps: float,
+    plot_window_ps: float,
+    pairs: Sequence[str] | None = None,
+    quiet: bool = False,
+) -> tuple[np.ndarray, dict]:
+    """Histogram delta-t feathers one Arrow record batch at a time.
+
+    A full run's combined feather reaches hundreds of GB, so the old read path
+    - ``read_all().to_pandas()``, then ``to_numpy().ravel()`` - could not open
+    it at all: it needs the whole table resident several times over. Arrow IPC
+    files are a sequence of record batches, though, and a histogram over fixed
+    edges is *additive*, so the counts can be summed batch by batch with one
+    batch resident at a time. The result is identical to histogramming the
+    pooled array in one go, bin for bin - this is the exact baseline, with no
+    rounding, sampling or re-binning anywhere.
+
+    Padding is dropped as it is met: nulls (current writers) and NaN (feathers
+    written before null padding) both, exactly as the pooled path did.
+
+    Parameters
+    ----------
+    sources : Sequence[str]
+        Delta-t feathers to pool. Their columns need not match.
+    edges : np.ndarray
+        Histogram bin edges, from '_delta_hist_edges'.
+    time_unit_ps : float
+        Picoseconds per raw TDC code, applied when the unit is ``'code'``.
+    plot_window_ps : float
+        Only differences with ``abs(delta_ps) <= plot_window_ps`` are counted.
+    pairs : Sequence[str] | None, optional
+        Restrict pooling to these pixel-pair columns. The default is None
+        (pool every pair column).
+    quiet : bool, optional
+        Suppress the progress bar. The default is False.
+
+    Returns
+    -------
+    counts : np.ndarray
+        Counts per bin, ``len(edges) - 1`` long.
+    stats : dict
+        ``unit``, ``n`` (differences inside the window), ``total`` (real
+        differences seen), ``slots`` (table cells read, padding included),
+        ``padding_fraction``, ``granularity_ps`` (smallest non-zero
+        ``abs(delta_ps)``, for the comb guard), ``n_columns`` and ``missing``.
+    """
+    columns, unit, missing = _pooled_columns(sources, pairs)
+    if missing:
+        print(f"  WARNING: pair column(s) not in feather: {missing}")
+
+    # Batch counts come from the footer, so the bar knows its length up front.
+    plan: list[tuple[str, int]] = []
+    for src in sources:
+        with pa.ipc.open_file(src) as reader:
+            plan.append((src, reader.num_record_batches))
+
+    counts = np.zeros(len(edges) - 1, dtype=np.int64)
+    n_windowed = 0
+    total = 0
+    slots = 0
+    granularity_ps = np.inf
+
+    bar = tqdm(
+        total=sum(n for _, n in plan),
+        desc="delta-t histogram",
+        unit="batch",
+        disable=quiet,
+    )
+    for src, n_batches in plan:
+        with pa.ipc.open_file(src) as reader:
+            present = set(reader.schema.names)
+            indices = [
+                reader.schema.get_field_index(c)
+                for c in columns
+                if c in present
+            ]
+            for i in range(n_batches):
+                batch = reader.get_batch(i)
+                for j in indices:
+                    # Nulls come back as NaN, so one mask drops both kinds of
+                    # padding. The resident set is this batch (~one part) plus
+                    # this one column's copy - never the table.
+                    values = batch.column(j).to_numpy(zero_copy_only=False)
+                    slots += values.size
+                    values = values[~np.isnan(values)]
+                    if not values.size:
+                        continue
+                    d_ps = values if unit == "ps" else values * time_unit_ps
+                    total += d_ps.size
+
+                    nonzero = np.abs(d_ps[d_ps != 0])
+                    if nonzero.size:
+                        granularity_ps = min(
+                            granularity_ps, float(nonzero.min())
+                        )
+
+                    inside = d_ps[np.abs(d_ps) <= plot_window_ps]
+                    n_windowed += inside.size
+                    if inside.size:
+                        counts += np.histogram(inside, bins=edges)[0]
+                del batch
+                bar.update(1)
+    bar.close()
+
+    stats = {
+        "unit": unit,
+        "n": int(n_windowed),
+        "total": int(total),
+        "slots": int(slots),
+        "padding_fraction": (1.0 - total / slots) if slots else 0.0,
+        "granularity_ps": (
+            float(granularity_ps) if np.isfinite(granularity_ps) else None
+        ),
+        "n_columns": len(columns),
+        "missing": list(missing),
+    }
+    return counts, stats
+
+
+def compute_and_save_delta_histogram(
+    path: str | None = None,
+    *,
+    feather_path: str | None = None,
+    time_unit_ps: float = _TS_CODE_PS,
+    bin_width_ps: float = _TS_CODE_PS,
+    plot_window_ps: float = 3000.0,
+    pairs: Sequence[str] | None = None,
+    reuse: bool = True,
+    quiet: bool = False,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Stream a delta-t feather down to a saved histogram.
+
+    This is the expensive pass - it reads every record batch of every source -
+    and it is the only thing standing between a hundreds-of-GB feather and a
+    plot. The counts are saved to ``processed/<name>_delta_hist.npy`` with a
+    '.meta.json' sidecar, so replotting, re-fitting or changing the background
+    model costs a ~5 MB load rather than another full read.
+
+    The saved histogram is *lossless for everything downstream*: both fit
+    models take ``(bin_centers, counts)``, and so does the plot. Binning at
+    ``bin_width_ps=_TS_CODE_PS`` (one TDC code) is the native resolution of
+    the data, so nothing is thrown away at the default settings.
+
+    The sidecar records the binning and a fingerprint of the sources; a saved
+    histogram is only reused when all of it matches, so changing
+    ``bin_width_ps``, ``plot_window_ps``, ``time_unit_ps`` or ``pairs`` - or
+    rewriting the feather - re-streams automatically.
+
+    Parameters
+    ----------
+    path : str | None, optional
+        Path to the raw-data folder. Its ``processed/`` holds the feather and
+        receives the histogram. May be None when ``feather_path`` is given.
+    feather_path : str | None, optional
+        Explicit delta-t '.feather' to read, or a ``*_delta_t_parts`` folder
+        to read the parts directly (which skips needing the combined file at
+        all). When given, ``path`` is ignored. The default is None.
+    time_unit_ps : float, optional
+        Picoseconds per raw TDC code, applied to a ``'code'`` feather. The
+        default is ~77 ps.
+    bin_width_ps : float, optional
+        Histogram bin width in ps. The default is ~77 ps (one code).
+    plot_window_ps : float, optional
+        Histogram half-range in ps around zero. The default is 3000.0.
+    pairs : Sequence[str] | None, optional
+        Restrict pooling to these pixel-pair column names. The default is
+        None (pool every pair column).
+    reuse : bool, optional
+        Load a matching saved histogram instead of re-streaming. The default
+        is True. Pass False to force the full pass.
+    quiet : bool, optional
+        Suppress the progress bar and the summary. The default is False.
+
+    Returns
+    -------
+    counts : np.ndarray
+        Counts per bin.
+    edges : np.ndarray
+        The bin edges the counts belong to.
+    info : dict
+        The stats from '_stream_delta_histogram' plus ``name``, ``root``,
+        ``sources``, ``hist_path`` and ``reused``.
+    """
+    sources, name, root = _locate_delta_target(path, feather_path)
+    edges = _delta_hist_edges(bin_width_ps, plot_window_ps)
+    signature = _hist_signature(
+        sources,
+        time_unit_ps=time_unit_ps,
+        bin_width_ps=bin_width_ps,
+        plot_window_ps=plot_window_ps,
+        pairs=pairs,
+    )
+    hist_path = os.path.join(
+        store.processed_dir(root, create=False), f"{name}{_HIST_SUFFIX}"
+    )
+
+    if reuse and os.path.isfile(hist_path):
+        counts, meta = store.load_map(npy_path=hist_path)
+        if meta.get("signature") == signature and counts.size == len(edges) - 1:
+            if not quiet:
+                print(
+                    f"\n> > > Reusing the saved delta-t histogram "
+                    f"({meta.get('n', 0)} differences in the window) from "
+                    f"{os.path.basename(hist_path)} - pass reuse=False to "
+                    "re-stream < < <"
+                )
+            info = dict(meta.get("stats", {}))
+            info.update(
+                name=name,
+                root=root,
+                sources=sources,
+                hist_path=hist_path,
+                reused=True,
+            )
+            return counts, edges, info
+
+    if not quiet:
+        print(
+            f"\n> > > Streaming {len(sources)} delta-t feather(s) into a "
+            f"{len(edges) - 1}-bin histogram ({bin_width_ps:.0f} ps bins, "
+            f"+/-{plot_window_ps:.0f} ps) < < <\n"
+        )
+
+    counts, stats = _stream_delta_histogram(
+        sources,
+        edges=edges,
+        time_unit_ps=time_unit_ps,
+        plot_window_ps=plot_window_ps,
+        pairs=pairs,
+        quiet=quiet,
+    )
+
+    hist_path = store.save_map(
+        counts,
+        root,
+        kind=_KIND,
+        file_name=f"{name}{_HIST_SUFFIX}",
+        meta={
+            "signature": signature,
+            "stats": stats,
+            "sources": [os.path.basename(s) for s in sources],
+        },
+        quiet=True,
+    )
+
+    if not quiet:
+        print(
+            f"\n> > > {stats['total']} difference(s) across "
+            f"{stats['n_columns']} pair column(s); {stats['n']} inside "
+            f"+/-{plot_window_ps:.0f} ps. Padding was "
+            f"{100 * stats['padding_fraction']:.1f}% of the cells read. "
+            f"Histogram saved to {hist_path} < < <"
+        )
+    return (
+        counts,
+        edges,
+        {
+            **stats,
+            "name": name,
+            "root": root,
+            "sources": sources,
+            "hist_path": hist_path,
+            "reused": False,
+        },
+    )
+
+
 def gaussian(
     x: np.ndarray, amp: float, mu: float, sigma: float, bkg: float
 ) -> np.ndarray:
@@ -1127,17 +1613,26 @@ def collect_and_plot_timestamp_differences(
     pairs: Sequence[str] | None = None,
     label: str = "spdc",
     cmap_title: str | None = None,
-) -> tuple[np.ndarray, dict]:
-    """Read the saved delta-t feather, fit the peak, and plot it.
+    reuse_histogram: bool = True,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Histogram the saved delta-t feather, fit the peak, and plot it.
 
     Pools the selected pair columns of a saved feather, converts to
     picoseconds (per the ``delta_unit`` metadata), histograms, fits the
     coincidence peak and saves the figure. Old single-column feathers
     (``delta_code`` / ``delta_ps``) are still read.
 
+    The feather is **streamed** through 'compute_and_save_delta_histogram',
+    one Arrow record batch at a time, and never held in memory - a full run's
+    combined feather is far too large to load. The counts are identical to
+    histogramming the whole pooled array at once; only the memory profile
+    differs. The histogram is cached in ``processed/``, so re-fitting or
+    changing the background model does not re-read the feather.
+
     Locate the feather either from ``path`` (its ``processed/``) or directly
     via ``feather_path``, which ignores ``path`` entirely - that is how a
-    combined feather is plotted.
+    combined feather is plotted. Either may point at a ``*_delta_t_parts``
+    folder to plot straight from the part files.
 
     Parameters
     ----------
@@ -1169,9 +1664,10 @@ def collect_and_plot_timestamp_differences(
         ``+/- osc_period_ps``). The default is 100000.0 ps (~100 ns). Only
         used when ``background='triangle'``; the fit refines it.
     feather_path : str | None, optional
-        Explicit feather to read and plot directly; when given, ``path`` is
-        ignored and the raw-data folder is not needed (the plot is saved
-        beside the feather). The default is None (derive from ``path``).
+        Explicit feather to read and plot directly, or a ``*_delta_t_parts``
+        folder to read the parts; when given, ``path`` is ignored and the
+        raw-data folder is not needed (the plot is saved beside the feather).
+        The default is None (derive from ``path``).
     pairs : Sequence[str] | None, optional
         Restrict pooling to these pixel-pair column names (e.g.
         ``["16,16-20,20"]``). The default is None (pool every pair column).
@@ -1181,11 +1677,17 @@ def collect_and_plot_timestamp_differences(
         The default is ``'spdc'``.
     cmap_title : str | None, optional
         Optional override for the plot title. The default is None.
+    reuse_histogram : bool, optional
+        Reuse a saved histogram whose binning and sources match, instead of
+        re-streaming the feather. The default is True. Pass False to force
+        the full pass.
 
     Returns
     -------
-    deltas_ps : np.ndarray
-        The timestamp differences in picoseconds.
+    counts : np.ndarray
+        Counts per bin - the histogram that was fitted and plotted.
+    centers : np.ndarray
+        Bin centres in picoseconds, to re-fit without re-reading the feather.
     fit : dict
         The fit results plus ``fwhm`` (2.355 sigma), ``jitter_per_detector``
         (sigma / sqrt(2)), ``car`` (peak-to-background ratio) and ``n``.
@@ -1195,82 +1697,29 @@ def collect_and_plot_timestamp_differences(
     FileNotFoundError
         Raised when the delta-t '.feather' cannot be found.
     """
-    if feather_path is not None:
-        # Feather given directly: ignore path, derive the name and output
-        # folder from the feather itself so a standalone or combined feather
-        # can be plotted without the original raw-data folder.
-        feather_path = os.path.abspath(feather_path)
-        base = os.path.basename(feather_path)
-        suffix = "_delta_t.feather"
-        name = base[: -len(suffix)] if base.endswith(suffix) else (
-            os.path.splitext(base)[0]
-        )
-        # <root>/processed/<name>.feather -> figures belong under <root>.
-        results_dir = store.results_dir(
-            os.path.dirname(os.path.dirname(feather_path)), _KIND, create=False
-        )
-    else:
-        if path is None:
-            raise ValueError(
-                "Provide either path (to locate the feather) or feather_path."
-            )
-        name = os.path.basename(os.path.normpath(path))
-        feather_path = os.path.join(
-            store.processed_dir(path, create=False),
-            f"{name}_delta_t.feather",
-        )
-        results_dir = store.results_dir(path, _KIND, create=False)
-
-    if not os.path.isfile(feather_path):
-        raise FileNotFoundError(
-            f"No delta-t feather at {feather_path}. Run "
-            "calculate_and_save_timestamp_differences first."
-        )
-
-    df, unit = _read_delta_feather(feather_path)
-
-    if "delta_ps" in df.columns:  # legacy single-column layout
-        pooled = df["delta_ps"].to_numpy()
-        unit = unit or "ps"
-    elif "delta_code" in df.columns:  # legacy single-column layout
-        pooled = df["delta_code"].to_numpy()
-        unit = unit or "code"
-    else:  # per-pair columns, NaN-padded
-        cols = (
-            list(df.columns)
-            if pairs is None
-            else [p for p in pairs if p in df.columns]
-        )
-        if pairs is not None:
-            missing = [p for p in pairs if p not in df.columns]
-            if missing:
-                print(f"  WARNING: pair column(s) not in feather: {missing}")
-        vals = df[cols].to_numpy().ravel() if cols else np.empty(0)
-        pooled = vals[~np.isnan(vals)]
-        unit = unit or "code"
-
-    deltas_ps = pooled if unit == "ps" else pooled * time_unit_ps
-
-    d = deltas_ps[np.abs(deltas_ps) <= plot_window_ps]
-    edges = np.arange(
-        -plot_window_ps - bin_width_ps / 2,
-        plot_window_ps + bin_width_ps,
-        bin_width_ps,
+    counts, edges, info = compute_and_save_delta_histogram(
+        path,
+        feather_path=feather_path,
+        time_unit_ps=time_unit_ps,
+        bin_width_ps=bin_width_ps,
+        plot_window_ps=plot_window_ps,
+        pairs=pairs,
+        reuse=reuse_histogram,
     )
-    counts, edges = np.histogram(d, bins=edges)
+    name = info["name"]
+    results_dir = store.results_dir(info["root"], _KIND, create=False)
     centers = (edges[:-1] + edges[1:]) / 2
+    n_in_window = int(info["n"])
 
     # Comb guard: warn if the data granularity is coarser than the bin.
-    nz = np.abs(deltas_ps[deltas_ps != 0])
-    if nz.size:
-        gran = float(np.min(nz))
-        if gran > bin_width_ps * 1.5:
-            print(
-                f"  WARNING: delta granularity is ~{gran:.0f} ps but "
-                f"bin_width={bin_width_ps:.0f} ps -> the histogram will be a "
-                "comb. Bin coarser, or ensure the fine timing is populated "
-                "in the acquisition."
-            )
+    gran = info.get("granularity_ps")
+    if gran is not None and gran > bin_width_ps * 1.5:
+        print(
+            f"  WARNING: delta granularity is ~{gran:.0f} ps but "
+            f"bin_width={bin_width_ps:.0f} ps -> the histogram will be a "
+            "comb. Bin coarser, or ensure the fine timing is populated "
+            "in the acquisition."
+        )
 
     if background not in ("flat", "triangle"):
         raise ValueError(
@@ -1291,7 +1740,7 @@ def collect_and_plot_timestamp_differences(
     fit["car"] = (
         (fit["amp"] + fit["bkg"]) / fit["bkg"] if fit["bkg"] else np.inf
     )
-    fit["n"] = int(d.size)
+    fit["n"] = n_in_window
 
     fig, ax = plt.subplots()
     ax.bar(
@@ -1299,7 +1748,7 @@ def collect_and_plot_timestamp_differences(
         counts,
         width=bin_width_ps,
         # alpha=0.6,
-        label=f"data ({d.size} pairs)",
+        label=f"data ({n_in_window} pairs)",
     )
     if fit["ok"]:
         xs = np.linspace(-plot_window_ps, plot_window_ps, 4000)
@@ -1346,7 +1795,7 @@ def collect_and_plot_timestamp_differences(
             "has proper (stopped, fine) timing."
         )
 
-    return deltas_ps, fit
+    return counts, centers, fit
 
 
 

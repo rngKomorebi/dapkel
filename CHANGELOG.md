@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-08-02
+
+### Added
+
+- `delta_t.compute_and_save_delta_histogram` — streams a delta-t feather down
+  to its histogram one Arrow record batch at a time, so a combined feather far
+  larger than RAM (a 10 000-file run reaches ~135 GB) can be read at all. The
+  counts are saved to `processed/<name>_delta_hist.npy` with a `.meta.json`
+  sidecar recording the binning and a fingerprint of the sources, so replotting
+  or changing the background model costs a small load instead of another full
+  pass. The sidecar also reports what share of the cells read were padding.
+- `feather_path` may now be a `*_delta_t_parts` folder, and a run whose
+  combined feather is missing falls back to its parts automatically — the
+  giant combined file is no longer needed to plot.
+
+### Changed
+
+- `delta_t.collect_and_plot_timestamp_differences` now returns
+  `(counts, centers, fit)` instead of `(deltas_ps, fit)`, and never
+  materialises the differences. **Breaking**: returning the pooled array was
+  the reason the function could not open a full-size feather. The histogram is
+  bin-for-bin identical to what the old load-everything path produced — both
+  fit models and the plot only ever consumed `(bin_centers, counts)`.
+- Promoting `[Unreleased]` to a numbered release is a **manual edit** of
+  `CHANGELOG.md`, documented step by step in the README. Nothing has ever
+  written the changelog automatically; the removed script only did that edit
+  for you.
+- `tools/changelog.py` is now usable from a Jupyter interactive window, so the
+  release notes can be previewed without a terminal. Running the file there
+  defines its functions instead of firing the CLI — `__name__` really is
+  `"__main__"` in a kernel, so argparse used to parse ipykernel's own argv and
+  die with `SystemExit: 2`. `main()` also takes an explicit `argv`, and
+  `notes_for` raises `ChangelogError` instead of calling `sys.exit`. Only
+  `main()` converts that to a non-zero exit, so the gate `publish.yml` relies
+  on is unchanged.
+- The "no section for this version" failure now spells out the heading and
+  link edits to make, and warns that deleting a release leaves its tag behind.
+  That message is what the person cutting a failed release actually reads.
+
+### Removed
+
+- `tools/release.py` and its tests. It automated one two-line edit to
+  `CHANGELOG.md` and was the only part of the release process that wanted a
+  terminal. `tools/changelog.py` stays: `publish.yml` runs it **on the
+  runner** to refuse a tag whose version has no changelog section, and to fill
+  the release body.
+
+### Fixed
+
+- The changelog's link block still pointed `[Unreleased]` at a `v0.2.0` that
+  was never tagged, carried a `[0.2.0]` link with no matching section, and had
+  no `[0.1.1]` entry.
+
 ## [0.1.1] - 2026-08-02
 
 ### Added
@@ -136,7 +189,7 @@ Initial commit.
 
 - Functions for unpacking raw, binary data and analyzing dark count rate.
 
-[Unreleased]: https://github.com/rngKomorebi/dapkel/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/rngKomorebi/dapkel/compare/v0.1.0...v0.2.0
+[Unreleased]: https://github.com/rngKomorebi/dapkel/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/rngKomorebi/dapkel/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/rngKomorebi/dapkel/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/rngKomorebi/dapkel/releases/tag/v0.0.1

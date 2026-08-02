@@ -64,5 +64,14 @@ def test_leading_v_is_stripped():
 
 
 def test_missing_version_is_a_hard_failure():
-    with pytest.raises(SystemExit):
+    """The library raises; 'main' is what turns this into a non-zero exit.
+
+    Splitting the two is what lets the same check run in a notebook, where a
+    'sys.exit' would surface as a SystemExit traceback instead of an error.
+    """
+    with pytest.raises(changelog.ChangelogError):
         changelog.notes_for("9.9.9", CHANGELOG)
+
+    with pytest.raises(SystemExit) as excinfo:
+        changelog.main(["9.9.9", "--changelog", str(CHANGELOG)])
+    assert excinfo.value.code != 0

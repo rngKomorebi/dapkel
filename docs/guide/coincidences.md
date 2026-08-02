@@ -94,6 +94,66 @@ array — about 82 MB at 10 000 frames — so below that the part buffer is not 
 binding constraint, and a smaller cap only multiplies the number of part files.
 A smaller value is perfectly safe if you want the memory ceiling lower.
 
+## Reading it back: the histogram is streamed, not loaded
+
+The write side streams, and so must the read side. A 10 000-file run's combined
+feather reaches ~135 GB; loading it into a DataFrame and pooling the columns
+needs it resident several times over, which simply does not happen.
+
+[`compute_and_save_delta_histogram`][dapkel.functions.delta_t.compute_and_save_delta_histogram]
+reads it one Arrow record batch at a time instead. A histogram over fixed edges
+is **additive**, so the counts can be summed batch by batch with one batch
+resident — and the result is bin-for-bin what histogramming the whole pooled
+array at once would have given. This is the exact baseline: no sampling, no
+re-binning, no rounding.
+
+Nothing downstream ever needed the raw differences. Both fit models take
+`(bin_centers, counts)`, and so does the plot; the pooled array was a pure
+intermediate. So the counts are saved as a stage-1 artifact:
+
+```
+processed/
+  <dataset>_delta_t.feather        <- ~135 GB, read once
+  <dataset>_delta_hist.npy         <- the counts, a few MB
+  <dataset>_delta_hist.meta.json   <- binning, source fingerprint, statistics
+```
+
+The sidecar records `bin_width_ps`, `plot_window_ps`, `time_unit_ps`, `pairs`
+and a fingerprint of the source files. A saved histogram is reused only when
+all of it matches, so changing the binning or rewriting the feather re-streams
+automatically; pass `reuse=False` (or `reuse_histogram=False` to the plot
+driver) to force the full pass. Re-fitting, switching between the flat and
+triangular background, or redrawing therefore costs a small load rather than
+another read of the feather.
+
+`collect_and_plot_timestamp_differences` goes through this, and returns
+`(counts, centers, fit)` — enough to re-fit by hand without touching disk:
+
+```python
+counts, centers, fit = dt.collect_and_plot_timestamp_differences(
+    path, background="triangle", plot_window_ps=100_000
+)
+narrow = np.abs(centers) < 1000
+dt.fit_gaussian_peak(centers[narrow], counts[narrow])
+```
+
+The `.meta.json` also reports `padding_fraction`: the share of the cells read
+that were padding rather than data. The parts are written wide and padded to
+the longest pair column, so an unbalanced blob pair inflates the feather —
+that number says how much of the 135 GB is real.
+
+### Plotting without the combined file
+
+`feather_path` accepts a `*_delta_t_parts` folder as well as a `.feather`, and
+a run whose combined feather is missing falls back to its parts on its own. The
+parts are complete feathers, so the combine step is optional for plotting:
+
+```python
+dt.collect_and_plot_timestamp_differences(
+    feather_path=".../processed/SPDC_delta_t_parts"
+)
+```
+
 ## Overwriting: the five-second countdown
 
 Every `rewrite=True` in this module routes through

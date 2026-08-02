@@ -14,6 +14,8 @@ a run that dies mid-way.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -362,3 +364,293 @@ def test_end_to_end_keep_parts_false_removes_them(tmp_path):
     assert not parts_dir.exists()
     for values in _columns(out).values():
         assert 0.9 * 3 * NFRAMES <= values.size <= 3 * NFRAMES
+
+
+# --- stage 1b: streaming the feather down to a histogram -------------------
+#
+# The combined feather of a 10 000-file run reaches hundreds of GB, so the
+# read side has to stream too. These tests pin the property that makes the
+# streamed histogram usable as the *baseline* every later optimisation is
+# measured against: it is bin-for-bin what loading the whole table and
+# histogramming it in one go would have produced.
+
+TIME_UNIT_PS = 77.0
+BIN_PS = 77.0
+WINDOW_PS = 3000.0
+
+
+def _reference_histogram(
+    feather, *, edges, time_unit_ps=TIME_UNIT_PS, window_ps=WINDOW_PS
+):
+    """Histogram the old way: load everything, pool it, bin it once."""
+    df, unit = dt._read_delta_feather(feather)
+    vals = df.to_numpy().ravel()
+    pooled = vals[~np.isnan(vals)]
+    deltas_ps = pooled if unit == "ps" else pooled * time_unit_ps
+    inside = deltas_ps[np.abs(deltas_ps) <= window_ps]
+    return np.histogram(inside, bins=edges)[0], inside.size
+
+
+def _spread_deltas(rng, n):
+    """Codes with a coincidence peak at 0 on a wide accidental background."""
+    peak = rng.normal(0.0, 4.0, size=n // 4)
+    accidental = rng.uniform(-1300.0, 1300.0, size=n - n // 4)
+    return np.concatenate([peak, accidental])
+
+
+def _feather_of_parts(tmp_path, n_batches=12, unit="code"):
+    """Write a multi-batch delta-t feather and return (combined, parts_dir)."""
+    rng = np.random.default_rng(7)
+    parts_dir = tmp_path / "parts"
+    writer = dt._PartWriter(
+        str(parts_dir), "run_delta_t", LABELS, unit, 1 / 1024
+    )
+    for _ in range(n_batches):
+        writer.add({lbl: _spread_deltas(rng, 90) for lbl in LABELS})
+    parts = writer.close()
+    combined = str(tmp_path / "run_delta_t.feather")
+    dt._combine_delta_feathers(parts, combined)
+    return combined, str(parts_dir)
+
+
+def test_streamed_histogram_is_identical_to_loading_the_whole_table(tmp_path):
+    """The baseline property: streaming must change memory, not numbers."""
+    combined, _ = _feather_of_parts(tmp_path)
+    edges = dt._delta_hist_edges(BIN_PS, WINDOW_PS)
+
+    counts, stats = dt._stream_delta_histogram(
+        [combined],
+        edges=edges,
+        time_unit_ps=TIME_UNIT_PS,
+        plot_window_ps=WINDOW_PS,
+        quiet=True,
+    )
+    expected, expected_n = _reference_histogram(combined, edges=edges)
+
+    assert counts.sum() > 0, "the fixture produced no counts in the window"
+    np.testing.assert_array_equal(counts, expected)
+    assert stats["n"] == expected_n
+    assert stats["unit"] == "code"
+
+
+def test_streaming_reads_more_than_one_batch(tmp_path):
+    """Guards the test above: a single-batch file would prove nothing."""
+    combined, _ = _feather_of_parts(tmp_path)
+    with pa.ipc.open_file(combined) as reader:
+        assert reader.num_record_batches > 1
+
+
+def test_parts_and_combined_give_the_same_histogram(tmp_path):
+    """Plotting from the parts must not need the giant combined file."""
+    combined, parts_dir = _feather_of_parts(tmp_path)
+    edges = dt._delta_hist_edges(BIN_PS, WINDOW_PS)
+    kwargs = {
+        "edges": edges,
+        "time_unit_ps": TIME_UNIT_PS,
+        "plot_window_ps": WINDOW_PS,
+        "quiet": True,
+    }
+
+    from_combined, stats_c = dt._stream_delta_histogram([combined], **kwargs)
+    from_parts, stats_p = dt._stream_delta_histogram(
+        dt._find_parts(parts_dir), **kwargs
+    )
+
+    np.testing.assert_array_equal(from_parts, from_combined)
+    assert stats_p["n"] == stats_c["n"]
+
+
+def test_ps_feathers_are_not_rescaled(tmp_path):
+    """A 'ps' feather is already calibrated; time_unit_ps must not apply."""
+    path = str(tmp_path / "run_delta_t.feather")
+    dt._write_delta_feather(
+        path, {"0,0-1,1": np.array([0.0, 100.0, -100.0])}, ["0,0-1,1"], "ps"
+    )
+    edges = dt._delta_hist_edges(BIN_PS, WINDOW_PS)
+
+    counts, stats = dt._stream_delta_histogram(
+        [path],
+        edges=edges,
+        time_unit_ps=TIME_UNIT_PS,
+        plot_window_ps=WINDOW_PS,
+        quiet=True,
+    )
+    np.testing.assert_array_equal(
+        counts, _reference_histogram(path, edges=edges)[0]
+    )
+    assert stats["unit"] == "ps"
+    assert stats["granularity_ps"] == 100.0  # not 100 * 77
+
+
+def test_padding_is_dropped_and_measured(tmp_path):
+    """Padding must not be counted - and its share is worth reporting."""
+    path = str(tmp_path / "run_delta_t.feather")
+    dt._write_delta_feather(
+        path,
+        {"0,0-1,1": np.zeros(100), "0,0-2,2": np.zeros(4)},
+        ["0,0-1,1", "0,0-2,2"],
+        "code",
+    )
+    counts, stats = dt._stream_delta_histogram(
+        [path],
+        edges=dt._delta_hist_edges(BIN_PS, WINDOW_PS),
+        time_unit_ps=TIME_UNIT_PS,
+        plot_window_ps=WINDOW_PS,
+        quiet=True,
+    )
+
+    assert counts.sum() == 104  # 104 real values, not 200 padded cells
+    assert stats["total"] == 104
+    assert stats["slots"] == 200
+    assert stats["padding_fraction"] == pytest.approx(0.48)
+
+
+def test_out_of_window_differences_are_excluded_but_still_counted(tmp_path):
+    path = str(tmp_path / "run_delta_t.feather")
+    inside = np.zeros(6)
+    outside = np.full(4, 1000.0)  # 1000 codes * 77 ps >> 3000 ps
+    dt._write_delta_feather(
+        path,
+        {"0,0-1,1": np.concatenate([inside, outside])},
+        ["0,0-1,1"],
+        "code",
+    )
+    counts, stats = dt._stream_delta_histogram(
+        [path],
+        edges=dt._delta_hist_edges(BIN_PS, WINDOW_PS),
+        time_unit_ps=TIME_UNIT_PS,
+        plot_window_ps=WINDOW_PS,
+        quiet=True,
+    )
+
+    assert counts.sum() == 6
+    assert stats["n"] == 6
+    assert stats["total"] == 10  # the granularity guard sees them all
+
+
+def test_missing_pairs_are_reported_not_fatal(tmp_path, capsys):
+    combined, _ = _feather_of_parts(tmp_path)
+    counts, stats = dt._stream_delta_histogram(
+        [combined],
+        edges=dt._delta_hist_edges(BIN_PS, WINDOW_PS),
+        time_unit_ps=TIME_UNIT_PS,
+        plot_window_ps=WINDOW_PS,
+        pairs=[LABELS[0], "31,31-30,30"],
+        quiet=True,
+    )
+
+    assert "31,31-30,30" in capsys.readouterr().out
+    assert stats["missing"] == ["31,31-30,30"]
+    assert stats["n_columns"] == 1
+    assert counts.sum() > 0
+
+
+def _hist_run(tmp_path):
+    """Build a data folder with a combined delta-t feather in 'processed/'."""
+    root = tmp_path / "run"
+    processed = root / "processed"
+    processed.mkdir(parents=True)
+    combined, _ = _feather_of_parts(tmp_path)
+    target = processed / "run_delta_t.feather"
+    os.replace(combined, target)
+    return root
+
+
+def test_histogram_is_saved_and_then_reused(tmp_path, monkeypatch):
+    """The 135 GB pass happens once; replotting loads ~KB instead."""
+    root = _hist_run(tmp_path)
+
+    counts, edges, info = dt.compute_and_save_delta_histogram(
+        str(root), quiet=True
+    )
+    assert info["reused"] is False
+    assert os.path.isfile(info["hist_path"])
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("the feather was re-streamed instead of reused")
+
+    monkeypatch.setattr(dt, "_stream_delta_histogram", _boom)
+    again, again_edges, again_info = dt.compute_and_save_delta_histogram(
+        str(root), quiet=True
+    )
+
+    assert again_info["reused"] is True
+    np.testing.assert_array_equal(again, counts)
+    np.testing.assert_array_equal(again_edges, edges)
+    assert again_info["n"] == info["n"]
+
+
+def test_a_different_binning_re_streams(tmp_path):
+    """Reuse is keyed on the binning, or the cache would answer wrongly."""
+    root = _hist_run(tmp_path)
+
+    dt.compute_and_save_delta_histogram(str(root), quiet=True)
+    counts, edges, info = dt.compute_and_save_delta_histogram(
+        str(root), bin_width_ps=BIN_PS * 4, quiet=True
+    )
+
+    assert info["reused"] is False
+    assert counts.size == len(edges) - 1
+    assert counts.size < len(dt._delta_hist_edges(BIN_PS, WINDOW_PS)) - 1
+
+
+def test_a_rewritten_feather_re_streams(tmp_path):
+    """Stale counts against fresh data would be the worst kind of wrong."""
+    root = _hist_run(tmp_path)
+    first, _, _ = dt.compute_and_save_delta_histogram(str(root), quiet=True)
+
+    feather = str(root / "processed" / "run_delta_t.feather")
+    dt._write_delta_feather(
+        feather, {"0,0-1,1": np.zeros(500)}, ["0,0-1,1"], "code"
+    )
+    second, _, info = dt.compute_and_save_delta_histogram(
+        str(root), quiet=True
+    )
+
+    assert info["reused"] is False
+    assert second.sum() == 500
+    assert not np.array_equal(second, first)
+
+
+def test_missing_combined_feather_falls_back_to_the_parts(tmp_path):
+    """A run that died before the combine step is still plottable."""
+    root = tmp_path / "run"
+    processed = root / "processed"
+    processed.mkdir(parents=True)
+    _feather_of_parts(tmp_path)
+    os.rename(
+        str(tmp_path / "parts"), str(processed / "run_delta_t_parts")
+    )
+
+    counts, _, info = dt.compute_and_save_delta_histogram(str(root), quiet=True)
+
+    assert len(info["sources"]) > 1
+    assert counts.sum() > 0
+
+
+def test_no_feather_and_no_parts_is_a_clear_error(tmp_path):
+    root = tmp_path / "run"
+    (root / "processed").mkdir(parents=True)
+    with pytest.raises(FileNotFoundError, match="run_delta_t.feather"):
+        dt.compute_and_save_delta_histogram(str(root), quiet=True)
+
+
+def test_plot_streams_and_returns_the_histogram(tmp_path):
+    """End to end: the driver never materialises the differences."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    root = _hist_run(tmp_path)
+
+    counts, centers, fit = dt.collect_and_plot_timestamp_differences(
+        str(root), background="flat"
+    )
+
+    assert counts.shape == centers.shape
+    assert fit["n"] == int(counts.sum())
+    assert os.path.isfile(
+        root / "results" / "coincidences" / "run_spdc_delta_t.png"
+    )
+    # The fitted numbers must come from the same counts the caller gets back.
+    refit = dt.fit_gaussian_peak(centers, counts, fit_window=1000.0)
+    assert refit["sigma"] == fit["sigma"]

@@ -148,17 +148,41 @@ mkdocs serve        # preview the documentation at localhost:8000
 There is no version number to bump anywhere: `setuptools_scm` derives it from
 the git tag, so **creating the tag is the version bump**.
 
-1. Add a `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md` and merge it into
-   `main`. Preview what the release will say with
-   `python tools/changelog.py X.Y.Z`.
-2. On GitHub, *Releases -> Draft a new release*, create the tag `vX.Y.Z` there
-   and publish.
+The changelog is edited by hand, and it has to be edited *before* the tag
+exists - the workflow reads `CHANGELOG.md` as it was at the tagged commit, so
+notes still sitting under `[Unreleased]` cannot ship.
+
+1. In `CHANGELOG.md`, rename the `## [Unreleased]` heading, leaving an empty
+   `[Unreleased]` above it for the next cycle:
+
+   ```markdown
+   ## [Unreleased]
+
+   ## [0.2.0] - 2026-08-02
+   ```
+
+   and update the link definitions at the foot of the file:
+
+   ```markdown
+   [Unreleased]: https://github.com/rngKomorebi/dapkel/compare/v0.2.0...HEAD
+   [0.2.0]: https://github.com/rngKomorebi/dapkel/compare/v0.1.1...v0.2.0
+   ```
+
+2. Merge that into `main`.
+3. On GitHub, *Releases -> Draft a new release*, create the tag `v0.2.0`
+   **there** - it must point at the commit from step 2 - and publish.
 
 Publishing runs `publish.yml`, which validates the tag, refuses to ship a
 version with no changelog entry, runs the tests, checks the built version
 matches the tag, uploads to PyPI, and rewrites the release body from the
-changelog. PyPI versions cannot be reused, so a bad release costs the next
-number.
+changelog.
+
+If the changelog entry is missing, the run fails at the first job, so nothing
+is built and nothing reaches PyPI - no version number is lost. Fix the
+changelog, push, then **delete the tag as well as the release** before
+retrying: deleting a release leaves its tag behind, and re-creating one with
+the same name silently reuses that tag and its old commit. PyPI versions
+themselves cannot be reused, so a release that *does* upload is final.
 
 ### Contributing
 
