@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import json
 import os
+import time
 from collections.abc import Sequence
 
 import matplotlib.pyplot as plt
@@ -73,11 +75,19 @@ _TS_CODE_PS = 77.0
 # smaller cap (10 MB) is perfectly safe, just ~6x more part files.
 _PART_MB = 64.0
 
-# Suffix of the folder holding one run's part files, as
-# '<dataset>_delta_t_parts/<dataset>_delta_t_<i>.feather'. Note the parts do
-# NOT match the '*_delta_t.feather' glob 'combine_delta_t_feathers' uses, so
+# Suffix of the folder holding part files, as
+# '<dataset>_delta_t_parts/<dataset>_delta_t_<run>_<i>.feather'. Note the parts
+# do NOT match the '*_delta_t.feather' glob 'combine_delta_t_feathers' uses, so
 # they can never be pooled twice.
 _PARTS_SUFFIX = "_parts"
+
+# Suffix of the per-run manifest written alongside the parts. Part numbering
+# restarts at 0 on every run, so the file names alone cannot say which run a
+# part belongs to: a re-run overwrites '<stem>_0..N' and leaves a longer dead
+# run's '<stem>_N+1..M' in place, where a folder-wide glob then silently pools
+# both. The manifest is the record of which parts one run actually wrote, and
+# it is rewritten on every flush so a run that dies is still described by it.
+_MANIFEST_SUFFIX = "_manifest.json"
 
 # File name suffix of the histogram artifact 'compute_and_save_delta_histogram'
 # writes into 'processed/'. The counts are what every downstream consumer
@@ -174,12 +184,19 @@ def calculate_and_save_timestamp_differences(
 
     The differences are **streamed to disk as they are found**, not held until
     the end: the running buffer is flushed to
-    ``processed/<name>_delta_t_parts/<name>_delta_t_<i>.feather`` whenever it
-    would exceed ``part_size_mb``, and the parts are concatenated into the
-    final feather one record batch at a time. Memory therefore stays flat in
-    the number of '.bin' files, and a run that dies at file 9 000 of 10 000
-    leaves every completed part on disk - recover them with
+    ``processed/<name>_delta_t_parts/<name>_delta_t_<run>_<i>.feather``
+    whenever it would exceed ``part_size_mb``, and the parts are concatenated
+    into the final feather one record batch at a time. Memory therefore stays
+    flat in the number of '.bin' files, and a run that dies at file 9 000 of
+    10 000 leaves every completed part on disk - recover them with
     'combine_delta_t_parts'.
+
+    Each run tags its parts with its own ``<run>`` id and records them in a
+    manifest, and a run refuses to start while another run's parts are still
+    in the folder. Part numbering restarts at 0 every run, so without both of
+    those a re-run would overwrite a dead run's first parts, leave its later
+    ones, and the combine step would pool the two - counting some differences
+    twice and inflating the feather.
 
     With ``apply_TDC_calibration=True`` (default) the board's density-test LUT
     converts timestamps to picoseconds *before* differencing, saving
@@ -254,7 +271,8 @@ def calculate_and_save_timestamp_differences(
     Raises
     ------
     FileExistsError
-        Raised when the '.feather' already exists and ``rewrite`` is False.
+        Raised when the '.feather' already exists and ``rewrite`` is False, or
+        when an earlier run's parts are still in the part folder.
     """
     files = io.find_bin_files(path, tag)
     if max_files is not None:
@@ -275,6 +293,22 @@ def calculate_and_save_timestamp_differences(
         # stale ones left in place would be folded into this run's output.
         store.confirm_rewrite([out_path, parts_dir])
         _clear_parts(parts_dir)
+    else:
+        # A run that died leaves its parts behind, and part numbering restarts
+        # at 0, so this run would overwrite the dead one's first N parts and
+        # leave the rest - a folder holding two runs at once. Stop instead of
+        # producing a feather that counts some differences twice. Nothing is
+        # deleted here; the parts are the crash insurance and they are the
+        # caller's to keep, combine or discard.
+        stale = _all_part_files(parts_dir)
+        if stale:
+            raise FileExistsError(
+                f"{len(stale)} part file(s) from an earlier run are still in\n"
+                f"  {parts_dir}\n"
+                "Starting now would interleave both runs' parts. Either\n"
+                "  - recover them:  combine_delta_t_parts(parts_dir)\n"
+                "  - or discard them by re-running with rewrite=True."
+            )
 
     # Resolve the density-test LUT to apply (per-pixel, code -> ps). None
     # leaves the raw codes in place (saved as delta_code).
@@ -381,12 +415,16 @@ class _PartWriter:
         labels: Sequence[str],
         unit: str,
         part_size_mb: float,
+        run_id: str | None = None,
     ) -> None:
         self.parts_dir = parts_dir
         self.stem = stem
         self.labels = list(labels)
         self.unit = unit
         self.part_bytes = max(int(part_size_mb * 1024 * 1024), 1)
+        self.run_id = (
+            run_id if run_id is not None else _new_run_id(parts_dir)
+        )
         self.parts: list[str] = []
         self.total = 0
         self._buf: dict[str, list[np.ndarray]] = {
@@ -415,12 +453,43 @@ class _PartWriter:
         if self._buffered_bytes >= self.part_bytes:
             self.flush()
 
+    @property
+    def manifest_path(self) -> str:
+        """Path of this run's manifest inside the part folder."""
+        return os.path.join(
+            self.parts_dir, f"{self.stem}_{self.run_id}{_MANIFEST_SUFFIX}"
+        )
+
+    def _write_manifest(self, complete: bool) -> None:
+        """Record this run's parts, so a folder-wide glob cannot mix runs.
+
+        Rewritten after every flush rather than once at the end: a run that
+        dies still leaves a manifest naming every part it completed, which is
+        what 'combine_delta_t_parts' needs to recover it without sweeping up
+        a different run's leftovers.
+        """
+        os.makedirs(self.parts_dir, exist_ok=True)
+        payload = {
+            "run_id": self.run_id,
+            "stem": self.stem,
+            "unit": self.unit,
+            "n_labels": len(self.labels),
+            "parts": [os.path.basename(p) for p in self.parts],
+            "total": self.total,
+            "complete": complete,
+        }
+        tmp = f"{self.manifest_path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+        os.replace(tmp, self.manifest_path)
+
     def flush(self) -> str | None:
         """Write the buffer as the next part; a no-op when it is empty."""
         if not any(self._lens.values()):
             return None
         part = os.path.join(
-            self.parts_dir, f"{self.stem}_{len(self.parts)}.feather"
+            self.parts_dir,
+            f"{self.stem}_{self.run_id}_{len(self.parts)}.feather",
         )
         pair_arrays = {
             lbl: (
@@ -434,40 +503,197 @@ class _PartWriter:
         self.parts.append(part)
         self._buf = {lbl: [] for lbl in self.labels}
         self._lens = dict.fromkeys(self.labels, 0)
+        self._write_manifest(complete=False)
         return part
 
     def close(self) -> list[str]:
         """Flush whatever is left and return every part written."""
         self.flush()
+        if self.parts:
+            self._write_manifest(complete=True)
         return self.parts
 
 
+def _new_run_id(parts_dir: str) -> str:
+    """Return a run tag that no other run in ``parts_dir`` already uses.
+
+    Wall-clock to the second plus the pid reads well in a folder listing and
+    sorts chronologically, but it is not unique on its own: two runs started
+    from the same script within the same second share both, and the second
+    would then overwrite the first's parts - the very failure the run tag
+    exists to prevent. So the tag is checked against the folder and given a
+    ``-2``, ``-3``, ... suffix until nothing on disk answers to it.
+    """
+    base = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid():d}"
+    taken = set(_part_runs(parts_dir))
+    if base not in taken:
+        return base
+    n = 2
+    while f"{base}-{n}" in taken:
+        n += 1
+    return f"{base}-{n}"
+
+
 def _part_index(part_path: str) -> int:
-    """Sort key for '<stem>_<i>.feather': the trailing integer, else -1."""
+    """Sort key for '<stem>_<run>_<i>.feather': the trailing int, else -1."""
     stem = os.path.basename(part_path).removesuffix(".feather")
     _, _, tail = stem.rpartition("_")
     return int(tail) if tail.isdigit() else -1
 
 
-def _find_parts(parts_dir: str) -> list[str]:
-    """Return a part folder's '.feather' files in write order."""
+def _all_part_files(parts_dir: str) -> list[str]:
+    """Every part '.feather' in the folder, whichever run wrote it."""
     if not os.path.isdir(parts_dir):
         return []
     found = glob.glob(os.path.join(parts_dir, "*_delta_t_*.feather"))
     return sorted(found, key=_part_index)
 
 
+def _part_runs(parts_dir: str) -> dict[str, list[str]]:
+    """Group a part folder's files by the run that wrote them.
+
+    Manifests are authoritative: each names the parts of exactly one run.
+    Part files no manifest claims are grouped under ``'legacy'`` - that is
+    what a folder written before manifests existed looks like, and it is also
+    where a folder holding two pre-manifest runs' parts ends up, which is
+    precisely the case that used to be pooled silently.
+
+    Returns
+    -------
+    dict[str, list[str]]
+        Run id -> that run's parts, in write order. Empty when the folder
+        holds no parts.
+    """
+    if not os.path.isdir(parts_dir):
+        return {}
+
+    runs: dict[str, list[str]] = {}
+    claimed: set[str] = set()
+    manifests = sorted(
+        glob.glob(os.path.join(parts_dir, f"*{_MANIFEST_SUFFIX}"))
+    )
+    for mpath in manifests:
+        try:
+            with open(mpath, encoding="utf-8") as fh:
+                payload = json.load(fh)
+            run_id = str(payload["run_id"])
+            names = [str(n) for n in payload["parts"]]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue  # an unreadable manifest must not hide its parts
+        present = [
+            os.path.join(parts_dir, n)
+            for n in names
+            if os.path.isfile(os.path.join(parts_dir, n))
+        ]
+        claimed.update(present)
+        if present:
+            runs[run_id] = sorted(present, key=_part_index)
+
+    orphans = [p for p in _all_part_files(parts_dir) if p not in claimed]
+    if orphans:
+        _warn_if_untagged_parts_are_mixed(orphans)
+        runs["legacy"] = orphans
+    return runs
+
+
+def _warn_if_untagged_parts_are_mixed(parts: Sequence[str]) -> None:
+    """Warn when untagged parts look like more than one run.
+
+    Parts written before run tags existed carry no record of who wrote them,
+    so they cannot be separated - but they can be *detected*: one run writes
+    its parts in index order, so a part whose index is higher than its
+    neighbour's while its mtime is older belongs to an earlier, longer run
+    that a re-run overwrote the front of. Pooling those double-counts part of
+    the data set, which is worth saying out loud even though it cannot be
+    fixed after the fact.
+    """
+    stamped = []
+    for p in parts:
+        try:
+            stamped.append((_part_index(p), os.stat(p).st_mtime))
+        except OSError:
+            return
+    backwards = sum(
+        1
+        for (_, t_prev), (_, t_next) in zip(stamped, stamped[1:], strict=False)
+        if t_next < t_prev
+    )
+    if backwards:
+        print(
+            f"  WARNING: {backwards} of {len(parts)} untagged part file(s) are "
+            "older than the part before them - this folder looks like two "
+            "runs, and pooling it would count some differences twice. Check "
+            "the mtimes before trusting a feather built from it."
+        )
+
+
+def _find_parts(parts_dir: str, run: str | None = None) -> list[str]:
+    """Return one run's part '.feather' files, in write order.
+
+    Raises
+    ------
+    ValueError
+        Raised when the folder holds more than one run and ``run`` does not
+        say which to take. Pooling them is what produced feathers with
+        several times the differences the data actually contains, so it is
+        refused rather than guessed at.
+    """
+    runs = _part_runs(parts_dir)
+    if not runs:
+        return []
+    if run is not None:
+        if run not in runs:
+            raise ValueError(
+                f"No parts for run {run!r} in {parts_dir}. "
+                f"Available: {sorted(runs)}"
+            )
+        return runs[run]
+    if len(runs) == 1:
+        return next(iter(runs.values()))
+
+    summary = "\n".join(
+        f"    run={rid!r}: {len(parts)} part(s)"
+        for rid, parts in sorted(runs.items())
+    )
+    raise ValueError(
+        f"{parts_dir} holds parts from {len(runs)} different runs:\n"
+        f"{summary}\n"
+        "  Pooling them would count some differences more than once. Pass "
+        "run='<id>' to pick one, or move the others aside."
+    )
+
+
 def _clear_parts(parts_dir: str, only: Sequence[str] | None = None) -> None:
     """Remove part files, leaving anything else in the folder alone.
 
-    Only ever touches ``*_delta_t_*.feather`` inside ``parts_dir`` - either
-    all of them (a ``rewrite=True`` that the countdown has already announced)
-    or, with ``only``, just the ones this run wrote.
+    Only ever touches ``*_delta_t_*.feather`` and the manifests beside them -
+    either all of them (a ``rewrite=True`` that the countdown has already
+    announced) or, with ``only``, just the ones this run wrote.
     """
-    targets = list(only) if only is not None else _find_parts(parts_dir)
+    if only is not None:
+        targets = list(only)
+        manifests: list[str] = []
+    else:
+        targets = _all_part_files(parts_dir)
+        manifests = glob.glob(
+            os.path.join(parts_dir, f"*{_MANIFEST_SUFFIX}")
+        )
     for part in targets:
         try:
             os.remove(part)
+        except OSError:
+            pass
+    # A manifest naming parts that are all gone would otherwise keep an empty
+    # run alive in '_part_runs' and block the folder from being tidied away.
+    if only is not None:
+        for mpath in glob.glob(
+            os.path.join(parts_dir, f"*{_MANIFEST_SUFFIX}")
+        ):
+            if not _manifest_parts_present(mpath, parts_dir):
+                manifests.append(mpath)
+    for mpath in manifests:
+        try:
+            os.remove(mpath)
         except OSError:
             pass
     if os.path.isdir(parts_dir) and not os.listdir(parts_dir):
@@ -475,6 +701,18 @@ def _clear_parts(parts_dir: str, only: Sequence[str] | None = None) -> None:
             os.rmdir(parts_dir)
         except OSError:
             pass
+
+
+def _manifest_parts_present(manifest_path: str, parts_dir: str) -> bool:
+    """Report whether a manifest still names a part that exists on disk."""
+    try:
+        with open(manifest_path, encoding="utf-8") as fh:
+            names = json.load(fh)["parts"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return True  # unreadable: leave it alone rather than delete blind
+    return any(
+        os.path.isfile(os.path.join(parts_dir, str(n))) for n in names
+    )
 
 
 def _write_delta_feather(
@@ -688,6 +926,7 @@ def combine_delta_t_parts(
     out_path: str | None = None,
     *,
     rewrite: bool = False,
+    run: str | None = None,
 ) -> str:
     """Assemble one run's delta-t part files into its combined feather.
 
@@ -707,6 +946,10 @@ def combine_delta_t_parts(
     rewrite : bool, optional
         Overwrite an existing combined feather. The default is False, which
         raises instead. When True, 'store.confirm_rewrite' counts down first.
+    run : str | None, optional
+        Which run's parts to assemble, when the folder holds more than one.
+        The default is None, which requires the folder to describe exactly
+        one run and raises otherwise rather than pooling them.
 
     Returns
     -------
@@ -719,8 +962,10 @@ def combine_delta_t_parts(
         Raised when the folder holds no part files.
     FileExistsError
         Raised when the output exists and ``rewrite`` is False.
+    ValueError
+        Raised when the folder holds several runs and ``run`` is None.
     """
-    parts = _find_parts(parts_dir)
+    parts = _find_parts(parts_dir, run)
     if not parts:
         raise FileNotFoundError(
             f"No *_delta_t_<i>.feather part files in:\n  {parts_dir}"

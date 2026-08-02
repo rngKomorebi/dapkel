@@ -654,3 +654,120 @@ def test_plot_streams_and_returns_the_histogram(tmp_path):
     # The fitted numbers must come from the same counts the caller gets back.
     refit = dt.fit_gaussian_peak(centers, counts, fit_window=1000.0)
     assert refit["sigma"] == fit["sigma"]
+
+
+# --- one run's parts must never be pooled with another's ------------------
+#
+# Part numbering restarts at 0 on every run. A 10 000-file run that died at
+# part 300, restarted and writing 120 parts, used to overwrite parts 0-119
+# and leave 120-299 from the dead run in place - and the folder-wide glob
+# behind 'combine_delta_t_parts' then pooled all 300, counting the dead run's
+# tail as extra coincidences. These pin the two halves of the fix.
+
+
+def _run_parts(parts_dir, value, n_parts, run_id=None):
+    """Write 'n_parts' parts of a constant value, as one run would."""
+    writer = dt._PartWriter(
+        str(parts_dir), "run_delta_t", LABELS, "ps", 1.0, run_id=run_id
+    )
+    for _ in range(n_parts):
+        writer.add({lbl: np.full(2, float(value)) for lbl in LABELS})
+        writer.flush()
+    return writer.close()
+
+
+def test_parts_are_tagged_and_manifested_per_run(tmp_path):
+    parts_dir = tmp_path / "parts"
+    dead = _run_parts(parts_dir, 111, 4, run_id="runA")
+    live = _run_parts(parts_dir, 999, 2, run_id="runB")
+
+    # Two runs, no file name collision: the dead run's parts are all intact.
+    assert not set(dead) & set(live)
+    assert all(os.path.isfile(p) for p in dead + live)
+
+    runs = dt._part_runs(str(parts_dir))
+    assert set(runs) == {"runA", "runB"}
+    assert runs["runA"] == dead
+    assert runs["runB"] == live
+
+
+def test_combining_refuses_to_pool_two_runs(tmp_path):
+    parts_dir = tmp_path / "parts"
+    _run_parts(parts_dir, 111, 4, run_id="runA")
+    _run_parts(parts_dir, 999, 2, run_id="runB")
+
+    with pytest.raises(ValueError, match="2 different runs"):
+        dt.combine_delta_t_parts(str(parts_dir))
+
+    # Naming a run takes that run's parts, and nothing of the other's.
+    out = dt.combine_delta_t_parts(
+        str(parts_dir), str(tmp_path / "b.feather"), run="runB"
+    )
+    values = _columns(out)["0,0-1,1"]
+    assert set(values) == {999.0}
+    assert len(values) == 2 * 2
+
+
+def test_legacy_untagged_parts_still_read_as_one_run(tmp_path):
+    """A folder written before manifests existed keeps working."""
+    parts_dir = tmp_path / "parts"
+    parts_dir.mkdir()
+    for i in range(3):
+        dt._write_delta_feather(
+            str(parts_dir / f"run_delta_t_{i}.feather"),
+            {lbl: np.full(2, 5.0) for lbl in LABELS},
+            LABELS,
+            "ps",
+        )
+    assert list(dt._part_runs(str(parts_dir))) == ["legacy"]
+    assert len(dt._find_parts(str(parts_dir))) == 3
+
+
+def test_stage_one_refuses_to_start_on_top_of_stale_parts(tmp_path):
+    root = tmp_path / "run"
+    processed = root / "processed"
+    processed.mkdir(parents=True)
+    # The guard must fire before a single '.bin' is opened, so the file only
+    # has to exist for 'find_bin_files' - it is never read.
+    (root / "data_ORT1.bin").write_bytes(b"")
+    _run_parts(processed / "run_delta_t_parts", 111, 2, run_id="dead")
+
+    with pytest.raises(FileExistsError, match="earlier run"):
+        dt.calculate_and_save_timestamp_differences(
+            str(root),
+            [[(0, 0)], [(1, 1)]],
+            apply_TDC_calibration=False,
+        )
+    # The refusal must not have destroyed the parts it refused over.
+    assert len(dt._all_part_files(str(processed / "run_delta_t_parts"))) == 2
+
+
+def test_two_runs_in_the_same_second_still_get_separate_ids(tmp_path):
+    """Wall-clock alone is not unique: same script, same second, same pid."""
+    parts_dir = tmp_path / "parts"
+    dead = _run_parts(parts_dir, 111, 4)
+    live = _run_parts(parts_dir, 999, 2)
+
+    assert not set(dead) & set(live), "the re-run overwrote the dead run"
+    assert len(dt._part_runs(str(parts_dir))) == 2
+    assert all(os.path.isfile(p) for p in dead + live)
+
+
+def test_untagged_parts_from_two_runs_are_flagged(tmp_path, capsys):
+    """Legacy folders cannot be separated, but they can be called out."""
+    parts_dir = tmp_path / "parts"
+    parts_dir.mkdir()
+    for i in range(4):
+        dt._write_delta_feather(
+            str(parts_dir / f"run_delta_t_{i}.feather"),
+            {lbl: np.full(2, 5.0) for lbl in LABELS},
+            LABELS,
+            "ps",
+        )
+    # A re-run rewrites the low indices, so 0-1 end up NEWER than 2-3.
+    for i, age in ((0, 500.0), (1, 400.0), (2, 900.0), (3, 800.0)):
+        p = parts_dir / f"run_delta_t_{i}.feather"
+        os.utime(p, (os.stat(p).st_atime, os.stat(p).st_mtime - age))
+
+    dt._part_runs(str(parts_dir))
+    assert "looks like two runs" in capsys.readouterr().out

@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-08-02
+
+### Fixed
+
+- **Delta-t parts from two runs could be pooled into one feather.** Part
+  numbering restarts at 0 on every run, so a run that died at part 300 and was
+  restarted for 120 parts had its first 120 overwritten and its last 180 left
+  in place — and `combine_delta_t_parts` globbed the whole folder, pooling all
+  300. The combined feather then counted a slice of the run twice, inflating
+  both the file and the coincidence total, and skewing the peak against the
+  accidental background. Each run now tags its parts with its own id and
+  records them in a manifest (rewritten on every flush, so a dead run is still
+  described), `combine_delta_t_parts` refuses to pool several runs and takes
+  `run=` to pick one, and
+  `calculate_and_save_timestamp_differences` refuses to start while another
+  run's parts are in the folder rather than interleaving with them. Nothing is
+  deleted on that refusal — the parts are the crash insurance.
+
+### Changed
+
+- Delta-t parts are now named `<name>_delta_t_<run>_<i>.feather` and are
+  accompanied by a `<name>_delta_t_<run>_manifest.json`. Folders written
+  before this keep working: their untagged parts read as a single `legacy`
+  run.
+
 ## [0.1.2] - 2026-08-02
 
 ### Added

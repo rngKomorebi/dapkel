@@ -11,9 +11,16 @@ strict: true
 theme:
   name: material
   features:
+    # Left sidebar: every section expanded, so the whole site is one glance.
     - navigation.sections
+    - navigation.expand
+    - navigation.instant
+    - navigation.tracking
     - navigation.top
+    # Prev/next links at the foot of every page, so the guide reads in order.
+    - navigation.footer
     - content.code.copy
+    # Right sidebar: the per-page table of contents, following the scroll.
     - toc.follow
   palette:
     - media: "(prefers-color-scheme: light)"
@@ -65,6 +72,8 @@ markdown_extensions:
   - tables
   - toc:
       permalink: true
+      # h2 and h3 in the right-hand table of contents; h4 and below is detail.
+      toc_depth: 3
 
 nav:
   - Home: index.md
