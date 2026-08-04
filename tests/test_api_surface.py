@@ -35,6 +35,7 @@ ANALYSIS_MODULES = [
     "crosstalk_analysis",
     "hitmap_analysis",
     "tdc_calibration",
+    "background_subtraction",
     "delta_t",
 ]
 
@@ -66,6 +67,14 @@ def _defined_public(tree: ast.Module) -> set[str]:
                 name = getattr(target, "id", None)
                 if name and not name.startswith("_") and name != "__all__":
                     names.add(name)
+        elif isinstance(node, ast.AnnAssign):
+            # 'NAME: type = value' is a different node from 'NAME = value',
+            # and missing it made an annotated public constant invisible to
+            # this guard - it could neither be required in __all__ nor found
+            # when it was declared there.
+            name = getattr(node.target, "id", None)
+            if name and not name.startswith("_"):
+                names.add(name)
     return names
 
 

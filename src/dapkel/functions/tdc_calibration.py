@@ -61,9 +61,8 @@ _SPAD_TAGS = ("SPAD0_S0", "SPAD1_S1", "SPAD2_S2", "SPAD3_S3")
 def compute_code_histogram(
     files: list[str],
     *,
+    nframes: int,
     n_codes: int = _MAX_CODES,
-    valid_min: float = 0.0,
-    nframes: int | None = None,
     label: str = "",
 ) -> np.ndarray:
     """Accumulate the (32, 32, n_codes) per-pixel TDC-code histogram.
@@ -71,22 +70,19 @@ def compute_code_histogram(
     Unpacks each file's ``time_series`` (the raw TDC code) and, for every
     pixel independently, counts how often each integer code occurs across
     all frames. Only frames in which the pixel carried a valid timestamp
-    (``time_series > valid_min``) contribute.
+    contribute - 'unpack' leaves non-fired slots at ``<= 0``, so that is
+    ``time_series > 0``.
 
     Parameters
     ----------
     files : list[str]
         Paths to the '.bin' files to unpack and accumulate.
+    nframes : int
+        Number of frames stored in each '.bin' file.
     n_codes : int, optional
         Number of code bins (0 .. n_codes-1). Codes at or above this are
         out-of-range artefacts and are dropped with a warning. The default
         is 1536.
-    valid_min : float, optional
-        Validity threshold on the code; 'unpack' leaves non-fired slots at
-        ``<= 0``. The default is 0.0.
-    nframes : int | None, optional
-        Frames per file. When None (the default) it is derived from each
-        file's size.
     label : str, optional
         Label used in the progress printout. The default is "".
 
@@ -102,12 +98,11 @@ def compute_code_histogram(
     n_overflow = 0
 
     for fp in tqdm(files, desc=label or None):
-        nf = nframes if nframes is not None else io.frames_in_file(fp)
-        ts, _ = unpack(fp, nf, compute_time_series=True)  # (32, 32, nf)
+        ts, _ = unpack(fp, nframes, compute_time_series=True)  # (32,32,nframes)
 
         code = ts.astype(np.int64)
-        valid = (ts > valid_min) & (code < n_codes)
-        n_overflow += int(((ts > valid_min) & (code >= n_codes)).sum())
+        valid = (ts > 0) & (code < n_codes)
+        n_overflow += int(((ts > 0) & (code >= n_codes)).sum())
 
         lin = pix_index[:, :, np.newaxis] * n_codes + code
         counts += np.bincount(lin[valid], minlength=1024 * n_codes)
@@ -193,10 +188,9 @@ def compute_tdc_lut(
     folder: str,
     tag: str,
     *,
+    nframes: int,
     period_ps: float = _PERIOD_PS,
     n_codes: int = _MAX_CODES,
-    valid_min: float = 0.0,
-    nframes: int | None = None,
     max_files: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute one SPAD's per-pixel code histogram and code -> ps LUT.
@@ -210,15 +204,13 @@ def compute_tdc_lut(
         Path to the folder with the calibration '.bin' data files.
     tag : str
         Filename fragment selecting one SPAD's files (e.g. ``'SPAD0_S0'``).
+    nframes : int
+        Number of frames stored in each '.bin' file.
     period_ps : float, optional
         Full-scale time (ps); the nominal ring-oscillator period. The
         default is 100 000 ps (100 ns).
     n_codes : int, optional
         Number of code bins to allocate before trimming. The default is 1536.
-    valid_min : float, optional
-        Validity threshold on the code. The default is 0.0.
-    nframes : int | None, optional
-        Frames per file. When None (the default) derived from file size.
     max_files : int | None, optional
         Process at most this many files (after natural sorting). The default
         is None (all files).
@@ -236,9 +228,8 @@ def compute_tdc_lut(
 
     counts = compute_code_histogram(
         files,
-        n_codes=n_codes,
-        valid_min=valid_min,
         nframes=nframes,
+        n_codes=n_codes,
         label=tag,
     )
     counts = _trim_trailing_zero_codes(counts)
@@ -324,11 +315,10 @@ def plot_tdc_calibration(
 def collect_and_save_luts(
     folder: str,
     *,
+    nframes: int,
     tags: tuple[str, ...] = _SPAD_TAGS,
     period_ps: float = _PERIOD_PS,
     n_codes: int = _MAX_CODES,
-    valid_min: float = 0.0,
-    nframes: int | None = None,
     max_files: int | None = None,
     save_qa: bool = True,
     qa_pixel: tuple[int, int] = (16, 16),
@@ -345,6 +335,8 @@ def collect_and_save_luts(
     ----------
     folder : str
         Path to the folder with the calibration '.bin' data files.
+    nframes : int
+        Number of frames stored in each '.bin' file.
     tags : tuple[str, ...], optional
         SPAD filename fragments to process. The default is the four Kelpie
         micropixel tags ``('SPAD0_S0', 'SPAD1_S1', 'SPAD2_S2', 'SPAD3_S3')``.
@@ -353,10 +345,6 @@ def collect_and_save_luts(
         default is 100 000 ps (100 ns).
     n_codes : int, optional
         Number of code bins to allocate before trimming. The default is 1536.
-    valid_min : float, optional
-        Validity threshold on the code. The default is 0.0.
-    nframes : int | None, optional
-        Frames per file. When None (the default) derived from file size.
     max_files : int | None, optional
         Process at most this many files per tag. The default is None.
     save_qa : bool, optional
@@ -390,9 +378,8 @@ def collect_and_save_luts(
         )
         counts = compute_code_histogram(
             files,
-            n_codes=n_codes,
-            valid_min=valid_min,
             nframes=nframes,
+            n_codes=n_codes,
             label=tag,
         )
         counts = _trim_trailing_zero_codes(counts)

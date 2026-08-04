@@ -37,6 +37,8 @@ every other analysis in this package.
 - [Hitmaps](guide/hitmap.md) — occupancy and photon rate
 - [TDC calibration](guide/tdc_calibration.md) — the code density test
 - [Coincidences](guide/coincidences.md) — delta-t and timing jitter
+- [Background subtraction](guide/background_subtraction.md) — measure the
+  accidental background by shifting frames instead of fitting it
 - [Data quality](guide/data_quality.md) — check the run before trusting it
 
 ## Reference
@@ -45,6 +47,7 @@ every other analysis in this package.
 - [The triangular delta-t background](ort_triangle_background.md) — why a flat
   fit inflates the jitter
 - [`dapkel.core`](api/core.md) — the shared substrate
+- [Open items](todo.md) — what is known to need deciding, and why it has not been
 
 ## Plot styling
 
@@ -57,7 +60,7 @@ import komorebi_mpl
 from dapkel.functions import hitmap_analysis
 
 komorebi_mpl.use("night_wave")    # or any registered style, or "default"
-hitmap_analysis.collect_and_plot_hitmap(path)
+hitmap_analysis.collect_and_plot_hitmap(path)   # stage 2: reads the saved map
 ```
 
 The plotting functions never touch `rcParams` themselves, so whatever style is

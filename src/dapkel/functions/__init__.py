@@ -21,6 +21,7 @@ Full documentation: ``docs/index.md``. Adding a measurement:
 """
 
 from dapkel.functions import (
+    background_subtraction,
     calc_diff,
     crosstalk_analysis,
     data_quality,
@@ -42,5 +43,6 @@ __all__ = [
     "hitmap_analysis",
     "tdc_calibration",
     "calc_diff",
+    "background_subtraction",
     "delta_t",
 ]

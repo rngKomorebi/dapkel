@@ -24,6 +24,11 @@ _old/
 *.bak
 *.orig
 
+# Bench scripts for trying things out: hardcoded paths, functions pasted inline
+# to be stepped through, no promise they run anywhere but this machine. Worked
+# examples live in examples/ and are tracked.
+testing_ideas/
+
 # OS cruft
 .DS_Store
 Thumbs.db
@@ -34,6 +39,10 @@ Thumbs.db
 processed/
 results/
 *.bin
+
+# Figures dropped in the repo root by a bench script run from here. Figures
+# that belong to the documentation live in docs/figures/ and are tracked.
+/*.png
 
 # mkdocs build output
 site/

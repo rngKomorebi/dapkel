@@ -8,11 +8,10 @@ module boundary; they are shared API, so they live here.
 
 from __future__ import annotations
 
-import os
-
 __all__ = [
     "CLK_PERIOD",
     "FREE_RUNNING_US",
+    "resolve_cycle_time",
     "resolve_frame_time",
     "resolve_live_time",
 ]
@@ -21,29 +20,124 @@ __all__ = [
 CLK_PERIOD = 5e-9
 
 #: Base frame period when ``exp_time=0`` is sent to the acquisition exe, in µs.
+#: The firmware adds this to whatever exposure is requested, so it is both the
+#: whole cycle under short-exposure firmware and the overhead under long.
 FREE_RUNNING_US = 9.0
 
+#: Firmware versions, by how they set the length of one acquisition cycle:
+#:
+#:     * ``'short_exposure'`` - the cycle is always 9 µs. The photon-sensitive
+#:       exposure inside it is 50-500 ns (typically 100 ns) and does not change
+#:       the cycle length.
+#:     * ``'long_exposure'`` - the caller sets X and the firmware adds 9 µs, so
+#:       the cycle is ``X + 9 µs`` and the exposure is essentially the whole of
+#:       it.
+#:
+#: The ``'short_window'`` / ``'full_window'`` names 'resolve_live_time' and
+#: 'dcr_analysis' use are accepted as aliases of the two.
+_CYCLE_ALIASES = {
+    "short_exposure": "short_exposure",
+    "short_window": "short_exposure",
+    "long_exposure": "long_exposure",
+    "full_window": "long_exposure",
+}
 
-def resolve_frame_time(
-    folder: str, explicit: float | None, nframes: int
+
+def resolve_cycle_time(
+    firmware_version: str, exp_time: float | None = None
 ) -> tuple[float, str]:
-    """Return the per-frame period and a description of where it came from.
+    """Return the length of one acquisition cycle and where it came from.
 
-    Mirrors the GUI's ``_run_analysis`` logic exactly:
+    This is the wall-clock repetition period of a frame, which is what a
+    photon *rate* divides by: ``nframes * n_files * cycle`` is the elapsed
+    time of a run.
 
-    1. explicit ``exp_time`` supplied -> ``exp_time`` + 9 µs overhead
-    2. ``frame_rate_cnt.txt`` present -> ``ticks * CLK_PERIOD / nframes``
-    3. fallback                       -> 9 µs free-running base
+    Computed from the firmware setting, and **never** from the
+    ``frame_rate_cnt.txt`` the acquisition exe writes beside the data: that exe
+    is not ours, so no analysis here is allowed to depend on its output. The
+    cycle length is a property of the firmware and the requested exposure, and
+    ``Kelpie_run.m`` states it directly: ``exp_time = 0 -> 9 us``,
+    ``1e-6 -> 10 us``, ``2e-6 -> 11 us``.
+
+    For the record, the counter *is* self-consistent where it exists - it is a
+    200 MHz tick count over the whole run, latched by the firmware, and across
+    every sample folder it fits ``ticks = nframes * N + 138 + window/5ns``
+    exactly. What it says is that the real cycle is **9.685-9.770 µs**, i.e.
+    685-770 ns per frame longer than the nominal 9 µs used here, and that the
+    50-500 ns exposure window sits *inside* the cycle rather than extending it.
+    So a rate normalised by the nominal 9 µs runs ~7.8% high. Whether to prefer
+    the nominal or a measured cycle is a decision for the experiment, not for
+    this function to make silently off a file it happens to find on disk.
 
     Parameters
     ----------
-    folder : str
-        Data folder, searched for ``frame_rate_cnt.txt``.
+    firmware_version : str
+        ``'short_exposure'`` (the cycle is always 9 µs) or ``'long_exposure'``
+        (the cycle is ``exp_time`` + 9 µs). ``'short_window'`` and
+        ``'full_window'`` are accepted as aliases of the two.
+    exp_time : float | None, optional
+        The exposure X requested of long-exposure firmware, in seconds. The
+        firmware adds 9 µs to it. Required for ``'long_exposure'``, ignored for
+        ``'short_exposure'``. The default is None.
+
+    Returns
+    -------
+    tuple[float, str]
+        The cycle length in seconds and a human-readable source string.
+
+    Raises
+    ------
+    ValueError
+        Raised on an unknown ``firmware_version``, or when
+        ``'long_exposure'`` is given without ``exp_time``.
+    """
+    try:
+        version = _CYCLE_ALIASES[firmware_version]
+    except KeyError:
+        raise ValueError(
+            "firmware_version must be 'short_exposure' or 'long_exposure' "
+            f"(aliases 'short_window' / 'full_window'), got "
+            f"{firmware_version!r}"
+        ) from None
+
+    base = FREE_RUNNING_US * 1e-6
+    if version == "short_exposure":
+        return base, f"short_exposure: {FREE_RUNNING_US:.0f} µs cycle"
+    if exp_time is None:
+        raise ValueError(
+            "firmware_version='long_exposure' needs exp_time (the exposure X "
+            "requested, in seconds; the firmware adds "
+            f"{FREE_RUNNING_US:.0f} µs to it)."
+        )
+    return (
+        exp_time + base,
+        f"long_exposure: {exp_time * 1e6:.3f} µs + "
+        f"{FREE_RUNNING_US:.0f} µs = {(exp_time + base) * 1e6:.3f} µs cycle",
+    )
+
+
+def resolve_frame_time(
+    explicit: float | None, nframes: int | None = None
+) -> tuple[float, str]:
+    """Return the per-frame period and a description of where it came from.
+
+    1. explicit ``exp_time`` supplied -> ``exp_time`` + 9 µs overhead
+    2. fallback                       -> 9 µs free-running base
+
+    The acquisition exe also writes a ``frame_rate_cnt.txt`` beside the data -
+    a 200 MHz tick count for the whole run, latched by the firmware. **It is
+    deliberately not read here.** It is written by an exe we do not control, so
+    nothing in the analysis path is allowed to depend on it; the period comes
+    from the settings the run was started with. See 'resolve_cycle_time' for
+    what the counter does contain, and for the measured-vs-nominal gap.
+
+    Parameters
+    ----------
     explicit : float | None
-        Explicit exposure time in seconds, or None to fall through to the
-        counter file.
-    nframes : int
-        Frames per file, used to turn the tick count into a period.
+        Explicit exposure time in seconds, or None for the free-running base.
+    nframes : int | None, optional
+        Unused. Kept so existing callers do not break; it was only ever needed
+        to turn the counter's tick count into a period. The default is None.
 
     Returns
     -------
@@ -57,21 +151,11 @@ def resolve_frame_time(
             f"exp_time={explicit * 1e6:.1f} µs + {FREE_RUNNING_US:.0f} µs overhead",
         )
 
-    cnt_file = os.path.join(folder, "frame_rate_cnt.txt")
-    try:
-        ticks = int(open(cnt_file).read().strip())
-        if ticks > 0:
-            ft = ticks * CLK_PERIOD / nframes
-            return ft, f"frame_rate_cnt.txt -> {ft * 1e6:.4f} µs"
-    except (OSError, ValueError):
-        pass
-
     ft = FREE_RUNNING_US * 1e-6
-    return ft, f"fallback free-running ({FREE_RUNNING_US} µs)"
+    return ft, f"free-running base ({FREE_RUNNING_US} µs)"
 
 
 def resolve_live_time(
-    folder: str,
     firmware_version: str,
     nframes: int,
     *,
@@ -94,9 +178,6 @@ def resolve_live_time(
 
     Parameters
     ----------
-    folder : str
-        Data folder (only used by ``'full_window'`` for
-        ``frame_rate_cnt.txt``).
     firmware_version : str
         ``'short_window'`` or ``'full_window'``.
     nframes : int
@@ -124,7 +205,7 @@ def resolve_live_time(
             return None, "short_window (no acq_window given)"
         return acq_window, f"short_window: {acq_window * 1e9:.1f} ns window"
     if firmware_version == "full_window":
-        return resolve_frame_time(folder, exp_time, nframes)
+        return resolve_frame_time(exp_time, nframes)
     raise ValueError(
         "firmware_version must be 'short_window' or 'full_window', got "
         f"{firmware_version!r}"

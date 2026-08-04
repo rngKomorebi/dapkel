@@ -99,7 +99,7 @@ def _accumulate_dcr(
     total_time = nframes * len(files) * frame_time
     if total_time == 0:
         raise ValueError(
-            "Total acquisition time is zero — check --exp-time / frame_rate_cnt.txt."
+            "Total acquisition time is zero — check nframes and --exp-time."
         )
     dcr = photon_sum / total_time
     return dcr
@@ -128,8 +128,8 @@ def compute_dcr_32(
         Number of frames stored in each '.bin' file.
     exp_time : float | None, optional
         Legacy exposure time in seconds (``firmware_version='full_window'``
-        only): 0 → 9 µs actual, 10e-6 → 19 µs. If None, read from
-        'frame_rate_cnt.txt', falling back to 9 µs. The default is None.
+        only): 0 → 9 µs actual, 10e-6 → 19 µs. If None, the 9 µs
+        free-running base is used. The default is None.
     tag : str, optional
         SPAD quadrant tag ('S0C', 'S1C', 'S2C', 'S3C'). The default is
         "", which matches every '.bin' file in the folder.
@@ -153,7 +153,7 @@ def compute_dcr_32(
         is given.
     """
     live, _ = timing.resolve_live_time(
-        folder, firmware_version, nframes,
+        firmware_version, nframes,
         acq_window=acq_window, exp_time=exp_time,
     )
     if live is None:
@@ -188,8 +188,8 @@ def compute_dcr_64(
         Number of frames stored in each '.bin' file.
     exp_time : float | None, optional
         Legacy exposure time in seconds (``firmware_version='full_window'``
-        only). If None, read from 'frame_rate_cnt.txt', falling back to
-        9 µs. The default is None.
+        only). If None, the 9 µs free-running base is used. The default
+        is None.
     firmware_version : str, optional
         ``'short_window'`` (default) or ``'full_window'``; see
         'resolve_live_time'.
@@ -212,7 +212,7 @@ def compute_dcr_64(
         is given.
     """
     live, _ = timing.resolve_live_time(
-        folder, firmware_version, nframes,
+        firmware_version, nframes,
         acq_window=acq_window, exp_time=exp_time,
     )
     if live is None:
@@ -306,7 +306,6 @@ def _dcr_meta(
 ) -> dict:
     """Build the acquisition metadata sidecar for a saved DCR map."""
     frame_live_s, live_source = timing.resolve_live_time(
-        path,
         firmware_version,
         nframes,
         acq_window=acq_window,

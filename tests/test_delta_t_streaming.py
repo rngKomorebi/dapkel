@@ -259,15 +259,17 @@ def _fake_run(tmp_path, n_files=6):
     return folder
 
 
-def test_end_to_end_streams_parts_and_combines_them(tmp_path):
+def test_end_to_end_streams_parts_and_combines_them(tmp_path, monkeypatch):
     folder = _fake_run(tmp_path)
 
+    # 1 KB parts, so the buffer rolls over every few files. The cap is a
+    # module constant rather than a parameter, so the test moves the constant.
+    monkeypatch.setattr(dt, "_PART_MB", 1 / 1024)
     out = dt.calculate_and_save_timestamp_differences(
         str(folder),
         PAIRS,
         apply_TDC_calibration=False,
         nframes=NFRAMES,
-        part_size_mb=1 / 1024,  # 1 KB, so it rolls over every few files
     )
 
     parts_dir = tmp_path / "run" / "processed" / "run_delta_t_parts"
@@ -282,17 +284,17 @@ def test_end_to_end_streams_parts_and_combines_them(tmp_path):
         assert 0.9 * 6 * NFRAMES <= values.size <= 6 * NFRAMES
 
 
-def test_end_to_end_part_size_does_not_change_the_result(tmp_path):
+def test_end_to_end_part_size_does_not_change_the_result(tmp_path, monkeypatch):
     """Sharding is a memory strategy; it must not touch the numbers."""
     results = {}
     for part_mb in (1 / 1024, 1024.0):
         folder = _fake_run(tmp_path / f"cap{part_mb}")
+        monkeypatch.setattr(dt, "_PART_MB", part_mb)
         out = dt.calculate_and_save_timestamp_differences(
             str(folder),
             PAIRS,
             apply_TDC_calibration=False,
             nframes=NFRAMES,
-            part_size_mb=part_mb,
         )
         results[part_mb] = _columns(out)
 
@@ -304,11 +306,8 @@ def test_end_to_end_part_size_does_not_change_the_result(tmp_path):
 
 def test_end_to_end_rewrite_guard(tmp_path, monkeypatch, capsys):
     folder = _fake_run(tmp_path, n_files=2)
-    kwargs = {
-        "apply_TDC_calibration": False,
-        "nframes": NFRAMES,
-        "part_size_mb": 1 / 1024,
-    }
+    kwargs = {"apply_TDC_calibration": False, "nframes": NFRAMES}
+    monkeypatch.setattr(dt, "_PART_MB", 1 / 1024)
     dt.calculate_and_save_timestamp_differences(str(folder), PAIRS, **kwargs)
 
     with pytest.raises(FileExistsError):
@@ -329,11 +328,8 @@ def test_end_to_end_rewrite_guard(tmp_path, monkeypatch, capsys):
 def test_end_to_end_rewrite_does_not_pool_the_previous_run(tmp_path, monkeypatch):
     """Stale parts must be cleared, or a rewrite doubles the data."""
     folder = _fake_run(tmp_path, n_files=3)
-    kwargs = {
-        "apply_TDC_calibration": False,
-        "nframes": NFRAMES,
-        "part_size_mb": 1 / 1024,
-    }
+    kwargs = {"apply_TDC_calibration": False, "nframes": NFRAMES}
+    monkeypatch.setattr(dt, "_PART_MB", 1 / 1024)
     first = _columns(
         dt.calculate_and_save_timestamp_differences(str(folder), PAIRS, **kwargs)
     )
@@ -349,21 +345,35 @@ def test_end_to_end_rewrite_does_not_pool_the_previous_run(tmp_path, monkeypatch
         np.testing.assert_array_equal(second[label], values)
 
 
-def test_end_to_end_keep_parts_false_removes_them(tmp_path):
+def test_end_to_end_keeps_the_parts_after_combining(tmp_path, monkeypatch):
+    """A successful run keeps its parts.
+
+    They are the crash insurance, and every read-side entry point streams a
+    part folder as readily as the combined file.
+    """
     folder = _fake_run(tmp_path, n_files=3)
+    monkeypatch.setattr(dt, "_PART_MB", 1 / 1024)
     out = dt.calculate_and_save_timestamp_differences(
         str(folder),
         PAIRS,
         apply_TDC_calibration=False,
         nframes=NFRAMES,
-        part_size_mb=1 / 1024,
-        keep_parts=False,
     )
 
     parts_dir = tmp_path / "run" / "processed" / "run_delta_t_parts"
-    assert not parts_dir.exists()
-    for values in _columns(out).values():
+    parts = dt._find_parts(str(parts_dir))
+    assert len(parts) > 1
+
+    # The kept parts and the combined feather must say the same thing.
+    combined = _columns(out)
+    for values in combined.values():
         assert 0.9 * 3 * NFRAMES <= values.size <= 3 * NFRAMES
+    from_parts: dict[str, list] = {label: [] for label in combined}
+    for part in parts:
+        for label, values in _columns(part).items():
+            from_parts[label].extend(values.tolist())
+    for label, values in combined.items():
+        np.testing.assert_allclose(from_parts[label], values)
 
 
 # --- stage 1b: streaming the feather down to a histogram -------------------
@@ -736,6 +746,7 @@ def test_stage_one_refuses_to_start_on_top_of_stale_parts(tmp_path):
         dt.calculate_and_save_timestamp_differences(
             str(root),
             [[(0, 0)], [(1, 1)]],
+            nframes=NFRAMES,
             apply_TDC_calibration=False,
         )
     # The refusal must not have destroyed the parts it refused over.
@@ -834,3 +845,176 @@ def test_one_batch_and_many_batches_histogram_identically(tmp_path):
 
     np.testing.assert_array_equal(one_counts, many_counts)
     assert one_stats["total"] == many_stats["total"] > 0
+
+
+# --- subtract_background: the frame-shifted columns -----------------------
+#
+# The feather grows one column per pair per lag, named '<pair>@lag<k>', with
+# lag 0 keeping the bare pair name. That naming is the whole compatibility
+# story: every existing reader still finds exactly the columns it always did,
+# and a reader that pools "every pair column" must not quietly hoover up 9x
+# the data because the background happens to be in the same file.
+
+
+def _lagged_feather(tmp_path, lags=(1, 2, 3), nframes=4):
+    """Write a small lagged feather by hand, one known value per column."""
+    path = str(tmp_path / "run_delta_t.feather")
+    columns = {}
+    for k in (0, *lags):
+        for i, label in enumerate(LABELS):
+            # lag 0 holds a peak at 0; the shifted lags hold only 'background'
+            # away from it, so a subtraction has something to remove.
+            values = (
+                np.array([0.0, 0.0, 200.0]) if k == 0 else np.array([200.0])
+            )
+            columns[dt._lag_column(label, k)] = values + i
+    dt._write_delta_feather(
+        path,
+        columns,
+        list(columns),
+        "ps",
+        dt._lag_meta((0, *lags), nframes),
+    )
+    return path
+
+
+def test_lag_columns_are_named_apart_from_the_pair_columns(tmp_path):
+    path = _lagged_feather(tmp_path)
+    with pa.ipc.open_file(path) as reader:
+        names = reader.schema.names
+
+    assert names[: len(LABELS)] == LABELS, "lag 0 must keep the bare names"
+    assert "0,0-1,1@lag2" in names
+    assert not any("@" in lbl for lbl in LABELS), "a pair label cannot hold @"
+
+
+def test_pooling_every_pair_column_ignores_the_lag_columns(tmp_path):
+    """Otherwise a plain plot of a lagged feather would inflate ~9x."""
+    path = _lagged_feather(tmp_path)
+    columns, _, _ = dt._pooled_columns([path], None)
+
+    assert columns == LABELS
+
+
+def test_the_lag_meta_travels_through_a_combine(tmp_path):
+    """A combined feather must describe itself as its parts did."""
+    parts_dir = str(tmp_path / "parts")
+    writer = dt._PartWriter(
+        parts_dir,
+        "run_delta_t",
+        [dt._lag_column(LABELS[0], k) for k in (0, 1)],
+        "ps",
+        1 / 1024,
+        extra_meta=dt._lag_meta((0, 1), 10),
+    )
+    for _ in range(4):
+        writer.add(
+            {dt._lag_column(LABELS[0], k): np.arange(40.0) for k in (0, 1)}
+        )
+    parts = writer.close()
+    assert len(parts) > 1, "the cap was never reached"
+
+    combined = str(tmp_path / "combined_delta_t.feather")
+    dt._combine_delta_feathers(parts, combined)
+
+    assert dt._read_lag_meta([combined]) == {"lags": [0, 1], "nframes": 10}
+
+
+def test_mixed_lag_sets_are_refused(tmp_path):
+    a = str(tmp_path / "a_delta_t.feather")
+    b = str(tmp_path / "b_delta_t.feather")
+    for path, lags in ((a, (0, 1)), (b, (0, 2))):
+        dt._write_delta_feather(
+            path,
+            {LABELS[0]: np.array([0.0])},
+            [LABELS[0]],
+            "ps",
+            dt._lag_meta(lags, 10),
+        )
+    with pytest.raises(ValueError, match="different lag sets"):
+        dt._read_lag_meta([a, b])
+
+
+def test_every_lag_is_histogrammed_in_one_pass(tmp_path):
+    """One row per lag, lag 0 first, and row 0 is the plain histogram."""
+    path = _lagged_feather(tmp_path)
+    edges = dt._delta_hist_edges(BIN_PS, WINDOW_PS)
+    kwargs = {
+        "edges": edges,
+        "time_unit_ps": TIME_UNIT_PS,
+        "plot_window_ps": WINDOW_PS,
+        "quiet": True,
+    }
+
+    plain, plain_stats = dt._stream_delta_histogram([path], **kwargs)
+    lagged, lag_stats = dt._stream_delta_histogram(
+        [path], lags=[0, 1, 2, 3], **kwargs
+    )
+
+    assert lagged.shape == (4, plain.size)
+    np.testing.assert_array_equal(lagged[0], plain)
+    # The stats describe the measurement, not the background bookkeeping.
+    assert lag_stats["n"] == plain_stats["n"]
+    assert lag_stats["total"] == plain_stats["total"]
+    # Each shifted lag holds one value per pair, at +200 ps.
+    assert lagged[1:].sum() == 3 * len(LABELS)
+
+
+def test_subtracting_needs_a_feather_with_lag_columns(tmp_path):
+    root = _hist_run(tmp_path)
+    with pytest.raises(ValueError, match="frame-shifted columns"):
+        dt.compute_and_save_delta_histogram(
+            str(root), subtract_background=True, quiet=True
+        )
+
+
+def test_subtracting_refuses_a_triangle_before_reading_anything(
+    tmp_path, monkeypatch
+):
+    """The streaming pass is minutes on a real feather - check the model first."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    path = _lagged_feather(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("the feather must not be read at all")
+
+    monkeypatch.setattr(dt, "_stream_delta_histogram", _boom)
+    with pytest.raises(ValueError, match="no triangle left"):
+        dt.collect_and_plot_timestamp_differences(
+            feather_path=path,
+            subtract_background=True,
+            background="triangle",
+        )
+
+
+def test_the_subtracted_driver_returns_the_residual(tmp_path):
+    """End to end on the feather path: residual out, both figures on disk."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    root = tmp_path / "run"
+    (root / "processed").mkdir(parents=True)
+    path = _lagged_feather(root / "processed")
+
+    counts, centers, fit = dt.collect_and_plot_timestamp_differences(
+        feather_path=path,
+        bin_width_ps=100.0,
+        plot_window_ps=500.0,
+        support_ps=1000.0,
+        peak_window_ps=100.0,
+        subtract_background=True,
+        label="test",
+    )
+
+    assert counts.shape == centers.shape
+    np.testing.assert_allclose(counts, fit["subtraction"]["residual"])
+    # Two pairs, two entries each at delta = 0 and 1 ps -> both in the 0 bin,
+    # against one background entry per lag well away from it.
+    np.testing.assert_allclose(fit["model_free"]["n"], 4.0)
+    assert np.isnan(fit["car"]), "a residual has no peak-to-baseline ratio"
+
+    results = root / "results" / "coincidences"
+    assert (results / "run_test_delta_t_sub.png").is_file()
+    assert (results / "run_test_background_subtraction.png").is_file()

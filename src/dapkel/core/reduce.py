@@ -12,7 +12,6 @@ from collections.abc import Callable
 import numpy as np
 from tqdm import tqdm
 
-from dapkel.core import io
 from dapkel.functions.unpack import unpack
 
 __all__ = [
@@ -29,7 +28,7 @@ def accumulate_frames(
     files: list[str],
     extract: Extract,
     *,
-    nframes: int | None = None,
+    nframes: int,
     need_time_series: bool = True,
     label: str = "",
     shape: tuple[int, int] = (32, 32),
@@ -47,9 +46,11 @@ def accumulate_frames(
         ``need_time_series`` is False. Typical bodies are
         ``lambda ts, pc: pc.sum(axis=2)`` for photon counts and
         ``lambda ts, pc: (ts > 0).sum(axis=2)`` for ORT occupancy.
-    nframes : int | None, optional
-        Frames per file. When None (the default) it is derived from each
-        file's size, so files of differing length are handled correctly.
+    nframes : int
+        Frames per file - the acquisition setting, required rather than
+        inferred. 'io.frames_in_file' is there when a file's size is the only
+        record left, but which frame count a run used is the caller's to
+        state, not this loop's to guess.
     need_time_series : bool, optional
         Whether ``extract`` uses the timestamps. Passing False lets 'unpack'
         skip the coarse/fine time decoding - roughly two thirds of the
@@ -67,8 +68,7 @@ def accumulate_frames(
     """
     total = np.zeros(shape, dtype=np.float64)
     for fp in tqdm(files, desc=label or None):
-        nf = nframes if nframes is not None else io.frames_in_file(fp)
-        ts, pc = unpack(fp, nf, compute_time_series=need_time_series)
+        ts, pc = unpack(fp, nframes, compute_time_series=need_time_series)
         total += extract(ts, pc)
     return total
 

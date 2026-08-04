@@ -36,16 +36,15 @@ def collect_time_mat(
     folder: str,
     pixels: Pixel | Sequence[Pixel],
     *,
+    nframes: int,
     tag: str = "ORT",
-    valid_min: float = 0.0,
-    nframes: int | None = None,
     max_files: int | None = None,
 ) -> dict[Pixel, np.ndarray]:
     """Collect the per-frame TDC codes (``time_mat``) for given pixels.
 
     Returns, per requested pixel, the stack of its per-frame TDC codes over
-    every file, keeping only frames with a valid timestamp
-    (``time_series > valid_min``).
+    every file, keeping only frames with a valid timestamp - 'unpack' leaves
+    non-fired slots at ``<= 0``, so that is ``time_series > 0``.
 
     Parameters
     ----------
@@ -53,12 +52,10 @@ def collect_time_mat(
         Path to the folder with the '.bin' data files.
     pixels : tuple[int, int] | Sequence[tuple[int, int]]
         A single ``(row, col)`` pixel or a sequence of them.
+    nframes : int
+        Number of frames stored in each '.bin' file.
     tag : str, optional
         Filename fragment selecting the files. The default is ``'ORT'``.
-    valid_min : float, optional
-        Validity threshold. The default is 0.0.
-    nframes : int | None, optional
-        Frames per file. When None (default) derived from file size.
     max_files : int | None, optional
         Process at most this many files. The default is None.
 
@@ -74,11 +71,10 @@ def collect_time_mat(
 
     chunks: dict[Pixel, list[np.ndarray]] = {p: [] for p in pix}
     for fp in tqdm(files, desc=tag or "time_mat"):
-        nf = nframes if nframes is not None else io.frames_in_file(fp)
-        ts, _ = unpack(fp, nf, compute_time_series=True)
+        ts, _ = unpack(fp, nframes, compute_time_series=True)
         for r, c in pix:
             code = ts[r, c]
-            chunks[(r, c)].append(code[code > valid_min])
+            chunks[(r, c)].append(code[code > 0])
 
     return {
         p: (np.concatenate(v) if v else np.empty(0, dtype=np.float64))
@@ -90,6 +86,7 @@ def plot_time_code_histogram(
     folder: str,
     pixel: Pixel,
     *,
+    nframes: int,
     tag: str = "ORT",
     bins: int | np.ndarray = 256,
     time_unit_ps: float | None = None,
@@ -107,6 +104,8 @@ def plot_time_code_histogram(
         Path to the folder with the '.bin' data files.
     pixel : tuple[int, int]
         The ``(row, col)`` pixel to inspect.
+    nframes : int
+        Number of frames stored in each '.bin' file.
     tag : str, optional
         Filename fragment selecting the files. The default is ``'ORT'``.
     bins : int | np.ndarray, optional
@@ -124,9 +123,9 @@ def plot_time_code_histogram(
         The pixel's valid TDC codes over all frames.
     """
     r, c = int(pixel[0]), int(pixel[1])
-    codes = collect_time_mat(folder, (r, c), tag=tag, max_files=max_files)[
-        (r, c)
-    ]
+    codes = collect_time_mat(
+        folder, (r, c), nframes=nframes, tag=tag, max_files=max_files
+    )[(r, c)]
 
     scale = time_unit_ps if time_unit_ps else 1.0
     unit = "ps" if time_unit_ps else "TDC code"

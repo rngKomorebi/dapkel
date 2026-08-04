@@ -1,4 +1,4 @@
-"""Per-pixel sensor occupancy (hitmaps), in counts and in rate units.
+"""Per-pixel sensor occupancy (hitmaps), in counts and in photon rate.
 
 Two modes, matched to what 'unpack' returns:
 
@@ -6,9 +6,10 @@ Two modes, matched to what 'unpack' returns:
       first-photon timestamp. At most one firing per macropixel per frame.
     * ``mode="count"`` (``S*C``/``ORC``) - sums the per-pixel photon counts.
 
-The rate normalisation differs between them: ``count`` divides by the live
-acquisition window, ``timestamp`` by the wall-clock frame period. Using the
-window for occupancy overstates the rate by ~45x. The derivation is in
+Both are turned into a photon rate the same way: divide by the wall-clock
+duration of the acquisition, ``nframes * n_files * 9 us``. Under the current
+firmware every frame is a 9 µs acquisition cycle, so that product *is* the
+elapsed time, and the rate is photons per second of experiment. See
 ``docs/guide/hitmap.md``.
 """
 
@@ -38,6 +39,12 @@ __all__ = [
 #: Analysis name: the stage-1 file stem and the results sub-folder.
 _KIND = "hitmap"
 
+# Fallback cycle length, in seconds: the short-exposure firmware's fixed 9 µs.
+# Used only for a sidecar written before 'frame_cycle_s' was recorded in it;
+# every new hitmap stores the cycle 'timing.resolve_cycle_time' resolved from
+# the firmware version and exposure it was given.
+_DEFAULT_CYCLE_S = timing.FREE_RUNNING_US * 1e-6
+
 # SPAD quadrant layout on the full (64, 64) sensor: each S*C tag reads one
 # micropixel per 2x2 macropixel, so the four (32, 32) maps interleave onto
 # the full grid. The indices run CLOCKWISE, not row-major::
@@ -61,8 +68,7 @@ def _accumulate_hitmap(
     files: list[str],
     mode: str,
     *,
-    valid_min: float = 0.0,
-    nframes: int | None = None,
+    nframes: int,
     label: str = "",
 ) -> np.ndarray:
     """Unpack a list of '.bin' files and accumulate the (32, 32) hitmap.
@@ -75,15 +81,8 @@ def _accumulate_hitmap(
         ``'timestamp'`` for the ORT occupancy map (per pixel, the number of
         frames carrying a valid first-photon timestamp), or ``'count'`` for
         the accumulated photon-count map (S*C / ORC).
-    valid_min : float, optional
-        Timestamp-validity threshold for ``mode='timestamp'``: a pixel is
-        counted in a frame when ``time_series > valid_min``. 'unpack' leaves
-        non-fired slots at ``<= 0``. Ignored for ``mode='count'``. The
-        default is 0.0.
-    nframes : int | None, optional
-        Number of frames per file. When None (the default) it is derived
-        from each file's size, which is the common case for the uniform
-        ORT/S*C acquisitions.
+    nframes : int
+        Number of frames per file.
     label : str, optional
         Label used in the progress printout. The default is "".
 
@@ -101,10 +100,12 @@ def _accumulate_hitmap(
         raise ValueError(f"mode must be 'timestamp' or 'count', got {mode!r}")
 
     if mode == "timestamp":
-        # Occupancy: frames with a valid first-photon timestamp. Do NOT use
+        # Occupancy: frames with a valid first-photon timestamp. 'unpack'
+        # leaves non-fired slots at <= 0, so validity is 'ts > 0' - a fixed
+        # property of the decoding, not a tunable threshold. Do NOT use
         # photon_counts here — in ORT those bits are the low bits of the
         # coarse timestamp, not a real count (see 'unpack').
-        extract = lambda ts, pc: (ts > valid_min).sum(axis=2)  # noqa: E731
+        extract = lambda ts, pc: (ts > 0).sum(axis=2)  # noqa: E731
     else:  # count
         extract = lambda ts, pc: pc.sum(axis=2)  # noqa: E731
 
@@ -119,12 +120,10 @@ def _accumulate_hitmap(
 
 def compute_hitmap(
     folder: str,
+    nframes: int,
     mode: str = "timestamp",
     tag: str = "ORT",
-    nframes: int | None = None,
     max_files: int | None = None,
-    *,
-    valid_min: float = 0.0,
 ) -> np.ndarray:
     """Unpack the binary data and compute the (32, 32) hitmap.
 
@@ -134,6 +133,8 @@ def compute_hitmap(
     ----------
     folder : str
         Path to the folder with the '.bin' data files.
+    nframes : int
+        Number of frames stored in each '.bin' file.
     mode : str, optional
         ``'timestamp'`` for the ORT occupancy hitmap (per pixel, the number
         of frames with a valid first-photon timestamp), or ``'count'`` for
@@ -143,16 +144,10 @@ def compute_hitmap(
         Filename fragment selecting the files (e.g. ``'ORT'``, ``'ORC'``,
         or a SPAD quadrant tag ``'S0C'``). Use ``''`` to match every
         '.bin' file in the folder. The default is ``'ORT'``.
-    nframes : int | None, optional
-        Number of frames per file. When None (the default) it is derived
-        from each file's size.
     max_files : int | None, optional
         Process at most this many files (after natural sorting). Useful
         for a quick preview over a large batch. The default is None (all
         files).
-    valid_min : float, optional
-        Timestamp-validity threshold for ``mode='timestamp'`` (see
-        '_accumulate_hitmap'). The default is 0.0.
 
     Returns
     -------
@@ -163,13 +158,13 @@ def compute_hitmap(
     if max_files is not None:
         files = files[:max_files]
     return _accumulate_hitmap(
-        files, mode, valid_min=valid_min, nframes=nframes, label=tag or mode
+        files, mode, nframes=nframes, label=tag or mode
     )
 
 
 def compute_hitmap_64(
     folder: str,
-    nframes: int | None = None,
+    nframes: int,
     max_files: int | None = None,
 ) -> np.ndarray:
     """Unpack the four S*C tags and assemble the (64, 64) count hitmap.
@@ -182,9 +177,8 @@ def compute_hitmap_64(
     ----------
     folder : str
         Path to the folder with the S*C '.bin' data files.
-    nframes : int | None, optional
-        Number of frames per file. When None (the default) it is derived
-        from each file's size.
+    nframes : int
+        Number of frames stored in each '.bin' file.
     max_files : int | None, optional
         Process at most this many files per tag. The default is None.
 
@@ -279,129 +273,111 @@ def plot_hitmap(
 
 
 def _acquisition_meta(
-    folder: str,
     files: list[str],
     mode: str,
     tag: str,
-    nframes: int | None,
+    nframes: int,
     firmware_version: str,
-    acq_window: float | None,
     exp_time: float | None,
+    exposure_window: float | None,
 ) -> dict:
     """Build the acquisition metadata saved alongside a hitmap.
 
-    Records what is needed to turn counts into a rate later: the frame count
-    and the *live* time per frame, resolved per ``firmware_version`` via
-    'dcr_analysis.resolve_live_time' (``'short_window'`` → the user-set
-    ``acq_window`` is live; ``'full_window'`` → the whole frame is live).
-    The physical rate is ``counts / active_time_s``.
+    Records what is needed to turn counts into a photon rate later: the frame
+    count, the cycle length resolved from the firmware, and their product - the
+    wall-clock duration the rate divides by. Nothing here is read back off the
+    '.bin' files, so a saved hitmap stays reduceable to a rate without them.
 
     Parameters
     ----------
-    folder : str
-        Data folder (used by ``'full_window'`` for ``frame_rate_cnt.txt``).
     files : list[str]
         The '.bin' files that were accumulated.
     mode : str
         ``'timestamp'`` or ``'count'``.
     tag : str
         The tag used to select the files.
-    nframes : int | None
-        Frames per file, or None to derive from the first file.
+    nframes : int
+        Frames per file, as the acquisition was set.
     firmware_version : str
-        ``'short_window'`` or ``'full_window'``.
-    acq_window : float | None
-        Photon-sensitive window per frame, in seconds (``'short_window'``).
+        ``'short_exposure'`` or ``'long_exposure'``; see
+        'core.timing.resolve_cycle_time'.
     exp_time : float | None
-        Legacy exposure time, in seconds (``'full_window'``).
+        The exposure X requested of long-exposure firmware, in seconds.
+    exposure_window : float | None
+        Photon-sensitive exposure inside one short-exposure cycle, in seconds.
+        Recorded only - the rate is per wall-clock second and does not use it.
 
     Returns
     -------
     dict
-        The metadata dictionary. ``active_time_s`` is None when the live
-        time could not be resolved (short_window without ``acq_window``).
+        The metadata dictionary.
     """
-    nfr = nframes if nframes is not None else io.frames_in_file(files[0])
-    total_frames = int(nfr) * len(files)
-    frame_live_s, live_source = timing.resolve_live_time(
-        folder,
-        firmware_version,
-        nfr,
-        acq_window=acq_window,
-        exp_time=exp_time,
-    )
-    # Wall-clock frame period (the ~9 µs repetition), independent of the live
-    # window. 'timestamp' mode records at most one firing per frame, so its
-    # rate ceiling is 1 / frame_period; 'count' mode uses the live window.
-    frame_period_s, period_source = timing.resolve_frame_time(folder, exp_time, nfr)
+    nfr = int(nframes)
+    total_frames = nfr * len(files)
+    cycle_s, cycle_source = timing.resolve_cycle_time(firmware_version, exp_time)
     return {
         "mode": mode,
         "tag": tag,
         "n_files": len(files),
-        "nframes": int(nfr),
+        "nframes": nfr,
         "total_frames": total_frames,
         "firmware_version": firmware_version,
-        "acq_window_s": acq_window,
         "exp_time_s": exp_time,
-        "frame_live_s": frame_live_s,
-        "active_time_s": (
-            total_frames * frame_live_s if frame_live_s is not None else None
-        ),
-        "live_time_source": live_source,
-        "frame_period_s": frame_period_s,
-        "wallclock_time_s": total_frames * frame_period_s,
-        "frame_period_source": period_source,
+        "frame_cycle_s": cycle_s,
+        "cycle_source": cycle_source,
+        "wallclock_time_s": total_frames * cycle_s,
+        "exposure_window_s": exposure_window,
     }
 
 
 def compute_and_save_hitmap(
     path: str,
+    nframes: int,
     mode: str = "timestamp",
     tag: str = "ORT",
     *,
-    valid_min: float = 0.0,
-    firmware_version: str = "short_window",
-    acq_window: float | None = None,
+    firmware_version: str = "short_exposure",
     exp_time: float | None = None,
-    nframes: int | None = None,
+    exposure_window: float | None = None,
     max_files: int | None = None,
 ) -> str:
     """Unpack the '.bin' files and save the (32, 32) hitmap to '.npy'.
 
     Unpacks once and saves ``processed/<name>_<tag>_hitmap.npy`` plus a
-    ``.meta.json`` sidecar recording the frame count and acquisition window,
-    so 'collect_and_plot_hitmap' can later render a rate map without
-    re-unpacking.
+    ``.meta.json`` sidecar recording the frame count and the wall-clock
+    duration, so 'collect_and_plot_hitmap' can later render the photon-rate
+    map without re-unpacking.
 
     Parameters
     ----------
     path : str
         Path to the folder with the '.bin' data files.
+    nframes : int
+        Number of frames the acquisition was set to record per '.bin' file.
+        Also recorded in the sidecar: the photon rate is
+        ``hits / (nframes * n_files * cycle)``, so this is what sets the
+        denominator. Do not infer it from the file size - the exe dumps a
+        fixed, larger DDR3 region, so the file is bigger than the acquisition.
     mode : str, optional
         ``'timestamp'`` (ORT occupancy) or ``'count'`` (S*C / ORC photon
         counts). See 'compute_hitmap'. The default is ``'timestamp'``.
     tag : str, optional
         Filename fragment selecting the files. The default is ``'ORT'``.
-    valid_min : float, optional
-        Timestamp-validity threshold for ``mode='timestamp'``. The default
-        is 0.0.
     firmware_version : str, optional
-        ``'short_window'`` (default) or ``'full_window'``; sets how the live
-        time per frame is resolved for the rate map (see
-        'dcr_analysis.resolve_live_time').
-    acq_window : float | None, optional
-        Photon-sensitive window per frame, in seconds (e.g. ``200e-9``),
-        used when ``firmware_version='short_window'``. Under that firmware
-        each ~9 µs frame is mostly readout and only this window is live, so
-        the photon rate is ``counts / (total_frames * acq_window)``. Stored
-        in the sidecar for the rate map; None (default) means no rate unless
-        supplied later at plot time.
+        Which firmware took the data, i.e. what one acquisition cycle is:
+        ``'short_exposure'`` (the default) means a fixed 9 µs cycle;
+        ``'long_exposure'`` means the requested ``exp_time`` plus 9 µs. See
+        'core.timing.resolve_cycle_time'.
     exp_time : float | None, optional
-        Legacy exposure time, in seconds, used when
-        ``firmware_version='full_window'``. The default is None.
-    nframes : int | None, optional
-        Number of frames per file. When None (the default) it is derived
-        from each file's size.
+        The exposure X requested of long-exposure firmware, in seconds; the
+        firmware adds 9 µs to it. Required for
+        ``firmware_version='long_exposure'``, ignored otherwise. The default
+        is None.
+    exposure_window : float | None, optional
+        Photon-sensitive exposure inside one short-exposure cycle, in seconds
+        (50-500 ns, typically ``100e-9``). Recorded in the sidecar and reported
+        as a duty cycle; the rate itself is per wall-clock second and does not
+        use it. The default is None.
     max_files : int | None, optional
         Process at most this many files. The default is None (all files).
 
@@ -414,9 +390,7 @@ def compute_and_save_hitmap(
         f"\n> > > Computing hitmap (mode='{mode}', tag='{tag or 'all'}') "
         "and saving the array < < <\n"
     )
-    hitmap = compute_hitmap(
-        path, mode, tag, nframes, max_files, valid_min=valid_min
-    )
+    hitmap = compute_hitmap(path, nframes, mode, tag, max_files)
     print(
         f"  {mode} hitmap: total {hitmap.sum():.0f} hits  "
         f"median {np.median(hitmap):.0f}  max {hitmap.max():.0f}"
@@ -426,14 +400,7 @@ def compute_and_save_hitmap(
     if max_files is not None:
         files = files[:max_files]
     meta = _acquisition_meta(
-        path,
-        files,
-        mode,
-        tag,
-        nframes,
-        firmware_version,
-        acq_window,
-        exp_time,
+        files, mode, tag, nframes, firmware_version, exp_time, exposure_window
     )
     out_path = store.save_map(
         hitmap, path, kind=_KIND, tag=(tag or mode), meta=meta, quiet=True
@@ -444,11 +411,11 @@ def compute_and_save_hitmap(
 
 def compute_and_save_hitmap_64(
     path: str,
+    nframes: int,
     *,
-    firmware_version: str = "short_window",
-    acq_window: float | None = None,
+    firmware_version: str = "short_exposure",
     exp_time: float | None = None,
-    nframes: int | None = None,
+    exposure_window: float | None = None,
     max_files: int | None = None,
 ) -> str:
     """Assemble and save the (64, 64) full-sensor count hitmap to '.npy'.
@@ -463,18 +430,17 @@ def compute_and_save_hitmap_64(
     ----------
     path : str
         Path to the folder with the S*C '.bin' data files.
+    nframes : int
+        Number of frames the acquisition was set to record per '.bin' file.
     firmware_version : str, optional
-        ``'short_window'`` (default) or ``'full_window'``; see
-        'compute_and_save_hitmap'.
-    acq_window : float | None, optional
-        Photon-sensitive window per frame, in seconds (e.g. ``200e-9``),
-        for ``firmware_version='short_window'``. The default is None.
+        ``'short_exposure'`` (default, 9 µs cycle) or ``'long_exposure'``
+        (``exp_time`` + 9 µs); see 'compute_and_save_hitmap'.
     exp_time : float | None, optional
-        Legacy exposure time, in seconds, for
-        ``firmware_version='full_window'``. The default is None.
-    nframes : int | None, optional
-        Number of frames per file. When None (the default) it is derived
-        from each file's size.
+        The exposure X requested of long-exposure firmware, in seconds. The
+        default is None.
+    exposure_window : float | None, optional
+        Photon-sensitive exposure inside one short-exposure cycle, in seconds.
+        Recorded only; see 'compute_and_save_hitmap'. The default is None.
     max_files : int | None, optional
         Process at most this many files per tag. The default is None.
 
@@ -499,14 +465,13 @@ def compute_and_save_hitmap_64(
     if max_files is not None:
         tag_files = tag_files[:max_files]
     meta = _acquisition_meta(
-        path,
         tag_files,
         "count",
         "64",
         nframes,
         firmware_version,
-        acq_window,
         exp_time,
+        exposure_window,
     )
     out_path = store.save_map(
         hitmap, path, kind=_KIND, tag="64", meta=meta, quiet=True
@@ -515,77 +480,29 @@ def compute_and_save_hitmap_64(
     return out_path
 
 
-def _rate_active_time(
-    mode: str,
-    meta: dict,
-    path: str | None,
-    tag: str,
-    acq_window: float | None,
-) -> tuple[float | None, str]:
-    """Return (total active time in seconds, source) for the rate map.
+def _wallclock_seconds(meta: dict) -> tuple[float | None, float]:
+    """Return the acquisition's ``(wall-clock seconds, cycle length)``.
 
-    The normalisation differs by mode (see 'collect_and_plot_hitmap'):
+    ``total_frames * cycle``: every frame is one acquisition cycle - 9 µs under
+    short-exposure firmware, ``exp_time + 9 µs`` under long - so this is the
+    elapsed time of the run and the denominator of the photon rate. Both
+    factors are read from the sidecar, the ``nframes`` and firmware the stage-1
+    call was given, and neither is re-derived from the '.bin' files: their size
+    is a fixed DDR3 dump larger than the acquisition, and the
+    ``frame_rate_cnt.txt`` beside them is written by an exe we do not control,
+    so nothing here depends on it (see 'core.timing.resolve_cycle_time' for
+    what it does contain, and for the measured-vs-nominal cycle gap).
 
-    * ``'count'`` — divide by the live window: ``total_frames * live``, where
-      ``live`` is ``acq_window`` (given here or from the sidecar) or, for
-      full-window firmware, the resolved per-frame live time.
-    * ``'timestamp'`` — divide by the wall-clock frame period:
-      ``total_frames * frame_period`` (one firing per frame; ceiling
-      ``1 / frame_period``).
-
-    Missing values are recovered from the '.bin' files in ``path`` (sizes for
-    the frame count; ``frame_rate_cnt.txt`` / 9 µs for the period) so old
-    '.npy' saved before the sidecar existed still get a rate.
-
-    Parameters
-    ----------
-    mode : str
-        ``'timestamp'`` or ``'count'`` (the effective mode from the sidecar).
-    meta : dict
-        The sidecar metadata (possibly empty).
-    path : str | None
-        Data folder, used to recover missing values from the '.bin' files.
-    tag : str
-        Tag selecting the '.bin' files, for the recovery.
-    acq_window : float | None
-        Live window per frame (s), overriding the sidecar's; ``'count'`` mode.
-
-    Returns
-    -------
-    tuple[float | None, str]
-        The total active time in seconds (None if it cannot be determined)
-        and a human-readable source string.
+    A '.npy' whose sidecar has no frame count (saved before the sidecar existed)
+    gets no rate map rather than one normalised by a guess. A sidecar with a
+    frame count but no cycle predates the two firmware versions being recorded,
+    and falls back to the 9 µs short-exposure cycle.
     """
+    cycle = float(meta.get("frame_cycle_s") or _DEFAULT_CYCLE_S)
     total_frames = meta.get("total_frames")
-    nfr = meta.get("nframes")
-    if (not total_frames or not nfr) and path is not None:
-        try:
-            bins = io.find_bin_files(path, tag)
-            nfr = io.frames_in_file(bins[0])
-            total_frames = sum(io.frames_in_file(f) for f in bins)
-        except (FileNotFoundError, ValueError):
-            pass
     if not total_frames:
-        return None, "no frame count"
-
-    if mode == "count":
-        per_frame = acq_window
-        if per_frame is None:
-            per_frame = meta.get("acq_window_s") or meta.get("frame_live_s")
-        if per_frame is None:
-            return None, "no live window"
-        return (
-            total_frames * per_frame,
-            f"count / {per_frame * 1e9:.1f} ns live",
-        )
-
-    # timestamp: one firing per frame period (wall clock)
-    period = meta.get("frame_period_s")
-    if period is None and path is not None and nfr:
-        period, _ = timing.resolve_frame_time(path, None, int(nfr))
-    if period is None:
-        return None, "no frame period"
-    return total_frames * period, f"timestamp / {period * 1e6:.3f} µs frame"
+        return None, cycle
+    return float(total_frames) * cycle, cycle
 
 
 def collect_and_plot_hitmap(
@@ -596,17 +513,15 @@ def collect_and_plot_hitmap(
     npy_path: str | None = None,
     cmap: str | None = None,
     rate: bool = True,
-    acq_window: float | None = None,
 ) -> np.ndarray:
     """Load a saved hitmap '.npy' and save its hitmap plot(s).
 
-    Reads the saved array - no re-unpacking - and writes the counts hitmap
-    to ``results/hitmap``, plus a **second** figure in rate units when the
-    active time is known: cps (``count``) or Hz (``timestamp``).
-
-    The two modes normalise differently (live window vs frame period); the
-    derivation is in ``docs/guide/hitmap.md``. Timing comes from the
-    '.meta.json' sidecar, with ``acq_window`` overriding it if given.
+    Reads the saved array - no re-unpacking - and writes two figures to
+    ``results/hitmap``: the counts/occupancy map and the **photon-rate** map,
+    ``hits / (nframes * n_files * 9 us)`` in Hz. Both modes normalise the same
+    way, by the wall-clock duration of the acquisition; the derivation is in
+    ``docs/guide/hitmap.md``. The frame count comes from the '.meta.json'
+    sidecar written at stage 1.
 
     Locate the '.npy' from ``path`` or directly via ``npy_path``, which
     ignores ``path``.
@@ -630,11 +545,7 @@ def collect_and_plot_hitmap(
         Matplotlib colormap name for the hitmaps. The default is None —
         use the active style's ``image.cmap``.
     rate : bool, optional
-        Also save the rate hitmap when the active time is known. The
-        default is True.
-    acq_window : float | None, optional
-        Active acquisition window per frame, in seconds; overrides the
-        sidecar value. The default is None (use the sidecar's, if any).
+        Also save the photon-rate hitmap. The default is True.
 
     Returns
     -------
@@ -682,39 +593,48 @@ def collect_and_plot_hitmap(
     store.save_figure(fig_counts, results_dir, f"{base}.png")
     plt.close(fig_counts)
 
-    # 2) rate map. The normalisation depends on the mode:
-    #      * 'count'     — photons accumulate within the live window, so the
-    #        rate is counts / (total_frames * live_window): counts/s (cps).
-    #      * 'timestamp' — at most one firing per frame, so the honest rate is
-    #        occupancy / frame_period = counts / (total_frames * frame_period):
-    #        firing rate in Hz, ceiling 1 / frame_period (~9 µs → ~111 kHz).
-    #    Dividing occupancy by the (short) live window would overstate it by
-    #    frame_period / live_window (e.g. 45x for 9 µs / 200 ns).
+    # 2) photon-rate map: hits / wall-clock seconds, i.e.
+    #    hits / (nframes * n_files * cycle). Every frame is one acquisition
+    #    cycle, so that product is the elapsed time of the run and this is
+    #    photons per second of experiment, for both modes.
+    #
+    #    In 'timestamp' mode only the *first* photon of a cycle is timestamped,
+    #    so the map saturates at one firing per cycle - 111 kHz at a 9 µs cycle
+    #    - and under-reports as it approaches that. The exposure window inside
+    #    the cycle (50-500 ns, short-exposure firmware) is reported as a duty
+    #    cycle when it is on record: dividing by it instead would give the rate
+    #    *during* the exposure, which is this figure times cycle / exposure
+    #    (90x for 9 µs / 100 ns).
     if rate:
-        active_time, rate_source = _rate_active_time(
-            mode_eff, meta, path, tag, acq_window
-        )
-        if active_time:
-            rate_map = hitmap / active_time
-            rate_clabel = "cps" if mode_eff == "count" else "Hz"
+        wallclock, cycle_s = _wallclock_seconds(meta)
+        if wallclock:
+            rate_map = hitmap / wallclock
+            exposure = meta.get("exposure_window_s")
+            duty = (
+                f"  exposure {exposure * 1e9:.0f} ns/cycle "
+                f"(x{cycle_s / exposure:.0f} for the in-exposure rate)"
+                if exposure
+                else ""
+            )
             print(
-                f"  rate ({rate_source}): active time {active_time * 1e3:.3f} "
-                f"ms  median {np.median(rate_map):.3g}  "
-                f"max {rate_map.max():.3g} {rate_clabel}"
+                f"  photon rate: {meta.get('total_frames')} frames x "
+                f"{cycle_s * 1e6:.3f} µs = {wallclock * 1e3:.3f} ms "
+                f"wall clock  median {np.median(rate_map):.3g}  "
+                f"max {rate_map.max():.3g} Hz{duty}"
             )
             fig_rate = plot_hitmap(
                 rate_map,
                 cmap=cmap,
-                clabel=rate_clabel,
+                clabel="Hz",
                 name="Photon rate",
                 show_total=False,
             )
             store.save_figure(fig_rate, results_dir, f"{base}_rate.png")
-            # plt.close(fig_rate)
+            # plt.close(fig_rate)  # left open on purpose, for interactive use
         else:
             print(
-                f"  (no rate map — {rate_source}; pass acq_window=<seconds> "
-                "for count mode, or recompute so .meta.json stores the times)"
+                "  (no rate map — the sidecar has no frame count; recompute "
+                "with compute_and_save_hitmap(..., nframes=<frames>))"
             )
 
     return hitmap

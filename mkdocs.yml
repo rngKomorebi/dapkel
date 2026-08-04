@@ -85,8 +85,10 @@ nav:
       - Hitmaps: guide/hitmap.md
       - TDC calibration: guide/tdc_calibration.md
       - Coincidences: guide/coincidences.md
+      - Background subtraction: guide/background_subtraction.md
   - Reference:
       - dapkel.core: api/core.md
       - Adding an analysis: adding_an_analysis.md
       - Triangular delta-t background: ort_triangle_background.md
       - Changelog: changelog.md
+      - Open items: todo.md

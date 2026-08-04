@@ -536,3 +536,237 @@ def test_plot_driver_returns_counts_centres_and_a_fit(bin_folder):
         f"{os.path.basename(bin_folder)}_test_delta_counts.png",
     )
     assert os.path.isfile(png), "the figure must land in results/"
+
+
+# --------------------------------------------------------------------------
+# subtract_background: the lag planes
+# --------------------------------------------------------------------------
+
+
+def test_without_subtraction_nothing_about_the_artifact_changes(bin_folder):
+    """The default path must write the same 2D array and the same sidecar.
+
+    'subtract_background' is a superset, and a parameter that quietly changed
+    the shape or the resume signature of every existing artifact would not be
+    one.
+    """
+    _counts_run(bin_folder)
+    counts = np.load(_counts_path(bin_folder))
+    meta = store.read_meta(_counts_path(bin_folder))
+
+    assert counts.shape == (len(LABELS), meta["n_bins"])
+    assert "lags" not in meta
+    assert "lags" not in meta["signature"]
+    assert "frames_used" not in meta
+
+
+def test_lag_zero_plane_is_the_unsubtracted_histogram(tmp_path):
+    """Plane 0 must be bin-for-bin the array a plain run writes.
+
+    This is what lets one artifact answer both questions, and what makes
+    'subtract_background' safe to switch on: the ordinary measurement is still
+    in there, untouched.
+    """
+    rng = np.random.default_rng(20260803)
+    plain, lagged = tmp_path / "plain", tmp_path / "lagged"
+    for folder in (plain, lagged):
+        folder.mkdir()
+    data = [rng.bytes(io.BYTES_PER_FRAME * NFRAMES) for _ in range(4)]
+    for folder in (plain, lagged):
+        for i, blob in enumerate(data):
+            (folder / f"ORT_{i}.bin").write_bytes(blob)
+
+    _counts_run(str(plain), support_ps=WIDE_PS)
+    _counts_run(
+        str(lagged),
+        support_ps=WIDE_PS,
+        subtract_background=True,
+        background_lags=(1, 2, 3),
+    )
+
+    flat = np.load(_counts_path(str(plain)))
+    lags = np.load(_counts_path(str(lagged)))
+
+    assert lags.shape == (4, *flat.shape)
+    np.testing.assert_array_equal(lags[0], flat)
+
+
+def test_frames_used_is_recorded_per_lag(bin_folder):
+    """A lag of k loses the last k frames of every file, and says so."""
+    _counts_run(
+        bin_folder, support_ps=WIDE_PS, subtract_background=True,
+        background_lags=(1, 4),
+    )
+    meta = store.read_meta(_counts_path(bin_folder))
+
+    assert meta["lags"] == [0, 1, 4]
+    assert meta["frames_used"] == [6 * NFRAMES, 6 * (NFRAMES - 1), 6 * (NFRAMES - 4)]
+
+
+@pytest.mark.parametrize(
+    ("lags", "match"),
+    [((0, 1), "background_lags"), ((1, 1), "duplicates"), ((), "empty")],
+)
+def test_bad_background_lags_are_rejected(bin_folder, lags, match):
+    with pytest.raises(ValueError, match=match):
+        _counts_run(bin_folder, subtract_background=True, background_lags=lags)
+
+
+def test_a_bare_int_is_taken_as_one_lag(bin_folder):
+    _counts_run(
+        bin_folder, support_ps=WIDE_PS, subtract_background=True,
+        background_lags=1,
+    )
+    assert store.read_meta(_counts_path(bin_folder))["lags"] == [0, 1]
+
+
+def test_load_keeps_the_lag_axis_and_pools_pairs_under_it(bin_folder):
+    _counts_run(
+        bin_folder, support_ps=WIDE_PS, subtract_background=True,
+        background_lags=(1, 2),
+    )
+    pooled, centres, info = dt.load_delta_counts(bin_folder)
+    per_pair, _, _ = dt.load_delta_counts(bin_folder, pool=False)
+    one_pair, _, _ = dt.load_delta_counts(bin_folder, pairs=[LABELS[0]])
+
+    assert pooled.shape == (3, centres.size)
+    assert per_pair.shape == (3, len(LABELS), centres.size)
+    assert one_pair.shape == (3, centres.size)
+    np.testing.assert_array_equal(pooled, per_pair.sum(axis=1))
+    np.testing.assert_array_equal(one_pair, per_pair[:, 0])
+    assert info["lags"] == [0, 1, 2]
+
+
+def test_subtracting_needs_an_artifact_with_lag_planes(bin_folder):
+    """Asking for it on a plain artifact must say what to do about it."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+
+    _counts_run(bin_folder, support_ps=WIDE_PS)
+    with pytest.raises(ValueError, match="lag planes"):
+        dt.collect_and_plot_delta_counts(
+            bin_folder, subtract_background=True, label="test"
+        )
+
+
+def test_subtracting_refuses_a_triangle_background(bin_folder):
+    """There is no triangle left to fit once it has been subtracted away."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+
+    _counts_run(
+        bin_folder, support_ps=WIDE_PS, subtract_background=True,
+        background_lags=(1, 2),
+    )
+    with pytest.raises(ValueError, match="no triangle left"):
+        dt.collect_and_plot_delta_counts(
+            bin_folder,
+            subtract_background=True,
+            background="triangle",
+            label="test",
+        )
+
+
+def test_the_subtracted_driver_returns_the_residual_and_writes_both_figures(
+    bin_folder,
+):
+    """The residual is what gets fitted, and the diagnostic lands beside it."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+
+    _counts_run(
+        bin_folder, support_ps=WIDE_PS, subtract_background=True,
+        background_lags=(1, 2, 3),
+    )
+    counts, centres, fit = dt.collect_and_plot_delta_counts(
+        bin_folder,
+        bin_width_ps=4 * dt._TS_CODE_PS,
+        plot_window_ps=200 * dt._TS_CODE_PS,
+        subtract_background=True,
+        peak_window_ps=10 * dt._TS_CODE_PS,
+        label="test",
+    )
+
+    assert counts.shape == centres.shape
+    # The residual is a difference of histograms, so it is signed - the plain
+    # path's "counts are non-negative" does not hold here.
+    assert counts.dtype.kind == "f"
+    np.testing.assert_allclose(
+        counts, fit["subtraction"]["residual"], rtol=0, atol=0
+    )
+    assert fit["n"] == int(round(fit["model_free"]["n"]))
+
+    results = store.results_dir(bin_folder, "coincidences", create=False)
+    name = os.path.basename(bin_folder)
+    assert os.path.isfile(
+        os.path.join(results, f"{name}_test_delta_counts_sub.png")
+    ), "the fit figure must be named apart from the unsubtracted one"
+    assert os.path.isfile(
+        os.path.join(results, f"{name}_test_background_subtraction.png")
+    ), "the three-panel diagnostic must land in results/ too"
+    assert fit["subtraction_png"].endswith("_background_subtraction.png")
+
+
+def test_both_stage_one_paths_give_the_same_subtracted_residual(bin_folder):
+    """The feather and the counts path must agree bin-for-bin after subtraction.
+
+    They agree on the raw histogram already
+    ('test_counts_path_reproduces_the_feather_histogram_exactly'), so this pins
+    the *subtraction* on top of it: the same lags, the same frame-count
+    rescaling, the same bins, and - the fiddly part - the zoom window landing on
+    the same lattice whether it came from slicing a support-wide histogram or
+    from rebinning a native grid.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+
+    # An odd number of cells per bin, so the counts-path rebin is exact.
+    width = 3 * dt._TS_CODE_PS
+    kwargs = {
+        "subtract_background": True,
+        "background_lags": (1, 2, 3),
+    }
+    feather = dt.calculate_and_save_timestamp_differences(
+        bin_folder,
+        PIXELS,
+        tag="ORT",
+        apply_TDC_calibration=False,
+        nframes=NFRAMES,
+        **kwargs,
+    )
+    counts_npy = _counts_run(bin_folder, support_ps=WIDE_PS, **kwargs)
+
+    _, _, from_feather = dt.collect_and_plot_timestamp_differences(
+        feather_path=feather,
+        bin_width_ps=width,
+        plot_window_ps=20 * width,
+        support_ps=WIDE_PS,
+        peak_window_ps=2 * width,
+        subtract_background=True,
+        label="feather",
+    )
+    _, _, from_counts = dt.collect_and_plot_delta_counts(
+        counts_path=counts_npy,
+        bin_width_ps=width,
+        plot_window_ps=20 * width,
+        peak_window_ps=2 * width,
+        subtract_background=True,
+        snap_to_grid=False,
+        label="counts",
+    )
+
+    np.testing.assert_allclose(
+        from_feather["subtraction"]["centers"],
+        from_counts["subtraction"]["centers"],
+    )
+    np.testing.assert_array_equal(
+        from_feather["subtraction"]["residual"],
+        from_counts["subtraction"]["residual"],
+    )
+    assert (
+        from_feather["model_free"]["n"] == from_counts["model_free"]["n"]
+    ), "the model-free coincidence count must not depend on the stage-1 path"

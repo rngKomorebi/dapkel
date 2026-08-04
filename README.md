@@ -74,10 +74,15 @@ from dapkel.functions import data_quality, dcr_analysis
 
 # 0. Did the TDC actually record timing? Codes should spread over 0..~1300,
 #    not collapse onto a handful of values.
-data_quality.plot_time_code_histogram("path/to/data", pixel=(16, 16))
+data_quality.plot_time_code_histogram(
+    "path/to/data", pixel=(16, 16), nframes=10_000
+)
 
-# 1 + 2. Compute the full-sensor DCR map and save both figures.
-dcr_analysis.collect_and_plot_dcr_64("path/to/data", nframes=1000, acq_window=1000)
+# 1 + 2. Compute the full-sensor DCR map and save both figures. 'acq_window' is
+#    the photon-sensitive part of each frame, in SECONDS.
+dcr_analysis.collect_and_plot_dcr_64(
+    "path/to/data", nframes=1000, acq_window=100e-9
+)
 ```
 
 Stages 1 and 2 are also separable, so a saved map can be re-plotted without
@@ -87,7 +92,7 @@ re-reading the raw files:
 from dapkel.core import store
 from dapkel.functions import dcr_analysis
 
-dcr_analysis.compute_and_save_dcr_64("path/to/data", 1000, acq_window=1000)
+dcr_analysis.compute_and_save_dcr_64("path/to/data", 1000, acq_window=100e-9)
 
 dcr, meta = store.load_map("path/to/data", kind="dcr", tag="64")
 fig = dcr_analysis.plot_heatmap(dcr)
@@ -112,6 +117,7 @@ surface in `__all__` - read that list to see what you can call.
 | [`hitmap_analysis`](https://rngkomorebi.github.io/dapkel/guide/hitmap/) | occupancy and photon rate |
 | [`tdc_calibration`](https://rngkomorebi.github.io/dapkel/guide/tdc_calibration/) | per-pixel TDC LUTs from the code density test |
 | [`calc_diff`, `delta_t`](https://rngkomorebi.github.io/dapkel/guide/coincidences/) | timestamp differences, coincidences and jitter |
+| [`background_subtraction`](https://rngkomorebi.github.io/dapkel/guide/background_subtraction/) | removes the accidental background by shifting frames |
 
 Anything shared between two analyses lives in
 [`dapkel.core`](https://rngkomorebi.github.io/dapkel/api/core/) rather than
@@ -187,7 +193,10 @@ themselves cannot be reused, so a release that *does* upload is final.
 ### Contributing
 
 `main` is the release branch: tested, and what PyPI is cut from. Work on a
-feature branch and open a pull request against it. Contributions are welcome;
+feature branch and open a pull request against it.
+[`TODO.md`](TODO.md) is the list of open questions — what is known to need
+deciding and what would settle it. Start there if you are looking for
+something to pick up, and add to it rather than leaving a decision undocumented. Contributions are welcome;
 please follow [PEP 8](https://peps.python.org/pep-0008/) and
 [PEP 257](https://peps.python.org/pep-0257/). If you are adding a new
 measurement, start from

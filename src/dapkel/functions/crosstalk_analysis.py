@@ -167,13 +167,17 @@ def _direction_of_pair(pair: str) -> tuple[str, tuple[int, int]] | None:
     return _DIRECTIONS.get(others[0])
 
 
-def _accumulate_counts(files: list[str], *, label: str = "") -> np.ndarray:
+def _accumulate_counts(
+    files: list[str], *, nframes: int, label: str = ""
+) -> np.ndarray:
     """Unpack a list of '.bin' files and sum the (32, 32) photon counts.
 
     Parameters
     ----------
     files : list[str]
         Paths to the '.bin' files to unpack and accumulate.
+    nframes : int
+        Number of frames stored in each '.bin' file.
     label : str, optional
         Label used in the progress printout. The default is "".
 
@@ -185,6 +189,7 @@ def _accumulate_counts(files: list[str], *, label: str = "") -> np.ndarray:
     return reduce.accumulate_frames(
         files,
         lambda ts, pc: pc.sum(axis=2),
+        nframes=nframes,
         need_time_series=False,
         label=label,
     )
@@ -192,6 +197,7 @@ def _accumulate_counts(files: list[str], *, label: str = "") -> np.ndarray:
 
 def compute_crosstalk(
     folder: str,
+    nframes: int,
     file_prefix: str = _DEFAULT_PREFIX,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
     """Unpack the coinc/OR data and compute the (32, 32) cross-talk map.
@@ -203,6 +209,8 @@ def compute_crosstalk(
     ----------
     folder : str
         Path to the folder with the coinc/OR '.bin' data files.
+    nframes : int
+        Number of frames stored in each '.bin' file.
     file_prefix : str, optional
         Filename prefix selecting the measurement batch. The default is
         ``'CT_'`` (the main 100-file batch), which excludes the smaller
@@ -224,8 +232,12 @@ def compute_crosstalk(
     coinc_files = _ct_files(folder, "coinc", file_prefix)
     or_files = _ct_files(folder, "OR", file_prefix)
 
-    coinc_sum = _accumulate_counts(coinc_files, label=f"{pair or 'CT'} coinc")
-    or_sum = _accumulate_counts(or_files, label=f"{pair or 'CT'} OR")
+    coinc_sum = _accumulate_counts(
+        coinc_files, nframes=nframes, label=f"{pair or 'CT'} coinc"
+    )
+    or_sum = _accumulate_counts(
+        or_files, nframes=nframes, label=f"{pair or 'CT'} OR"
+    )
 
     # OR = union >= coinc = intersection, so the ratio is in [0, 1].
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -299,7 +311,7 @@ def plot_ct_distribution(ct_map: np.ndarray, pair: str = "") -> plt.Figure:
 
 
 def compute_and_save_crosstalk(
-    path: str, file_prefix: str = _DEFAULT_PREFIX
+    path: str, nframes: int, file_prefix: str = _DEFAULT_PREFIX
 ) -> str:
     """Compute the (32, 32) cross-talk map and save it under ``processed/``.
 
@@ -312,6 +324,8 @@ def compute_and_save_crosstalk(
     ----------
     path : str
         Path to the folder with the coinc/OR '.bin' data files.
+    nframes : int
+        Number of frames stored in each '.bin' file.
     file_prefix : str, optional
         Filename prefix selecting the measurement batch. The default is
         ``'CT_'``.
@@ -321,7 +335,9 @@ def compute_and_save_crosstalk(
     str
         Path to the saved '.npy'.
     """
-    ct_map, coinc_sum, or_sum, pair = compute_crosstalk(path, file_prefix)
+    ct_map, coinc_sum, or_sum, pair = compute_crosstalk(
+        path, nframes, file_prefix
+    )
     return store.save_map(
         ct_map,
         path,
@@ -340,6 +356,7 @@ def compute_and_save_crosstalk(
 
 def collect_and_plot_crosstalk(
     path: str,
+    nframes: int,
     file_prefix: str = _DEFAULT_PREFIX,
     cmap: str | None = None,
     *,
@@ -354,6 +371,9 @@ def collect_and_plot_crosstalk(
     ----------
     path : str
         Path to the folder with the coinc/OR '.bin' data files.
+    nframes : int
+        Number of frames stored in each '.bin' file. Ignored when
+        ``from_saved=True`` - nothing is unpacked then.
     file_prefix : str, optional
         Filename prefix selecting the measurement batch. The default is
         ``'CT_'``.
@@ -375,7 +395,9 @@ def collect_and_plot_crosstalk(
         pair = _detect_pair(path, file_prefix)
         ct_map, _ = store.load_map(path, kind=_KIND, tag=pair)
     else:
-        ct_map, coinc_sum, or_sum, pair = compute_crosstalk(path, file_prefix)
+        ct_map, coinc_sum, or_sum, pair = compute_crosstalk(
+            path, nframes, file_prefix
+        )
         store.save_map(
             ct_map,
             path,
@@ -502,6 +524,7 @@ def plot_ct_direction_summary(medians: dict[str, float]) -> plt.Figure:
 
 def combine_directional_crosstalk(
     parent_path: str,
+    nframes: int,
     file_prefix: str = _DEFAULT_PREFIX,
     cmap: str | None = None,
 ) -> np.ndarray:
@@ -523,6 +546,10 @@ def combine_directional_crosstalk(
         Folder holding one sub-folder per pairing (e.g. '01'/'02'/'03').
         Sub-folders named 'results' and any without a recognisable
         ``S0S<n>`` pairing are ignored.
+    nframes : int
+        Number of frames stored in each '.bin' file. The pairings are
+        acquired with the same setting, so one value covers every
+        sub-folder.
     file_prefix : str, optional
         Filename prefix selecting the measurement batch, passed through to
         'compute_crosstalk'. The default is ``'CT_'``.
@@ -559,7 +586,7 @@ def combine_directional_crosstalk(
             continue
         name, off = direction
 
-        ct_map, _, _, _ = compute_crosstalk(entry.path, file_prefix)
+        ct_map, _, _, _ = compute_crosstalk(entry.path, nframes, file_prefix)
         maps[name] = ct_map
         offsets[name] = off
         print(

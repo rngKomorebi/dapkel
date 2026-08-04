@@ -23,7 +23,9 @@ across every frame.
 ```python
 from dapkel.functions import data_quality
 
-fig, codes = data_quality.plot_time_code_histogram(folder, pixel=(16, 16))
+fig, codes = data_quality.plot_time_code_histogram(
+    folder, pixel=(16, 16), nframes=10_000
+)
 print(codes.size, "valid codes,", len(set(codes)), "unique")
 ```
 

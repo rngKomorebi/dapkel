@@ -16,10 +16,10 @@ where the reusable code lives:
 | **1. process** | fold frames into an array, scale to physical units, **save** | your `compute_*` + `dapkel.core.reduce`, `dapkel.core.store` |
 | **2. plot** | load the saved array, render figures | your `plot_*` + `dapkel.core.plots` |
 
-> **Status.** All of `core.io`, `core.timing`, `core.reduce`, `core.plots` and
-> `core.store` exist, and every analysis writes stage-1 artifacts to
-> `processed/` and figures to `results/<kind>/`. This page describes the code as
-> it is.
+> **Status.** All of `core.io`, `core.timing`, `core.pairs`, `core.reduce`,
+> `core.plots` and `core.store` exist, and every analysis writes stage-1
+> artifacts to `processed/` and figures to `results/<kind>/`. This page
+> describes the code as it is.
 
 ## Figure sizing
 
@@ -52,7 +52,8 @@ raw data. Layout under a data folder:
 Only the parts that are genuinely specific to your measurement:
 
 1. **An extract function** — `(ts, pc) -> np.ndarray`, the per-frame reduction.
-   Photon counts are `pc.sum(axis=2)`; ORT occupancy is `(ts > valid_min).sum(axis=2)`.
+   Photon counts are `pc.sum(axis=2)`; ORT occupancy is `(ts > 0).sum(axis=2)`
+   (`unpack` leaves non-fired slots at `<= 0`, so validity is not a tunable).
 2. **A file tag / glob** identifying which `.bin` files belong to this measurement.
 3. **A unit conversion**, if the raw fold is not already in physical units
    (e.g. DCR divides by live time to get cps). Keep this *separate* from the
@@ -68,6 +69,8 @@ fail `tests/test_api_surface.py`:
 - the accumulate-over-frames loop → `core.reduce.accumulate_frames`
 - assembling four `S*C` quadrants into a (64, 64) map → `core.reduce.assemble_64`
 - frame period / live time resolution → `core.timing`
+- enumerating pixel pairs, and the `"ra,ca-rb,cb"` label every coincidence
+  artifact is indexed by → `core.pairs.pair_labels`, `core.pairs.pair_list`
 - the sensor heatmap figure → `core.plots.sensor_map`
 - the sorted-percentile distribution figure → `core.plots.sorted_distribution`
 - saving/loading arrays with metadata, and saving figures → `core.store`
@@ -153,13 +156,15 @@ KIND = "afterpulsing"
 _UNIT = "%"
 
 
-def compute_afterpulsing(folder: str, tag: str = "AP") -> np.ndarray:
+def compute_afterpulsing(folder: str, nframes: int, tag: str = "AP") -> np.ndarray:
     """Compute the (32, 32) afterpulsing probability map.
 
     Parameters
     ----------
     folder : str
         Data folder holding the '.bin' files.
+    nframes : int
+        Number of frames stored in each '.bin' file.
     tag : str
         Filename fragment selecting the files. The default is ``'AP'``.
 
@@ -169,14 +174,20 @@ def compute_afterpulsing(folder: str, tag: str = "AP") -> np.ndarray:
         (32, 32) afterpulsing probability in percent.
     """
     files = io.find_bin_files(folder, tag)
-    counts = reduce.accumulate_frames(files, lambda ts, pc: pc.sum(axis=2))
-    total = reduce.accumulate_frames(files, lambda ts, pc: np.full((32, 32), pc.shape[2]))
+    counts = reduce.accumulate_frames(
+        files, lambda ts, pc: pc.sum(axis=2), nframes=nframes
+    )
+    total = reduce.accumulate_frames(
+        files, lambda ts, pc: np.full((32, 32), pc.shape[2]), nframes=nframes
+    )
     return 100.0 * counts / np.where(total > 0, total, np.nan)
 
 
-def compute_and_save_afterpulsing(folder: str, tag: str = "AP") -> str:
+def compute_and_save_afterpulsing(
+    folder: str, nframes: int, tag: str = "AP"
+) -> str:
     """Compute the map and save it under ``processed/``; return the path."""
-    ap = compute_afterpulsing(folder, tag)
+    ap = compute_afterpulsing(folder, nframes, tag)
     return store.save_map(ap, folder, kind=KIND, tag=tag, unit=_UNIT)
 
 

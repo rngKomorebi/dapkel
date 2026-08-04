@@ -60,9 +60,9 @@ peak-shaped histogram — it is simply meaningless. See
 ## Large runs: the differences are streamed, not accumulated
 
 `calculate_and_save_timestamp_differences` writes as it goes. Whenever the
-buffered differences would exceed `part_size_mb` (default 64 MB) they are
-flushed to a part file, and the parts are concatenated into the final feather
-one Arrow record batch at a time:
+buffered differences would exceed the 64 MB part cap they are flushed to a part
+file, and the parts are concatenated into the final feather one Arrow record
+batch at a time:
 
 ```
 processed/
@@ -85,14 +85,18 @@ Two consequences worth knowing:
   complete, readable feather. Assemble them with
   [`combine_delta_t_parts`][dapkel.functions.delta_t.combine_delta_t_parts],
   or plot a single part directly via `feather_path`.
-- **The parts are kept by default** (`keep_parts=True`) — they are the
-  insurance, and they cost disk rather than memory. Pass `keep_parts=False`
-  to have the run remove its own parts once the combined feather is written.
+- **The parts are always kept.** They cost disk rather than memory, they are
+  the crash insurance, and — see [below](#plotting-without-the-combined-file) —
+  the read side streams them just as happily as the combined file, so there is
+  nothing to gain from deleting them automatically. Remove the folder by hand
+  once you have checked the combined feather.
 
 Why 64 MB and not 10: `unpack` already holds a `(32, 32, nframes)` float64
 array — about 82 MB at 10 000 frames — so below that the part buffer is not the
 binding constraint, and a smaller cap only multiplies the number of part files.
-A smaller value is perfectly safe if you want the memory ceiling lower.
+The cap is the module constant `_PART_MB`, not a parameter: sharding is a
+memory strategy and cannot change the numbers, so no call site needs to tune
+it.
 
 ## Reading it back: the histogram is streamed, not loaded
 
@@ -153,6 +157,14 @@ dt.collect_and_plot_timestamp_differences(
     feather_path=".../processed/SPDC_delta_t_parts"
 )
 ```
+
+Parts or combined file is not a numerical choice — the histogram is a sum over
+record batches either way, and a sum does not care which file a batch came out
+of, so the counts are identical. It is only an I/O choice, and the parts win it:
+histogramming them skips the combine pass, which reads and rewrites every byte
+of the run to produce a second copy of it. Working from the parts is the reason
+they are always kept. Keep the combined feather when you want one portable file
+per run, or when the data set is small enough to read whole into a DataFrame.
 
 ## The other stage 1: histogram straight off the `.bin`
 
@@ -244,6 +256,32 @@ place before the sidecar, so a crash between the two moves could pair a newer
 array with an older sidecar; resuming on that would re-count files and inflate
 the total. The resume path checks the array against `total_in_grid` and starts
 over rather than continue from something inconsistent.
+
+### Measuring the background instead of fitting it
+
+`subtract_background=True` histograms the *frame-shifted* pixel pairs alongside
+the real ones, so the accidental triangle can be subtracted bin-for-bin rather
+than fitted. Both stage-1 paths take it, and both give the same residual — see
+[Removing the accidental background by shifting frames](background_subtraction.md).
+
+```python
+# counts path: the lags cost one small grid plane each
+dt.calculate_and_save_delta_counts(path, [signal, idler], nframes=10_000,
+                                   subtract_background=True)
+counts, centers, fit = dt.collect_and_plot_delta_counts(
+    path, subtract_background=True, peak_window_ps=2_000.0)
+
+# feather path: same call, but the lags cost one column set each - so ~9x the
+# feather at the default eight lags. Use fewer, or use the counts path.
+dt.calculate_and_save_timestamp_differences(path, [signal, idler], nframes=10_000,
+                                            subtract_background=True,
+                                            background_lags=(1, 2, 3, 4))
+counts, centers, fit = dt.collect_and_plot_timestamp_differences(
+    path, subtract_background=True, peak_window_ps=2_000.0)
+```
+
+The feather's lag columns are named `<pair>@lag<k>`; lag 0 keeps the bare pair
+name, and pooling "every pair column" never picks up the shifted ones.
 
 ## Overwriting: the five-second countdown
 

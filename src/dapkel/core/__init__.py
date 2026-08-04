@@ -10,6 +10,10 @@ reduction in the middle, so the parts that do not vary live here:
       live time an acquisition represents (resolve_frame_time,
       resolve_live_time).
 
+    * pairs - stage 1: turn two detector groups into the ordered pixel pairs
+      and labels every coincidence artifact is indexed by (pair_list,
+      pair_labels, pair_label).
+
     * reduce - stage 1: fold a set of files into one sensor map
       (accumulate_frames) and interleave four quadrants into the full
       (64, 64) sensor (assemble_64).
@@ -25,6 +29,6 @@ Anything copied into two analysis modules belongs here instead;
 'docs/adding_an_analysis.md' for the contract when adding a measurement.
 """
 
-from dapkel.core import io, plots, reduce, store, timing
+from dapkel.core import io, pairs, plots, reduce, store, timing
 
-__all__ = ["io", "timing", "reduce", "plots", "store"]
+__all__ = ["io", "timing", "pairs", "reduce", "plots", "store"]

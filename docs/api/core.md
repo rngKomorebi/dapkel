@@ -14,6 +14,10 @@ See [Adding an analysis](../adding_an_analysis.md) for the contract.
 
 ::: dapkel.core.timing
 
+## `core.pairs` — which pixel pairs, and what they are called
+
+::: dapkel.core.pairs
+
 ## `core.reduce` — folding frames into a map
 
 ::: dapkel.core.reduce

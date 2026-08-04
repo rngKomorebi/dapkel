@@ -5,6 +5,154 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-08-05
+
+### Added
+
+- **`functions.background_subtraction`** — accidental-background removal by
+  frame shifting. An SPDC pair is always in one frame, so pairing pixel A of
+  frame *i* with pixel B of frame *i+k* samples the accidentals *only*;
+  subtracting that from the same-frame histogram cancels the ORT triangle
+  bin-for-bin, with no fit model. Five functions and no I/O:
+  `compute_lagged_differences`, `frames_per_lag`, `subtract_background`,
+  `integrate_residual` (the model-free coincidence count) and
+  `plot_background_subtraction` (three panels, the middle one being the
+  evidence that the pedestal really was accidental). See
+  `docs/guide/background_subtraction.md`.
+- **`subtract_background` on all four delta-t entry points**, feather path and
+  counts path alike. Stage 1 (`calculate_and_save_delta_counts`,
+  `calculate_and_save_timestamp_differences`) also histograms/records the
+  frame-shifted pairs; stage 2 (`collect_and_plot_delta_counts`,
+  `collect_and_plot_timestamp_differences`) fits and plots the *residual*
+  instead of the raw histogram, writes a three-panel diagnostic beside it, and
+  reports `fit["model_free"]` — a coincidence count with no peak or background
+  model in it. Default False, which leaves every artifact, resume signature and
+  figure exactly as they were. Only valid with `background='flat'`: there is no
+  triangle left to fit, and that is checked before the expensive pass rather
+  than after it.
+
+  The two stage-1 paths produce **bit-identical residuals** (tested, and
+  verified on a real 12-file ORT run), so the choice is only about cost: the
+  counts artifact grows one grid plane per lag (0.5 MB → 4.6 MB on a 1000-file
+  run), the feather grows one column set per lag (1 GB → ~9 GB). Lag 0 stays the
+  plain measurement in both — plane 0 of the grid, and the bare `"r,c-r,c"`
+  columns of the feather, where the shifted ones are `"<pair>@lag<k>"` and are
+  never pooled into the coincidence histogram. `compute_and_save_delta_histogram`
+  gained the parameter too and histograms every lag in one streaming pass.
+- **`core.pairs`** — `pair_list`, `pair_labels` and `pair_label`, the pixel-pair
+  enumeration and the `"ra,ca-rb,cb"` label format that every coincidence
+  artifact is indexed by. `delta_t` had it twice (once inline in the feather
+  path, once as `_pair_labels`); both now call this.
+- **`core.timing.resolve_cycle_time`** — the length of one acquisition cycle,
+  from the firmware setting rather than from a file on disk. Two versions:
+  `'short_exposure'` (the cycle is always 9 µs; the photon-sensitive exposure
+  inside it is 50–500 ns, typically 100 ns) and `'long_exposure'` (the caller
+  sets X and the firmware adds 9 µs, so the cycle is `exp_time + 9 µs`). The
+  older `'short_window'` / `'full_window'` names are accepted as aliases.
+
+### Changed
+
+- **The hitmap rate is now a photon rate per wall-clock second, in Hz, for both
+  modes**: `hits / (nframes * n_files * cycle)`. Every frame is one acquisition
+  cycle, so that product is the elapsed time of the run. `count` mode no longer
+  divides by the exposure window (which gave counts-per-live-second, a number
+  ~90x larger), and `timestamp` mode no longer resolves the period from
+  `frame_rate_cnt.txt`. `compute_and_save_hitmap` / `compute_and_save_hitmap_64`
+  take `firmware_version` (`'short_exposure'` default, or `'long_exposure'` with
+  `exp_time`) and record the resolved cycle in the sidecar; the figure is now
+  produced unconditionally, since `nframes` is required and the cycle always
+  resolves. `acq_window` is renamed `exposure_window` and is recorded and
+  reported as a duty cycle only — it does not enter the rate. The in-exposure
+  rate is the plotted figure times `cycle / exposure`, and that factor is
+  printed.
+- **`frame_rate_cnt.txt` is no longer read anywhere.** It is written by the
+  acquisition exe, which is not ours, so no analysis result may depend on it.
+  `core.timing.resolve_frame_time` no longer opens it — the frame period now
+  comes from `exp_time + 9 µs` or the 9 µs free-running base — and with the file
+  read gone, `resolve_frame_time` no longer needs a `folder` argument and
+  `resolve_live_time` no longer needs one either (both signatures changed;
+  `dcr_analysis` updated accordingly). The file itself is left on disk
+  untouched.
+
+  For the record, the counter is *self-consistent*, and an earlier draft of this
+  entry wrongly called it unreliable on the grounds that several folders share a
+  value. They share it because they share settings. It is a 200 MHz tick count
+  over the whole run and every value on disk fits
+  `ticks = nframes * N + 138 + window/5ns` exactly, which independently confirms
+  `nframes = 10 000`, reports the exposure register back (`(ticks mod nframes)
+  − 138 = window / 5 ns`, matching the folder names), and flags runs that died
+  early. It also says the **real cycle is 9.685–9.770 µs, not 9.000 µs**, so the
+  nominal normalisation used here runs ~7.8 % high — a deliberate,
+  documented choice rather than a measurement. Note the sample scripts
+  `extract_DCR.m`, `extract_dcr.py` and `dcr_hitmap.py` read it as ticks *per
+  frame* with no division, which is wrong by a factor of `nframes`.
+
+- **`nframes` is now required wherever `.bin` files are unpacked.** It was
+  optional, and `None` meant "derive it from the file size". A frame count is
+  an acquisition setting, not a property of a file that happens to be on disk:
+  deriving it silently turns a truncated or still-being-written file into a
+  different (wrong) normalisation, and every rate the package reports divides
+  by it. It is now a required argument on `hitmap_analysis.compute_hitmap` /
+  `compute_hitmap_64` / `compute_and_save_hitmap` / `compute_and_save_hitmap_64`
+  (second positional, matching `dcr_analysis`), on
+  `crosstalk_analysis.compute_crosstalk` / `compute_and_save_crosstalk` /
+  `collect_and_plot_crosstalk` / `combine_directional_crosstalk`, and as a
+  required keyword on `core.reduce.accumulate_frames`,
+  `data_quality.collect_time_mat` / `plot_time_code_histogram`,
+  `tdc_calibration.compute_code_histogram` / `compute_tdc_lut` /
+  `collect_and_save_luts` and
+  `delta_t.calculate_and_save_timestamp_differences` /
+  `calculate_and_save_delta_counts`. `core.io.frames_in_file`
+  is unchanged and still there for the case where a file's size really is the
+  only record left — it is now the caller's explicit choice rather than a
+  silent default, and its docstring warns that the relation between the frame
+  count an acquisition is asked for and the size of the '.bin' it produces is
+  not established (every sample file is a whole power-of-two number of frames,
+  which a 10 000-frame run should not produce). `hitmap_analysis.collect_and_plot_hitmap` no longer recovers
+  a missing frame count from the `.bin` sizes either: a stage-1 `.npy` whose
+  sidecar has no `total_frames` gets the counts figure but no rate figure,
+  rather than a rate normalised by a guess. Recompute it to get one.
+- The `nframes` used is part of the resume signature for the checkpointed
+  counts pass (`delta_t.calculate_and_save_delta_counts`), replacing `valid_min`
+  there. It decides how much of each file is read, so a checkpoint written with
+  one value must not be continued with another. Existing partial artifacts will
+  not resume across this change; they restart rather than mixing.
+
+### Removed
+
+- **`valid_min`.** Validity of an ORT timestamp is `time_series > 0` — `unpack`
+  leaves non-fired slots at `<= 0` — so this was a knob whose only correct
+  value was its default, and a wrong one silently drops or invents photons. The
+  threshold is now written into the code at each site, with the reason. Dropped
+  from `hitmap_analysis`, `data_quality.collect_time_mat`, `tdc_calibration`
+  and `delta_t` (both stage-1 paths).
+- **`part_size_mb` and `keep_parts`** on
+  `delta_t.calculate_and_save_timestamp_differences`. The part cap is now the
+  module constant `_PART_MB` (still 64 MB): sharding is a memory strategy that
+  cannot change the numbers, so no call site needs to tune it. The parts are
+  now always kept. They are the crash insurance, and the read side streams a
+  part folder exactly as it streams the combined feather — a histogram over
+  fixed edges is a sum over record batches, and a sum does not care which file
+  a batch came from — so working from the parts gives identical counts while
+  skipping the combine pass, which reads and rewrites every byte of the run.
+  Delete the folder by hand once the combined feather has been checked.
+
+- **`TODO.md`**, beside this file and published as *Open items* — the questions
+  that have deliberately **not** been decided, with the trade-off and what
+  evidence would settle each. This file records what was decided; that one
+  records what was left open, so a known gap cannot read as an oversight. It
+  opens with the delta-t feather keeping both its parts and its combined copy,
+  which doubles the disk a finished run occupies.
+
+### Fixed
+
+- The README's quick start passed `acq_window=1000` to `dcr_analysis`, which
+  takes **seconds** — a live time seven orders of magnitude too long, and so a
+  DCR quietly reported as ~1e-7 of the truth. It now reads `100e-9`, with the
+  unit spelled out. Nothing in the package changed; the example was wrong.
+- The changelog's link block had no `[0.1.4]` entry and still pointed
+  `[Unreleased]` at `v0.1.3`.
+
 ## [0.1.4] - 2026-08-02
 
 ### Added
@@ -277,7 +425,9 @@ Initial commit.
 
 - Functions for unpacking raw, binary data and analyzing dark count rate.
 
-[Unreleased]: https://github.com/rngKomorebi/dapkel/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/rngKomorebi/dapkel/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/rngKomorebi/dapkel/compare/v0.1.4...v0.2.0
+[0.1.4]: https://github.com/rngKomorebi/dapkel/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/rngKomorebi/dapkel/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/rngKomorebi/dapkel/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/rngKomorebi/dapkel/compare/v0.1.0...v0.1.1
