@@ -16,7 +16,6 @@ import pytest
 
 from dapkel.functions import dcr_analysis
 
-
 # --------------------------------------------------------------------------
 # mode <-> tag agreement
 # --------------------------------------------------------------------------
@@ -147,7 +146,7 @@ def test_pileup_correction_is_a_no_op_at_zero():
 
 
 def test_fully_saturated_pixel_stays_finite():
-    """p = 1 has no MLE; it must clip to a lower bound, not 'inf'."""
+    """A pixel with p = 1 has no MLE; it must clip, not go to 'inf'."""
     nframes = 8192
     out = dcr_analysis._pileup_correct(np.array([[float(nframes)]]), nframes)
     assert np.isfinite(out).all()
