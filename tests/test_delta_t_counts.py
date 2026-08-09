@@ -33,10 +33,16 @@ PIXELS = [[(0, 0), (0, 1)], [(1, 0), (1, 1)]]
 LABELS = ["0,0-1,0", "0,0-1,1", "0,1-1,0", "0,1-1,1"]
 
 NFRAMES = 50
+# One reference-clock period at 10 MHz; stage 1 requires it.
+SHUTTER_S = 100e-9
 
 # Random codes reach ~8 200, so differences reach ~630 000 ps. A support this
 # wide holds all of them, which is what the totals tests need.
 WIDE_PS = 1e6
+# The library takes seconds everywhere; these tests were written in ps, so a
+# single conversion keeps the numbers above readable.
+WIDE_S = WIDE_PS * 1e-12
+CODE_S = dt._TS_CODE_PS * 1e-12
 
 
 @pytest.fixture(autouse=True)
@@ -64,6 +70,7 @@ def _counts_run(path, **kwargs):
         tag="ORT",
         apply_TDC_calibration=False,
         nframes=NFRAMES,
+        open_shutter_time_s=SHUTTER_S,
         **kwargs,
     )
 
@@ -76,6 +83,7 @@ def _feather_run(path):
         tag="ORT",
         apply_TDC_calibration=False,
         nframes=NFRAMES,
+        open_shutter_time_s=SHUTTER_S,
     )
 
 
@@ -132,12 +140,12 @@ def test_accumulate_is_lossless_for_integer_codes():
     ``delta_code`` is an integer, so binning it onto its own lattice throws
     nothing away - the counts are exactly 'np.bincount' of the codes.
     """
-    n_bins, zero, _ = dt._delta_grid(1.0, 20.0)
+    n_bins, zero, _ = dt._delta_grid(CODE_S, 20 * CODE_S)
     counts = np.zeros((1, n_bins), dtype=np.int64)
     codes = np.array([-3.0, -3.0, 0.0, 1.0, 1.0, 1.0, 7.0])
 
     total, outside = dt._accumulate_delta_counts(
-        counts, {"a": codes}, {"a": 0}, grid_ps=1.0, zero_index=zero
+        counts, {"a": codes}, {"a": 0}, grid_native=1.0, zero_index=zero
     )
 
     assert (total, outside) == (7, 0)
@@ -148,14 +156,14 @@ def test_accumulate_is_lossless_for_integer_codes():
 
 def test_out_of_range_differences_are_counted_not_dropped():
     """A too-narrow support must be visible, not silent."""
-    n_bins, zero, _ = dt._delta_grid(1.0, 5.0)
+    n_bins, zero, _ = dt._delta_grid(CODE_S, 5 * CODE_S)
     counts = np.zeros((1, n_bins), dtype=np.int64)
 
     total, outside = dt._accumulate_delta_counts(
         counts,
         {"a": np.array([0.0, 4.0, 50.0, -50.0])},
         {"a": 0},
-        grid_ps=1.0,
+        grid_native=1.0,
         zero_index=zero,
     )
 
@@ -165,14 +173,14 @@ def test_out_of_range_differences_are_counted_not_dropped():
 
 
 def test_unknown_pair_labels_are_ignored():
-    n_bins, zero, _ = dt._delta_grid(1.0, 5.0)
+    n_bins, zero, _ = dt._delta_grid(CODE_S, 5 * CODE_S)
     counts = np.zeros((1, n_bins), dtype=np.int64)
 
     total, outside = dt._accumulate_delta_counts(
         counts,
         {"a": np.array([1.0]), "not-a-row": np.array([1.0, 2.0])},
         {"a": 0},
-        grid_ps=1.0,
+        grid_native=1.0,
         zero_index=zero,
     )
 
@@ -189,7 +197,7 @@ def test_rebinning_conserves_every_count_inside_the_window():
     counts = np.arange(grid.size, dtype=np.int64)
 
     binned, edges = dt.rebin_delta_counts(
-        counts, grid, bin_width_ps=50.0, plot_window_ps=500.0
+        counts, grid, bin_width_s=50.0e-12, plot_window_s=500.0e-12
     )
 
     inside = (grid >= edges[0]) & (grid < edges[-1])
@@ -203,7 +211,7 @@ def test_rebinning_onto_a_multiple_of_the_grid_is_a_plain_regrouping():
     counts = np.ones(grid.size, dtype=np.int64)
 
     binned, _ = dt.rebin_delta_counts(
-        counts, grid, bin_width_ps=50.0, plot_window_ps=250.0
+        counts, grid, bin_width_s=50.0e-12, plot_window_s=250.0e-12
     )
 
     assert set(np.unique(binned[1:-1])) == {5}
@@ -220,11 +228,17 @@ def _both_paths(bin_folder, bin_width, window):
     _counts_run(bin_folder)
 
     want, edges, info = dt.compute_and_save_delta_histogram(
-        bin_folder, bin_width_ps=bin_width, plot_window_ps=window, quiet=True
+        bin_folder,
+        bin_width_s=bin_width * 1e-12,
+        plot_window_s=window * 1e-12,
+        quiet=True,
     )
     grid_counts, centres, _ = dt.load_delta_counts(bin_folder)
     got, got_edges = dt.rebin_delta_counts(
-        grid_counts, centres, bin_width_ps=bin_width, plot_window_ps=window
+        grid_counts,
+        centres,
+        bin_width_s=bin_width * 1e-12,
+        plot_window_s=window * 1e-12,
     )
     np.testing.assert_allclose(got_edges, edges)
     return got, want, edges, info
@@ -278,7 +292,7 @@ def test_the_feather_paths_outermost_bins_are_undercounted(bin_folder):
 def test_the_two_paths_see_the_same_number_of_differences(bin_folder):
     """Totals must match over the whole support, not just inside a window."""
     _feather_run(bin_folder)
-    counts_path = _counts_run(bin_folder, support_ps=WIDE_PS)
+    counts_path = _counts_run(bin_folder, support_s=WIDE_S)
 
     _, _, info = dt.compute_and_save_delta_histogram(bin_folder, quiet=True)
     meta = store.read_meta(counts_path)
@@ -290,7 +304,7 @@ def test_the_two_paths_see_the_same_number_of_differences(bin_folder):
 
 def test_a_narrow_support_reports_what_it_lost(bin_folder):
     """The default support is narrower than these fabricated codes reach."""
-    meta = store.read_meta(_counts_run(bin_folder, support_ps=200e3))
+    meta = store.read_meta(_counts_run(bin_folder, support_s=200e-9))
 
     assert meta["n_outside"] > 0
     assert meta["total_in_grid"] == meta["total"] - meta["n_outside"]
@@ -298,10 +312,10 @@ def test_a_narrow_support_reports_what_it_lost(bin_folder):
 
 def _continuous_grid(deltas, cell):
     """Bin continuous (LUT'd) differences onto a native grid."""
-    n_bins, zero, _ = dt._delta_grid(cell, 200e3)
+    n_bins, zero, _ = dt._delta_grid(cell * 1e-12, 200e-9)
     counts = np.zeros((1, n_bins), dtype=np.int64)
     dt._accumulate_delta_counts(
-        counts, {"a": deltas}, {"a": 0}, grid_ps=cell, zero_index=zero
+        counts, {"a": deltas}, {"a": 0}, grid_native=cell, zero_index=zero
     )
     return counts[0], (np.arange(n_bins) - zero) * cell
 
@@ -325,7 +339,8 @@ def test_an_odd_number_of_cells_per_bin_rebins_exactly(cells):
     width = cells * cell
     window = 60 * width
     got, edges = dt.rebin_delta_counts(
-        counts, centres, bin_width_ps=width, plot_window_ps=window
+        counts, centres, bin_width_s=width * 1e-12,
+        plot_window_s=window * 1e-12
     )
 
     np.testing.assert_array_equal(got, np.histogram(deltas, bins=edges)[0])
@@ -341,7 +356,8 @@ def test_an_even_number_of_cells_per_bin_does_not(caplog):
     width = 10 * cell
     window = 60 * width
     got, edges = dt.rebin_delta_counts(
-        counts, centres, bin_width_ps=width, plot_window_ps=window
+        counts, centres, bin_width_s=width * 1e-12,
+        plot_window_s=window * 1e-12
     )
     want = np.histogram(deltas, bins=edges)[0]
 
@@ -352,7 +368,8 @@ def test_an_even_number_of_cells_per_bin_does_not(caplog):
 def test_snapping_picks_an_odd_cell_count_and_a_whole_window(capsys):
     cell = dt._TS_CODE_PS / dt._GRID_SUBDIV  # 7.7 ps
 
-    width, window = dt._snap_binning(71.0, 10e3, cell)
+    width, window = dt._snap_binning(71.0e-12, 10e-9, cell * 1e-12)
+    width, window, cell = width * 1e12, window * 1e12, cell
 
     assert width / cell == pytest.approx(9.0)
     assert (window / width) == pytest.approx(round(window / width))
@@ -360,14 +377,14 @@ def test_snapping_picks_an_odd_cell_count_and_a_whole_window(capsys):
 
 
 def test_snapping_moves_an_even_request_off_the_even_count():
-    cell = 7.7
-    width, _ = dt._snap_binning(10 * cell, 1000.0, cell)
+    cell = 7.7e-12
+    width, _ = dt._snap_binning(10 * cell, 1000.0e-12, cell)
     assert round(width / cell) % 2 == 1
 
 
 def test_snapping_never_returns_a_zero_width():
-    width, window = dt._snap_binning(0.1, 1.0, 7.7)
-    assert width == pytest.approx(7.7)
+    width, window = dt._snap_binning(0.1e-12, 1.0e-12, 7.7e-12)
+    assert width == pytest.approx(7.7e-12)
     assert window > 0
 
 
@@ -407,6 +424,7 @@ def test_different_inputs_will_not_overwrite_without_rewrite(bin_folder):
             tag="ORT",
             apply_TDC_calibration=False,
             nframes=NFRAMES,
+            open_shutter_time_s=SHUTTER_S,
         )
 
 
@@ -507,12 +525,12 @@ def test_a_code_grid_is_scaled_to_ps_at_load_time(bin_folder):
 
     _, default_centres, default_info = dt.load_delta_counts(bin_folder)
     _, doubled, doubled_info = dt.load_delta_counts(
-        bin_folder, time_unit_ps=2 * dt._TS_CODE_PS
+        bin_folder, time_unit_s=2 * CODE_S
     )
 
     assert default_info["unit"] == "code"
-    assert default_info["cell_ps"] == pytest.approx(dt._TS_CODE_PS)
-    assert doubled_info["cell_ps"] == pytest.approx(2 * dt._TS_CODE_PS)
+    assert default_info["cell_s"] == pytest.approx(CODE_S)
+    assert doubled_info["cell_s"] == pytest.approx(2 * CODE_S)
     np.testing.assert_allclose(doubled, 2 * default_centres)
 
 
@@ -524,8 +542,8 @@ def test_plot_driver_returns_counts_centres_and_a_fit(bin_folder):
     _counts_run(bin_folder)
     counts, centres, fit = dt.collect_and_plot_delta_counts(
         bin_folder,
-        bin_width_ps=4 * dt._TS_CODE_PS,
-        plot_window_ps=2400 * dt._TS_CODE_PS,
+        bin_width_s=4 * CODE_S,
+        plot_window_s=2400 * CODE_S,
         label="test",
     )
 
@@ -576,10 +594,10 @@ def test_lag_zero_plane_is_the_unsubtracted_histogram(tmp_path):
         for i, blob in enumerate(data):
             (folder / f"ORT_{i}.bin").write_bytes(blob)
 
-    _counts_run(str(plain), support_ps=WIDE_PS)
+    _counts_run(str(plain), support_s=WIDE_S)
     _counts_run(
         str(lagged),
-        support_ps=WIDE_PS,
+        support_s=WIDE_S,
         subtract_background=True,
         background_lags=(1, 2, 3),
     )
@@ -594,7 +612,7 @@ def test_lag_zero_plane_is_the_unsubtracted_histogram(tmp_path):
 def test_frames_used_is_recorded_per_lag(bin_folder):
     """A lag of k loses the last k frames of every file, and says so."""
     _counts_run(
-        bin_folder, support_ps=WIDE_PS, subtract_background=True,
+        bin_folder, support_s=WIDE_S, subtract_background=True,
         background_lags=(1, 4),
     )
     meta = store.read_meta(_counts_path(bin_folder))
@@ -614,7 +632,7 @@ def test_bad_background_lags_are_rejected(bin_folder, lags, match):
 
 def test_a_bare_int_is_taken_as_one_lag(bin_folder):
     _counts_run(
-        bin_folder, support_ps=WIDE_PS, subtract_background=True,
+        bin_folder, support_s=WIDE_S, subtract_background=True,
         background_lags=1,
     )
     assert store.read_meta(_counts_path(bin_folder))["lags"] == [0, 1]
@@ -622,7 +640,7 @@ def test_a_bare_int_is_taken_as_one_lag(bin_folder):
 
 def test_load_keeps_the_lag_axis_and_pools_pairs_under_it(bin_folder):
     _counts_run(
-        bin_folder, support_ps=WIDE_PS, subtract_background=True,
+        bin_folder, support_s=WIDE_S, subtract_background=True,
         background_lags=(1, 2),
     )
     pooled, centres, info = dt.load_delta_counts(bin_folder)
@@ -643,7 +661,7 @@ def test_subtracting_needs_an_artifact_with_lag_planes(bin_folder):
 
     matplotlib.use("Agg")
 
-    _counts_run(bin_folder, support_ps=WIDE_PS)
+    _counts_run(bin_folder, support_s=WIDE_S)
     with pytest.raises(ValueError, match="lag planes"):
         dt.collect_and_plot_delta_counts(
             bin_folder, subtract_background=True, label="test"
@@ -657,7 +675,7 @@ def test_subtracting_refuses_a_triangle_background(bin_folder):
     matplotlib.use("Agg")
 
     _counts_run(
-        bin_folder, support_ps=WIDE_PS, subtract_background=True,
+        bin_folder, support_s=WIDE_S, subtract_background=True,
         background_lags=(1, 2),
     )
     with pytest.raises(ValueError, match="no triangle left"):
@@ -678,15 +696,15 @@ def test_the_subtracted_driver_returns_the_residual_and_writes_both_figures(
     matplotlib.use("Agg")
 
     _counts_run(
-        bin_folder, support_ps=WIDE_PS, subtract_background=True,
+        bin_folder, support_s=WIDE_S, subtract_background=True,
         background_lags=(1, 2, 3),
     )
     counts, centres, fit = dt.collect_and_plot_delta_counts(
         bin_folder,
-        bin_width_ps=4 * dt._TS_CODE_PS,
-        plot_window_ps=200 * dt._TS_CODE_PS,
+        bin_width_s=4 * CODE_S,
+        plot_window_s=200 * CODE_S,
         subtract_background=True,
-        peak_window_ps=10 * dt._TS_CODE_PS,
+        peak_window_s=10 * CODE_S,
         label="test",
     )
 
@@ -725,7 +743,7 @@ def test_both_stage_one_paths_give_the_same_subtracted_residual(bin_folder):
     matplotlib.use("Agg")
 
     # An odd number of cells per bin, so the counts-path rebin is exact.
-    width = 3 * dt._TS_CODE_PS
+    width = 3 * CODE_S
     kwargs = {
         "subtract_background": True,
         "background_lags": (1, 2, 3),
@@ -736,24 +754,25 @@ def test_both_stage_one_paths_give_the_same_subtracted_residual(bin_folder):
         tag="ORT",
         apply_TDC_calibration=False,
         nframes=NFRAMES,
+        open_shutter_time_s=SHUTTER_S,
         **kwargs,
     )
-    counts_npy = _counts_run(bin_folder, support_ps=WIDE_PS, **kwargs)
+    counts_npy = _counts_run(bin_folder, support_s=WIDE_S, **kwargs)
 
     _, _, from_feather = dt.collect_and_plot_timestamp_differences(
         feather_path=feather,
-        bin_width_ps=width,
-        plot_window_ps=20 * width,
-        support_ps=WIDE_PS,
-        peak_window_ps=2 * width,
+        bin_width_s=width,
+        plot_window_s=20 * width,
+        support_s=WIDE_S,
+        peak_window_s=2 * width,
         subtract_background=True,
         label="feather",
     )
     _, _, from_counts = dt.collect_and_plot_delta_counts(
         counts_path=counts_npy,
-        bin_width_ps=width,
-        plot_window_ps=20 * width,
-        peak_window_ps=2 * width,
+        bin_width_s=width,
+        plot_window_s=20 * width,
+        peak_window_s=2 * width,
         subtract_background=True,
         snap_to_grid=False,
         label="counts",

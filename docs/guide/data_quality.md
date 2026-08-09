@@ -16,7 +16,10 @@ to catch it is to look at the raw code distribution.
 
 ## What healthy data looks like
 
-A working pixel's TDC codes spread over the full ~0..1300 oscillator range. A
+A working pixel's TDC codes spread over the full range for the reference clock
+in use — ~279 codes at 50 MHz, ~1397 at 10 MHz, ~2794 at 5 MHz, ~6985 at
+2 MHz, since the ring sets the ~71.6 ps code width and the clock sets the
+full scale. A
 broken run collapses onto a handful of values — often a single code repeated
 across every frame.
 

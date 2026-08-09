@@ -1,9 +1,25 @@
 """Dark count rate (DCR) maps, per quadrant and full-sensor.
 
-DCR is accumulated photon counts divided by the time the sensor was actually
+DCR is accumulated dark counts divided by the time the sensor was actually
 collecting. That live time is NOT the frame period: under the current
-``short_window`` firmware only the user-set ``acq_window`` of each ~9 us frame is
-photon-sensitive, so ``acq_window`` is required.
+``short_window`` firmware only the user-set ``open_shutter_time_s`` of each
+~9 us frame is photon-sensitive, so ``open_shutter_time_s`` is required.
+
+What counts as "a count" depends on the acquisition program, exactly as in
+'hitmap_analysis':
+
+    * ``mode="count"`` (``S*C`` / ``ORC``) - the per-pixel photon counter is
+      summed over frames.
+    * ``mode="timestamp"`` (``S*T`` / ``ORT``) - the counter field does **not**
+      exist; 'unpack' returns the low bits of the coarse timestamp in its place
+      (see the note in 'unpack'). Summing it gives a number tens of times too
+      large. Here the count is the number of frames carrying a valid timestamp,
+      ``(ts > 0).sum(axis=2)``.
+
+In timestamp mode only the *first* dark count of a frame is recorded, so the
+occupancy saturates at one per ``open_shutter_time_s`` (125 kcps at an 8 µs
+window) and under-reports below it. ``pileup_correct=True`` inverts that
+censoring under Poisson statistics; see 'compute_dcr_32'.
 
 See ``docs/guide/dcr.md``.
 """
@@ -55,15 +71,65 @@ _SPAD_LAYOUT = {
     "S3C": (1, 0),
 }
 
+#: Readout mode -> the letter the acquisition program appends to the SPAD tag.
+#: ``S0C`` is the counting program, ``S0T`` the timestamping one; the geometry
+#: in '_SPAD_LAYOUT' is the same for both.
+_MODE_TAG_LETTER = {"count": "C", "timestamp": "T"}
 
 
+def _quadrant_tag(tag: str, mode: str) -> str:
+    """Return the SPAD tag of '_SPAD_LAYOUT' spelled for a readout mode."""
+    return tag[:-1] + _MODE_TAG_LETTER[mode]
+
+
+def _check_mode(mode: str, tag: str = "") -> None:
+    """Validate ``mode``, and catch the tag/mode mismatch that inflates DCR.
+
+    A ``*T`` tag read with ``mode='count'`` sums coarse-timestamp bits as if
+    they were photon counts, which silently multiplies the rate by ~50. That is
+    a hard error rather than a warning, because the resulting map looks
+    plausible.
+    """
+    if mode not in _MODE_TAG_LETTER:
+        raise ValueError(f"mode must be 'timestamp' or 'count', got {mode!r}")
+
+    stem = tag.upper().rstrip("0123456789")
+    expected = {"T": "timestamp", "C": "count"}.get(stem[-1:] if stem else "")
+    if expected is not None and expected != mode:
+        raise ValueError(
+            f"tag {tag!r} is a {expected}-mode acquisition but mode={mode!r} "
+            f"was requested. In timestamp mode the photon-count field holds "
+            f"coarse-timestamp bits, not counts, so summing it overstates the "
+            f"DCR by more than an order of magnitude. Pass mode='{expected}'."
+        )
+
+
+def _pileup_correct(occupancy: np.ndarray, nframes_total: int) -> np.ndarray:
+    """Undo the one-count-per-frame censoring of timestamp mode.
+
+    Each frame is a Bernoulli trial: with a true dark count rate ``r`` and a
+    live window ``w``, a frame fires with probability ``p = 1 - exp(-r*w)``
+    because only the first count is timestamped. So the maximum-likelihood rate
+    is ``r = -ln(1 - p) / w``, i.e. the occupancy count is replaced by
+    ``-nframes_total * ln(1 - hits/nframes_total)`` before the division by the
+    live time.
+
+    A pixel that fires in *every* frame has no upper bound (``p = 1``); it is
+    clipped to the ``p = 1 - 1/(2*nframes_total)`` half-count level, so a
+    saturated pixel reads as a finite lower bound rather than ``inf``.
+    """
+    p = occupancy / nframes_total
+    p = np.minimum(p, 1.0 - 0.5 / nframes_total)
+    return -nframes_total * np.log1p(-p)
 
 
 def _accumulate_dcr(
     files: list[str],
     nframes: int,
-    frame_time: float,
+    frame_time_s: float,
     *,
+    mode: str = "count",
+    pileup_correct: bool = False,
     label: str = "",
 ) -> np.ndarray:
     """Unpack a list of '.bin' files and compute the (32, 32) DCR map.
@@ -74,8 +140,14 @@ def _accumulate_dcr(
         Paths to the '.bin' files to unpack and accumulate.
     nframes : int
         Number of frames stored in each '.bin' file.
-    frame_time : float
+    frame_time_s : float
         Length of a single frame, in seconds.
+    mode : str, optional
+        ``'count'`` (default) sums the photon-count field; ``'timestamp'``
+        counts the frames carrying a valid timestamp. See the module docstring.
+    pileup_correct : bool, optional
+        ``'timestamp'`` mode only: invert the one-count-per-frame censoring
+        (see '_pileup_correct'). The default is False.
     label : str, optional
         Label used in the progress printout. The default is "".
 
@@ -89,36 +161,45 @@ def _accumulate_dcr(
     ValueError
         Raised when the total acquisition time works out to zero.
     """
-    photon_sum = reduce.accumulate_frames(
+    _check_mode(mode)
+    timestamp = mode == "timestamp"
+    count_sum = reduce.accumulate_frames(
         files,
-        lambda ts, pc: pc.sum(axis=2),
+        (lambda ts, pc: (ts > 0).sum(axis=2))
+        if timestamp
+        else (lambda ts, pc: pc.sum(axis=2)),
         nframes=nframes,
-        need_time_series=False,
+        need_time_series=timestamp,
         label=label,
     )
-    total_time = nframes * len(files) * frame_time
+    total_frames = nframes * len(files)
+    total_time = total_frames * frame_time_s
     if total_time == 0:
         raise ValueError(
             "Total acquisition time is zero — check nframes and --exp-time."
         )
-    dcr = photon_sum / total_time
+    if timestamp and pileup_correct:
+        count_sum = _pileup_correct(count_sum, total_frames)
+    dcr = count_sum / total_time
     return dcr
 
 
 def compute_dcr_32(
     folder: str,
     nframes: int,
-    exp_time: float | None = None,
+    exp_time_s: float | None = None,
     tag: str = "",
     *,
+    mode: str = "count",
+    pileup_correct: bool = False,
     firmware_version: str = "short_window",
-    acq_window: float | None = None,
+    open_shutter_time_s: float | None = 500e-9,
 ) -> np.ndarray:
     """Unpack the binary data and compute the (32, 32) DCR map.
 
     Normalised by the *live* time per frame, which depends on the firmware
     (see 'core.timing.resolve_live_time'): ``'short_window'`` counts only
-    ``acq_window`` as live, ``'full_window'`` the whole frame.
+    ``open_shutter_time_s`` as live, ``'full_window'`` the whole frame.
 
     Parameters
     ----------
@@ -126,20 +207,32 @@ def compute_dcr_32(
         Path to the folder with the '.bin' data files.
     nframes : int
         Number of frames stored in each '.bin' file.
-    exp_time : float | None, optional
+    exp_time_s : float | None, optional
         Legacy exposure time in seconds (``firmware_version='full_window'``
         only): 0 → 9 µs actual, 10e-6 → 19 µs. If None, the 9 µs
         free-running base is used. The default is None.
     tag : str, optional
-        SPAD quadrant tag ('S0C', 'S1C', 'S2C', 'S3C'). The default is
-        "", which matches every '.bin' file in the folder.
+        SPAD quadrant tag - 'S0C'...'S3C' in counting mode, 'S0T'...'S3T' (or
+        'ORT') in timestamping mode. The default is "", which matches every
+        '.bin' file in the folder.
+    mode : str, optional
+        ``'count'`` (default) sums the per-pixel photon counter; use
+        ``'timestamp'`` for ``S*T``/``ORT`` data, where that field holds
+        coarse-timestamp bits instead and the count is the number of frames
+        that fired. A tag whose letter contradicts ``mode`` is an error.
+    pileup_correct : bool, optional
+        ``'timestamp'`` mode only. Timestamp mode records at most one count per
+        frame, so the raw rate saturates at ``1 / open_shutter_time_s`` (125 kcps at an
+        8 µs window) and under-reports well before that. With True the Poisson
+        censoring is inverted, ``r = -ln(1 - p) / open_shutter_time_s``. The default is
+        False, which reports the raw occupancy rate.
     firmware_version : str, optional
         ``'short_window'`` (default) or ``'full_window'``; see
         'resolve_live_time'.
-    acq_window : float | None, optional
+    open_shutter_time_s : float | None, optional
         Photon-sensitive window per frame, in seconds (required for
-        ``firmware_version='short_window'``, e.g. ``200e-9``). The default
-        is None.
+        ``firmware_version='short_window'``). The default is ``500e-9``
+        (500 ns).
 
     Returns
     -------
@@ -149,31 +242,37 @@ def compute_dcr_32(
     Raises
     ------
     ValueError
-        Raised when ``firmware_version='short_window'`` but no ``acq_window``
-        is given.
+        Raised when ``firmware_version='short_window'`` but no ``open_shutter_time_s``
+        is given, or when ``mode`` is unknown or contradicts ``tag``.
     """
+    _check_mode(mode, tag)
     live, _ = timing.resolve_live_time(
         firmware_version, nframes,
-        acq_window=acq_window, exp_time=exp_time,
+        open_shutter_time_s=open_shutter_time_s, exp_time_s=exp_time_s,
     )
     if live is None:
         raise ValueError(
-            "firmware_version='short_window' needs acq_window (the "
+            "firmware_version='short_window' needs open_shutter_time_s (the "
             "photon-sensitive window per frame, in seconds, e.g. 200e-9)."
         )
     # The DCR quadrant tags are matched with a leading underscore ('*_S0C*')
     # so a tag cannot match a filename that merely contains those characters.
     files = io.find_bin_files(folder, tag, require_separator=True)
-    return _accumulate_dcr(files, nframes, live, label=tag)
+    return _accumulate_dcr(
+        files, nframes, live,
+        mode=mode, pileup_correct=pileup_correct, label=tag,
+    )
 
 
 def compute_dcr_64(
     folder: str,
     nframes: int,
-    exp_time: float | None = None,
+    exp_time_s: float | None = None,
     *,
+    mode: str = "count",
+    pileup_correct: bool = False,
     firmware_version: str = "short_window",
-    acq_window: float | None = None,
+    open_shutter_time_s: float | None = 500e-9,
 ) -> np.ndarray:
     """Unpack the binary data and compute the (64, 64) DCR map.
 
@@ -186,16 +285,23 @@ def compute_dcr_64(
         Path to the folder with the '.bin' data files.
     nframes : int
         Number of frames stored in each '.bin' file.
-    exp_time : float | None, optional
+    exp_time_s : float | None, optional
         Legacy exposure time in seconds (``firmware_version='full_window'``
         only). If None, the 9 µs free-running base is used. The default
         is None.
+    mode : str, optional
+        ``'count'`` (default, ``S*C`` files) or ``'timestamp'`` (``S*T``
+        files); see 'compute_dcr_32'. The mode also selects which quadrant
+        files are looked for.
+    pileup_correct : bool, optional
+        ``'timestamp'`` mode only; see 'compute_dcr_32'. The default is False.
     firmware_version : str, optional
         ``'short_window'`` (default) or ``'full_window'``; see
         'resolve_live_time'.
-    acq_window : float | None, optional
+    open_shutter_time_s : float | None, optional
         Photon-sensitive window per frame, in seconds (required for
-        ``firmware_version='short_window'``). The default is None.
+        ``firmware_version='short_window'``). The default is ``500e-9``
+        (500 ns).
 
     Returns
     -------
@@ -208,23 +314,28 @@ def compute_dcr_64(
         Raised when no '.bin' files for any of the four SPAD tags are
         found in the folder.
     ValueError
-        Raised when ``firmware_version='short_window'`` but no ``acq_window``
-        is given.
+        Raised when ``firmware_version='short_window'`` but no ``open_shutter_time_s``
+        is given, or when ``mode`` is unknown.
     """
+    _check_mode(mode)
     live, _ = timing.resolve_live_time(
         firmware_version, nframes,
-        acq_window=acq_window, exp_time=exp_time,
+        open_shutter_time_s=open_shutter_time_s, exp_time_s=exp_time_s,
     )
     if live is None:
         raise ValueError(
-            "firmware_version='short_window' needs acq_window (the "
+            "firmware_version='short_window' needs open_shutter_time_s (the "
             "photon-sensitive window per frame, in seconds, e.g. 200e-9)."
         )
-    frame_time = live
+    frame_time_s = live
 
+    # The layout is keyed by the counting-mode tags; timestamping writes the
+    # same four quadrants as 'S0T'...'S3T'.
     tag_files = {}
     for tag in _SPAD_LAYOUT:
-        files = glob.glob(os.path.join(folder, f"*_{tag}*.bin"))
+        files = glob.glob(
+            os.path.join(folder, f"*_{_quadrant_tag(tag, mode)}*.bin")
+        )
         if files:
             tag_files[tag] = sorted(
                 files,
@@ -233,12 +344,18 @@ def compute_dcr_64(
                 ),
             )
     if not tag_files:
+        letter = _MODE_TAG_LETTER[mode]
         raise FileNotFoundError(
-            "No S0C/S1C/S2C/S3C .bin files found in:\n  " + folder
+            f"No S0{letter}/S1{letter}/S2{letter}/S3{letter} .bin files "
+            f"found in:\n  {folder}"
         )
 
     quadrants = {
-        tag: _accumulate_dcr(files, nframes, frame_time, label=tag)
+        tag: _accumulate_dcr(
+            files, nframes, frame_time_s,
+            mode=mode, pileup_correct=pileup_correct,
+            label=_quadrant_tag(tag, mode),
+        )
         for tag, files in tag_files.items()
     }
     return reduce.assemble_64(quadrants, _SPAD_LAYOUT)
@@ -296,27 +413,64 @@ def plot_distribution(dcr: np.ndarray) -> plt.Figure:
 
 
 
+def _warn_if_saturated(
+    dcr: np.ndarray,
+    mode: str,
+    pileup_correct: bool,
+    open_shutter_time_s: float | None,
+) -> None:
+    """Print how close a timestamp-mode map is to the one-per-frame ceiling.
+
+    Silent for counting mode, which has no such ceiling, and for an already
+    corrected map. Printed rather than raised: a saturated *pixel* is normal in
+    a DCR map, it is only the number attached to it that stops being a rate.
+    """
+    if mode != "timestamp" or pileup_correct or not open_shutter_time_s:
+        return
+    ceiling = 1.0 / open_shutter_time_s
+    worst = float(dcr.max()) / ceiling
+    if worst < 0.05:
+        return
+    n_hot = int((dcr > 0.5 * ceiling).sum())
+    print(
+        f"  ! timestamp mode records at most one count per frame, so this "
+        f"map saturates at {ceiling:.3g} cps. The hottest pixel is at "
+        f"{worst * 100:.0f}% of that"
+        + (
+            f" and {n_hot} pixel{'s are' if n_hot > 1 else ' is'} past 50%"
+            if n_hot
+            else ""
+        )
+        + ", so those rates read low. Pass pileup_correct=True for the "
+        "Poisson-corrected rate."
+    )
+
+
 def _dcr_meta(
     path: str,
     nframes: int,
     tag: str,
-    exp_time: float | None,
+    exp_time_s: float | None,
     firmware_version: str,
-    acq_window: float | None,
+    open_shutter_time_s: float | None,
+    mode: str = "count",
+    pileup_correct: bool = False,
 ) -> dict:
     """Build the acquisition metadata sidecar for a saved DCR map."""
     frame_live_s, live_source = timing.resolve_live_time(
         firmware_version,
         nframes,
-        acq_window=acq_window,
-        exp_time=exp_time,
+        open_shutter_time_s=open_shutter_time_s,
+        exp_time_s=exp_time_s,
     )
     return {
         "tag": tag,
         "nframes": int(nframes),
+        "mode": mode,
+        "pileup_correct": bool(pileup_correct) and mode == "timestamp",
         "firmware_version": firmware_version,
-        "acq_window_s": acq_window,
-        "exp_time_s": exp_time,
+        "open_shutter_time_s": open_shutter_time_s,
+        "exp_time_s": exp_time_s,
         "frame_live_s": frame_live_s,
         "live_time_source": live_source,
         "unit": "cps",
@@ -326,11 +480,13 @@ def _dcr_meta(
 def compute_and_save_dcr_32(
     path: str,
     nframes: int,
-    exp_time: float | None = None,
+    exp_time_s: float | None = None,
     tag: str = "",
     *,
+    mode: str = "count",
+    pileup_correct: bool = False,
     firmware_version: str = "short_window",
-    acq_window: float | None = None,
+    open_shutter_time_s: float | None = 500e-9,
 ) -> str:
     """Compute the (32, 32) DCR map and save it under ``processed/``.
 
@@ -344,14 +500,20 @@ def compute_and_save_dcr_32(
         Path to the folder with the '.bin' data files.
     nframes : int
         Number of frames stored in each '.bin' file.
-    exp_time : float | None, optional
+    exp_time_s : float | None, optional
         Value passed to Kelpie_v2.exe, in seconds. The default is None.
     tag : str, optional
-        SPAD quadrant tag ('S0C', 'S1C', 'S2C', 'S3C'). The default is "".
+        SPAD quadrant tag ('S0C'...'S3C', or 'S0T'...'S3T'/'ORT' in
+        timestamping mode). The default is "".
+    mode : str, optional
+        ``'count'`` (default) or ``'timestamp'``; see 'compute_dcr_32'.
+    pileup_correct : bool, optional
+        ``'timestamp'`` mode only; see 'compute_dcr_32'. The default is False.
     firmware_version : str, optional
         ``'short_window'`` (default) or ``'full_window'``.
-    acq_window : float | None, optional
-        Photon-sensitive window per frame, in seconds. The default is None.
+    open_shutter_time_s : float | None, optional
+        Photon-sensitive window per frame, in seconds. The default is
+        ``500e-9`` (500 ns).
 
     Returns
     -------
@@ -359,8 +521,9 @@ def compute_and_save_dcr_32(
         Path to the saved '.npy'.
     """
     dcr = compute_dcr_32(
-        path, nframes, exp_time, tag,
-        firmware_version=firmware_version, acq_window=acq_window,
+        path, nframes, exp_time_s, tag,
+        mode=mode, pileup_correct=pileup_correct,
+        firmware_version=firmware_version, open_shutter_time_s=open_shutter_time_s,
     )
     return store.save_map(
         dcr,
@@ -368,7 +531,8 @@ def compute_and_save_dcr_32(
         kind=_KIND,
         tag=tag,
         meta=_dcr_meta(
-            path, nframes, tag, exp_time, firmware_version, acq_window
+            path, nframes, tag, exp_time_s, firmware_version, open_shutter_time_s,
+            mode, pileup_correct,
         ),
     )
 
@@ -376,10 +540,12 @@ def compute_and_save_dcr_32(
 def compute_and_save_dcr_64(
     path: str,
     nframes: int,
-    exp_time: float | None = None,
+    exp_time_s: float | None = None,
     *,
+    mode: str = "count",
+    pileup_correct: bool = False,
     firmware_version: str = "short_window",
-    acq_window: float | None = None,
+    open_shutter_time_s: float | None = 500e-9,
 ) -> str:
     """Assemble the (64, 64) full-sensor DCR map and save it.
 
@@ -389,12 +555,17 @@ def compute_and_save_dcr_64(
         Path to the folder with the four SPAD quadrants' '.bin' files.
     nframes : int
         Number of frames stored in each '.bin' file.
-    exp_time : float | None, optional
+    exp_time_s : float | None, optional
         Value passed to Kelpie_v2.exe, in seconds. The default is None.
+    mode : str, optional
+        ``'count'`` (default) or ``'timestamp'``; see 'compute_dcr_32'.
+    pileup_correct : bool, optional
+        ``'timestamp'`` mode only; see 'compute_dcr_32'. The default is False.
     firmware_version : str, optional
         ``'short_window'`` (default) or ``'full_window'``.
-    acq_window : float | None, optional
-        Photon-sensitive window per frame, in seconds. The default is None.
+    open_shutter_time_s : float | None, optional
+        Photon-sensitive window per frame, in seconds. The default is
+        ``500e-9`` (500 ns).
 
     Returns
     -------
@@ -402,8 +573,9 @@ def compute_and_save_dcr_64(
         Path to the saved '.npy'.
     """
     dcr = compute_dcr_64(
-        path, nframes, exp_time,
-        firmware_version=firmware_version, acq_window=acq_window,
+        path, nframes, exp_time_s,
+        mode=mode, pileup_correct=pileup_correct,
+        firmware_version=firmware_version, open_shutter_time_s=open_shutter_time_s,
     )
     return store.save_map(
         dcr,
@@ -411,7 +583,8 @@ def compute_and_save_dcr_64(
         kind=_KIND,
         tag="64",
         meta=_dcr_meta(
-            path, nframes, "64", exp_time, firmware_version, acq_window
+            path, nframes, "64", exp_time_s, firmware_version, open_shutter_time_s,
+            mode, pileup_correct,
         ),
     )
 
@@ -419,14 +592,16 @@ def compute_and_save_dcr_64(
 def collect_and_plot_dcr_32(
     path: str,
     nframes: int,
-    exp_time: float | None = None,
+    exp_time_s: float | None = None,
     tag: str = "",
     daughterboard_number: str | None = None,
     motherboard_number: str | None = None,
     cmap: str | None = None,
     *,
+    mode: str = "count",
+    pileup_correct: bool = False,
     firmware_version: str = "short_window",
-    acq_window: float | None = None,
+    open_shutter_time_s: float | None = 500e-9,
     from_saved: bool = False,
 ) -> np.ndarray:
     """Unpack, compute, and plot the (32, 32) DCR map for a SPAD tag.
@@ -440,12 +615,13 @@ def collect_and_plot_dcr_32(
         Path to the folder with the '.bin' data files.
     nframes : int
         Number of frames stored in each '.bin' file.
-    exp_time : float | None, optional
+    exp_time_s : float | None, optional
         Value passed to Kelpie_v2.exe, in seconds. See
         'compute_dcr_32' for details. The default is None.
     tag : str, optional
-        SPAD quadrant tag ('S0C', 'S1C', 'S2C', 'S3C'). The default is
-        "", which matches every '.bin' file in the folder.
+        SPAD quadrant tag ('S0C'...'S3C', or 'S0T'...'S3T'/'ORT' in
+        timestamping mode). The default is "", which matches every '.bin'
+        file in the folder.
     daughterboard_number : str | None, optional
         Camera daughterboard number, used to look up the hot/warm
         pixel mask. Mask support is not implemented yet. The default
@@ -457,12 +633,17 @@ def collect_and_plot_dcr_32(
     cmap : str | None, optional
         Matplotlib colormap name for the heatmap. The default is None —
         use the active style's ``image.cmap``.
+    mode : str, optional
+        ``'count'`` (default) or ``'timestamp'``; see 'compute_dcr_32'.
+    pileup_correct : bool, optional
+        ``'timestamp'`` mode only; see 'compute_dcr_32'. The default is False.
     firmware_version : str, optional
         ``'short_window'`` (default) or ``'full_window'``; see
         'resolve_live_time'.
-    acq_window : float | None, optional
+    open_shutter_time_s : float | None, optional
         Photon-sensitive window per frame, in seconds (required for
-        ``firmware_version='short_window'``). The default is None.
+        ``firmware_version='short_window'``). The default is ``500e-9``
+        (500 ns).
     from_saved : bool, optional
         Load the map saved by 'compute_and_save_dcr_32' instead of
         re-unpacking the '.bin' files - use this to retry a colormap. The
@@ -479,16 +660,17 @@ def collect_and_plot_dcr_32(
     # the mask here (see daplis.functions.utils.apply_mask).
 
     print(
-        f"\n> > > Collecting DCR data for tag '{tag or 'all'}' and "
-        "plotting the heatmap and distribution < < <\n"
+        f"\n> > > Collecting DCR data for tag '{tag or 'all'}' "
+        f"(mode='{mode}') and plotting the heatmap and distribution < < <\n"
     )
 
     if from_saved:
         dcr, _ = store.load_map(path, kind=_KIND, tag=tag)
     else:
         dcr = compute_dcr_32(
-            path, nframes, exp_time, tag,
-            firmware_version=firmware_version, acq_window=acq_window,
+            path, nframes, exp_time_s, tag,
+            mode=mode, pileup_correct=pileup_correct,
+            firmware_version=firmware_version, open_shutter_time_s=open_shutter_time_s,
         )
         store.save_map(
             dcr,
@@ -496,10 +678,12 @@ def collect_and_plot_dcr_32(
             kind=_KIND,
             tag=tag,
             meta=_dcr_meta(
-                path, nframes, tag, exp_time, firmware_version, acq_window
+                path, nframes, tag, exp_time_s, firmware_version, open_shutter_time_s,
+                mode, pileup_correct,
             ),
             quiet=True,
         )
+        _warn_if_saturated(dcr, mode, pileup_correct, open_shutter_time_s)
 
     name = os.path.basename(os.path.normpath(path))
     tag_suffix = tag if tag else "dcr"
@@ -523,13 +707,15 @@ def collect_and_plot_dcr_32(
 def collect_and_plot_dcr_64(
     path: str,
     nframes: int,
-    exp_time: float | None = None,
+    exp_time_s: float | None = None,
     daughterboard_number: str | None = None,
     motherboard_number: str | None = None,
     cmap: str | None = None,
     *,
+    mode: str = "count",
+    pileup_correct: bool = False,
     firmware_version: str = "short_window",
-    acq_window: float | None = None,
+    open_shutter_time_s: float | None = 500e-9,
     from_saved: bool = False,
 ) -> np.ndarray:
     """Unpack, compute, and plot the (64, 64) full sensor DCR map.
@@ -543,7 +729,7 @@ def collect_and_plot_dcr_64(
         Path to the folder with the '.bin' data files.
     nframes : int
         Number of frames stored in each '.bin' file.
-    exp_time : float | None, optional
+    exp_time_s : float | None, optional
         Value passed to Kelpie_v2.exe, in seconds. See
         'compute_dcr_64' for details. The default is None.
     daughterboard_number : str | None, optional
@@ -558,12 +744,17 @@ def collect_and_plot_dcr_64(
     cmap : str | None, optional
         Matplotlib colormap name for the heatmap. The default is None —
         use the active style's ``image.cmap``.
+    mode : str, optional
+        ``'count'`` (default) or ``'timestamp'``; see 'compute_dcr_32'.
+    pileup_correct : bool, optional
+        ``'timestamp'`` mode only; see 'compute_dcr_32'. The default is False.
     firmware_version : str, optional
         ``'short_window'`` (default) or ``'full_window'``; see
         'resolve_live_time'.
-    acq_window : float | None, optional
+    open_shutter_time_s : float | None, optional
         Photon-sensitive window per frame, in seconds (required for
-        ``firmware_version='short_window'``). The default is None.
+        ``firmware_version='short_window'``). The default is ``500e-9``
+        (500 ns).
     from_saved : bool, optional
         Load the map saved by 'compute_and_save_dcr_64' instead of
         re-unpacking the '.bin' files. The default is False, which computes
@@ -581,16 +772,17 @@ def collect_and_plot_dcr_64(
     # the mask here (see daplis.functions.utils.apply_mask).
 
     print(
-        "\n> > > Collecting DCR data for the full sensor and plotting "
-        "the heatmap and distribution < < <\n"
+        f"\n> > > Collecting DCR data for the full sensor (mode='{mode}') "
+        "and plotting the heatmap and distribution < < <\n"
     )
 
     if from_saved:
         dcr, _ = store.load_map(path, kind=_KIND, tag="64")
     else:
         dcr = compute_dcr_64(
-            path, nframes, exp_time,
-            firmware_version=firmware_version, acq_window=acq_window,
+            path, nframes, exp_time_s,
+            mode=mode, pileup_correct=pileup_correct,
+            firmware_version=firmware_version, open_shutter_time_s=open_shutter_time_s,
         )
         store.save_map(
             dcr,
@@ -598,10 +790,12 @@ def collect_and_plot_dcr_64(
             kind=_KIND,
             tag="64",
             meta=_dcr_meta(
-                path, nframes, "64", exp_time, firmware_version, acq_window
+                path, nframes, "64", exp_time_s, firmware_version, open_shutter_time_s,
+                mode, pileup_correct,
             ),
             quiet=True,
         )
+        _warn_if_saturated(dcr, mode, pileup_correct, open_shutter_time_s)
 
     name = os.path.basename(os.path.normpath(path))
     results_dir = store.results_dir(path, _KIND, create=False)

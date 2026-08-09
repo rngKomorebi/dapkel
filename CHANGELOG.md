@@ -5,6 +5,126 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-09
+
+### Changed
+
+- **BREAKING: nothing assumes a 10 MHz reference clock any more.** The ring
+  oscillator sets the TDC code width (~71.6 ps, `core.timing.CODE_S`) and the
+  *reference clock* sets the full scale, so the number of codes scales as 1/f —
+  measured on the 2026-08-07 rate-vs-clock set as 275 codes at 50 MHz, 1379 at
+  10 MHz, 2761 at 5 MHz and 6914 at 2 MHz, i.e. 1/f to within 2 %. The old
+  `_PERIOD_PS = 100_000.0`, `_MAX_CODES = 1536`, `osc_period_ps = 100000.0` and
+  `_SUPPORT_PS = 200000.0` constants are gone. Both stage-1 entry points
+  (`calculate_and_save_timestamp_differences`, `calculate_and_save_delta_counts`)
+  and every `tdc_calibration` entry point now take **`open_shutter_time_s`** —
+  one reference-clock period, in seconds — with no default, because the TDC's
+  full scale *is* that window and nothing downstream is right without it.
+- **BREAKING: every time parameter is in seconds, named with an `_s` suffix.**
+  `bin_width_ps` → `bin_width_s`, `plot_window_ps` → `plot_window_s`,
+  `fit_window_ps` → `fit_window_s`, `time_unit_ps` → `time_unit_s`,
+  `support_ps` → `support_s`, `grid_ps` → `grid_s`,
+  `peak_window_ps` → `peak_window_s`, `zoom_window_ps` → `zoom_window_s`,
+  `window_ps` → `window_s`, `period_ps` → `open_shutter_time_s`,
+  `acq_window` → `open_shutter_time_s`, `exp_time` → `exp_time_s`,
+  `frame_time` → `frame_time_s`, `live_time` → `live_time_s`. There is no
+  compatibility shim: an old keyword raises `TypeError` naming the new one,
+  which is far safer than silently reading `10e3` as 10 000 seconds. Histogram
+  bin centres, edges and plot axes stay in picoseconds — that is the scale the
+  TDC lives on — and the conversion happens on entry.
+- **BREAKING: `osc_period_ps` is replaced by `full_scale_s`** on both plot
+  drivers, resolved through `core.timing.resolve_tdc_full_scale_s`: from the
+  calibration LUT first (a LUT is self-describing — its largest entry *is* the
+  full scale it was built for), then an explicit `full_scale_s`, then
+  `open_shutter_time_s` with a warning. That last fallback is only right when
+  the shutter is exactly one clock period; a longer shutter folds the timestamps
+  into the clock period, which is why the 2026-08-05 run showed a ±100 ns
+  triangle behind a 500 ns shutter.
+- **BREAKING: `calc_diff.calculate_differences(delta_window=...)` is now
+  `delta_window_native=...`**, and it is deliberately *not* in seconds: it is
+  compared against `pixel_timestamps`, which are ps with a LUT and raw codes
+  without, so the unit is the caller's to know. The drivers take
+  `delta_window_s` and convert. Same for
+  `background_subtraction.compute_lagged_differences`.
+- **BREAKING: renamed keys in returned dicts and `.meta.json` sidecars** —
+  `granularity_ps` → `granularity_s`, `cell_ps` → `cell_s`,
+  `grid_ps` → `grid_s`, `support_ps` → `support_s`, `window_ps` → `window_s`,
+  `bin_width_ps` → `bin_width_s`, and `time_unit_ps`/`bin_width_ps`/
+  `plot_window_ps` inside the histogram signature. Every cached
+  `*_delta_hist.npy` and `*_delta_counts.npy` is therefore invalidated and will
+  re-stream once; that is the intended behaviour, since the values themselves
+  changed unit.
+- **`_TS_CODE_PS` corrected from 77.0 ps to the measured ~71.58 ps**
+  (`core.timing.CODE_S`), and documented as clock-*independent*: 77.0 came from
+  dividing 100 ns by a rounded "~1300 codes", and was 7.5 % high. This changes
+  the time axis of any uncalibrated (`unit='code'`) histogram.
+- LUTs written by `collect_and_save_luts` now carry the window in the file name
+  (`TDC_LUT_SPAD0_S0_500ns.npy`) so per-clock calibrations coexist in one
+  folder, and record `open_shutter_time_s` / `full_scale_s` in the sidecar.
+
+### Fixed
+
+- **`dcr_analysis` read timestamping data as if it were counting data**, which
+  overstated the DCR by 40-50x. Every entry point summed the `photon_counts`
+  field, but under the `S*T` / `ORT` programs there is no photon counter —
+  `unpack` returns the low bits of the coarse timestamp in that slot (it says
+  so, and `hitmap_analysis` already honoured it). On the 2026-08-07 `DCR_S0T`
+  run at 24 V this gave a median of 247 kcps, nearly twice the 125 kcps that
+  one hit per 8 µs frame physically allows; the correct occupancy reading is
+  5.9 kcps. Nothing flagged it, because a map scaled by ~45 still looks like a
+  DCR map.
+- **A calibration LUT from the wrong reference clock was silently discarding
+  most of the data.** `_structure_pixel_timestamps` dropped any code past the
+  LUT's range to NaN with no count and no warning — the comment said "treat them
+  as invalid rather than indexing out of bounds", which is safe but mute. On the
+  2026-08-07 2 MHz data the packaged 10 MHz LUT keeps 21 % of the singles, and
+  since a coincidence needs both arms, ~4 % of the coincidences; the surviving
+  peak still looks entirely plausible. Now `load_lut` / `load_board_lut` raise at
+  load time when the LUT's own full scale does not match `open_shutter_time_s`,
+  and `_structure_pixel_timestamps` warns with the discarded fraction, the
+  largest code seen and the implied coincidence loss if a mismatched LUT ever
+  gets that far.
+- **Reusing a saved histogram always reported "0 differences in the window".**
+  The message read `meta.get('n', 0)`, but `n` lives at `meta["stats"]["n"]`.
+  Cosmetic — the `info` dict two lines later was already correct.
+
+### Added
+
+- **`mode` on every `dcr_analysis` entry point** — `'count'` (default, `S*C` /
+  `ORC`) sums the photon counter, `'timestamp'` (`S*T` / `ORT`) counts the
+  frames carrying a valid timestamp, matching `hitmap_analysis`. It also
+  selects which quadrant files `compute_dcr_64` globs (`S0T`...`S3T` vs
+  `S0C`...`S3C`), and is recorded in the `.meta.json` sidecar.
+- **A tag/mode cross-check.** `tag='S0T'` with `mode='count'` is now a
+  `ValueError` naming the correct mode, rather than a plausible-looking map
+  with the wrong numbers on it.
+- **`pileup_correct` for timestamp mode.** Timestamping records at most one
+  count per frame, so the raw rate saturates at `1 / open_shutter_time_s`
+  (125 kcps at an 8 µs shutter) and under-reports well before that — the
+  hottest pixel of the 24 V run sits at 60 % of the ceiling and reads 76 kcps
+  instead of 117 kcps. `pileup_correct=True` inverts the Poisson censoring,
+  `r = -ln(1 - p) / open_shutter_time_s`. Off by default; the drivers print a
+  warning naming the ceiling whenever the map gets within 5 % of it.
+- `tests/test_dcr_modes.py` — pins the field each mode reads, the tag/mode
+  check, and the pile-up inversion against known Poisson rates.
+- **`core.timing` is now the home of the ORT timing scale**, alongside the
+  live-time helpers: `CODE_S` (the ring's ~71.6 ps LSB, with the measurement it
+  comes from), `COARSE_BITS` / `MAX_TS_CODE`, `to_ps` / `to_s`,
+  `codes_for_full_scale` and `resolve_tdc_full_scale_s`. It also documents the
+  distinction that caused the confusion: the **open shutter time** is the
+  photon-sensitive window, the **TDC full scale** is one clock period, and they
+  coincide only when the shutter is one period.
+- **The reference clock has a floor.** `unpack` builds the code as
+  `(coarse - 1) * 8 + (8 - fine)` from a 10-bit coarse field, so it saturates at
+  8184 codes ≈ 586 ns: below ~1.7 MHz the counter wraps and the timestamps are
+  meaningless. 2 MHz already uses 85 % of it. `codes_for_full_scale` warns when
+  a requested full scale exceeds this.
+- `tdc_calibration.lut_full_scale_s(lut)` — read a LUT's own full scale back out
+  of it, which is the trustworthy source for the triangle half-base.
+- `compute_code_histogram` sizes its code axis from `open_shutter_time_s` and its
+  overflow warning now names the fraction lost and the largest code seen, rather
+  than only the bound it exceeded.
+
 ## [0.2.0] - 2026-08-05
 
 ### Added

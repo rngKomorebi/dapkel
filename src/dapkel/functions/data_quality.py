@@ -5,7 +5,8 @@ you spend time on analysis: did the TDC actually record timing?
 
 The failure mode is silent. When the TDC never stops, 'unpack' still returns a
 full array of plausible integers and every downstream analysis still runs on
-meaningless data. Healthy codes spread over the full ~0..1300 oscillator range;
+meaningless data. Healthy codes spread over the full code range of the clock in use
+(~279 codes at 50 MHz, ~1397 at 10 MHz, ~6985 at 2 MHz);
 a broken run collapses onto a handful of values.
 
 See ``docs/guide/data_quality.md``.
@@ -89,14 +90,15 @@ def plot_time_code_histogram(
     nframes: int,
     tag: str = "ORT",
     bins: int | np.ndarray = 256,
-    time_unit_ps: float | None = None,
+    time_unit_s: float | None = None,
     max_files: int | None = None,
 ) -> tuple[plt.Figure, np.ndarray]:
     """Histogram one pixel's TDC codes over all frames (QA / jitter view).
 
     Mirrors the ``Kelpie_run.m`` timestamp inspection. Useful to confirm, on a
     fresh acquisition, that the timing is populated (codes should span the full
-    0..~1300 oscillator range, not collapse onto a few values).
+    full code range for the reference clock in use - ~279 codes at 50 MHz,
+    ~1397 at 10 MHz, ~6985 at 2 MHz - not collapse onto a few values).
 
     Parameters
     ----------
@@ -110,8 +112,9 @@ def plot_time_code_histogram(
         Filename fragment selecting the files. The default is ``'ORT'``.
     bins : int | np.ndarray, optional
         Bins for ``np.histogram``. The default is 256.
-    time_unit_ps : float | None, optional
-        Picoseconds per code for the x-axis; None (default) keeps raw codes.
+    time_unit_s : float | None, optional
+        Seconds per code for the x-axis (the axis itself is drawn in ps); None
+        (default) keeps raw codes.
     max_files : int | None, optional
         Process at most this many files. The default is None.
 
@@ -127,8 +130,8 @@ def plot_time_code_histogram(
         folder, (r, c), nframes=nframes, tag=tag, max_files=max_files
     )[(r, c)]
 
-    scale = time_unit_ps if time_unit_ps else 1.0
-    unit = "ps" if time_unit_ps else "TDC code"
+    scale = time_unit_s * 1e12 if time_unit_s else 1.0
+    unit = "ps" if time_unit_s else "TDC code"
 
     fig, ax = plt.subplots()
     if codes.size:

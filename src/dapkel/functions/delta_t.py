@@ -18,7 +18,21 @@ background) is valid only on a narrow window around the peak, and a flat fit
 over a wide one inflates the fitted sigma. Or do not model it at all:
 ``subtract_background=True`` measures it from frame-shifted pairs and subtracts
 it, leaving the peak on a zero baseline
-('dapkel.functions.background_subtraction', ``docs/guide/background_subtraction.md``).
+('dapkel.functions.background_subtraction',
+``docs/guide/background_subtraction.md``).
+
+The triangle's half-base is the **TDC full scale**, which is one period of the
+reference clock - 20 ns at 50 MHz, 100 ns at 10 MHz, 500 ns at 2 MHz - so it is
+not a constant and neither is the number of TDC codes. Every entry point here
+takes ``open_shutter_time_s`` (or ``full_scale_s``) rather than assuming 100 ns,
+and the calibration LUT is checked against it: feeding a 10 MHz LUT to a 2 MHz
+run discards every code past 100 ns, which is 79 % of the singles and 96 % of the
+coincidences, and the surviving peak still looks plausible.
+
+UNITS: every time parameter in this module is in **seconds** and named with an
+``_s`` suffix, per 'dapkel.core.timing'. Histogram edges, bin centres and plot
+axes are in picoseconds - that is the scale the TDC lives on - and the
+conversion happens on entry with 'timing.to_ps'.
 
 Check a fresh acquisition with 'dapkel.functions.data_quality' first.
 See ``docs/guide/coincidences.md`` and ``docs/ort_triangle_background.md``.
@@ -32,6 +46,7 @@ import hashlib
 import json
 import os
 import time
+import warnings
 from collections.abc import Iterator, Sequence
 
 import matplotlib.pyplot as plt
@@ -42,7 +57,7 @@ import pyarrow.compute as pc
 from scipy.optimize import curve_fit
 from tqdm import tqdm
 
-from dapkel.core import io, store
+from dapkel.core import io, store, timing
 
 # 'core.pairs' is aliased because half the functions here take a 'pairs'
 # argument (pixel-pair *labels* to pool), which would shadow the module.
@@ -79,9 +94,14 @@ __all__ = [
 #: Analysis name: the results sub-folder for the figures.
 _KIND = "coincidences"
 
-# Average raw-code -> picosecond conversion: ~100 ns oscillator period over
-# ~1300 codes. Replace with a per-code LUT (density test) via 'time_lut'.
-_TS_CODE_PS = 77.0
+# Average raw-code -> picosecond conversion, for uncalibrated code data.
+#
+# This is the ring oscillator's own LSB, so it does NOT change with the
+# reference clock - only the number of codes per full scale does (see
+# 'core.timing.CODE_S' for the measurement). Replace it with a per-code LUT
+# (density test) via 'time_lut' whenever one exists: the ring's DNL is large
+# enough that the average is only ever a placeholder.
+_TS_CODE_PS = timing.to_ps(timing.CODE_S)
 
 # Size cap for one part file, in MB. Chosen against what else is resident
 # during the loop rather than in the abstract: 'unpack' already holds a
@@ -146,12 +166,16 @@ _COUNTS_SUFFIX = "_delta_counts.npy"
 # subdivision - they *are* integers - so this applies to 'ps' data only.
 _GRID_SUBDIV = 10
 
-# Default half-range of the counts grid, in ps. A difference cannot exceed one
-# oscillator period, so a grid this wide holds the entire physical support and
-# the window only ever gets narrowed afterwards, in memory. Widen it for a
-# longer period; anything landing outside is counted in 'n_outside' rather
-# than silently dropped.
-_SUPPORT_PS = 200000.0
+# Multiple of the TDC full scale used as the default half-range of the counts
+# grid. A difference cannot exceed the full scale, so 2x holds the entire
+# physical support with room for a wrapped or mis-stated one, and the window
+# only ever gets narrowed afterwards, in memory. Anything landing outside is
+# counted in 'n_outside' rather than silently dropped.
+#
+# It is a *multiple*, not a fixed span, because the full scale is one
+# reference-clock period: 20 ns at 50 MHz, 500 ns at 2 MHz. A fixed 200 ns grid
+# was 10x too wide for the one and 2.5x too narrow for the other.
+_SUPPORT_FULL_SCALES = 2.0
 
 # Files between checkpoint writes during the counts pass. The whole grid is
 # rewritten each time, which costs one ~100 MB write - cheap against unpacking
@@ -159,6 +183,43 @@ _SUPPORT_PS = 200000.0
 # every file up to its last checkpoint. This replaces the part folder: there
 # is only ever one file, so two runs cannot interleave.
 _FLUSH_EVERY = 50
+
+# Fraction of valid timestamps that may fall outside a LUT's code range before
+# '_structure_pixel_timestamps' warns. Any overflow at all means the LUT was
+# built for a different reference clock, but a handful of codes can sit past the
+# populated tail of a legitimate table, so the alarm is on the *rate*: 1 % is far
+# above that tail and far below the 79 % a 10 MHz LUT loses on a 2 MHz run.
+_LUT_OVERFLOW_WARN_FRACTION = 0.01
+
+
+def _native_window(window_s: float | None, unit: str) -> float | None:
+    """Convert a time window into the unit the timestamps are stored in.
+
+    Parameters
+    ----------
+    window_s : float | None
+        Half-width in seconds, or None for "no window".
+    unit : str
+        ``'ps'`` when a calibration LUT has been applied, ``'code'`` for raw
+        TDC codes.
+
+    Returns
+    -------
+    float | None
+        The window in picoseconds or in codes, or None.
+
+    Raises
+    ------
+    ValueError
+        Raised when ``unit`` is neither ``'ps'`` nor ``'code'``.
+    """
+    if window_s is None:
+        return None
+    if unit == "ps":
+        return timing.to_ps(window_s)
+    if unit == "code":
+        return float(window_s) / timing.CODE_S
+    raise ValueError(f"unit must be 'ps' or 'code', got {unit!r}")
 
 
 def _structure_pixel_timestamps(
@@ -199,9 +260,22 @@ def _structure_pixel_timestamps(
         Mapping ``(row, col) -> 1D float array`` of per-frame timestamps
         (codes, or ps if ``time_lut`` given), NaN where the pixel had no
         photon that frame.
+
+    Warns
+    -----
+    UserWarning
+        Raised when more than 1 % of the valid timestamps fall past the LUT's
+        code range - the signature of a LUT built for a different reference
+        clock. This used to be silent, and silence is expensive here: a 10 MHz
+        LUT on a 2 MHz run drops 79 % of the singles, hence 96 % of the
+        coincidences, and the surviving peak still looks entirely plausible.
     """
     per_pixel_lut = time_lut is not None and time_lut.ndim == 3
     n_codes = time_lut.shape[-1] if time_lut is not None else 0
+
+    n_valid = 0
+    n_over = 0
+    code_max = 0
 
     out: dict[Pixel, np.ndarray] = {}
     for r, c in pixels:
@@ -210,14 +284,35 @@ def _structure_pixel_timestamps(
         if time_lut is not None:
             idx = code.astype(np.int64)
             # Codes past the calibrated range have no LUT entry; treat them
-            # as invalid rather than indexing out of bounds.
+            # as invalid rather than indexing out of bounds - but count them,
+            # because "past the range" means "wrong calibration", not "noise".
             usable = valid & (idx >= 0) & (idx < n_codes)
+            over = valid & (idx >= n_codes)
+            n_valid += int(valid.sum())
+            n_over += int(over.sum())
+            if over.any():
+                code_max = max(code_max, int(idx[over].max()))
             lut_pix = time_lut[r, c] if per_pixel_lut else time_lut
             vals = np.full(code.shape, np.nan)
             vals[usable] = lut_pix[idx[usable]]
         else:
             vals = np.where(valid, code, np.nan)
         out[(r, c)] = vals
+
+    if n_over and n_over > _LUT_OVERFLOW_WARN_FRACTION * max(n_valid, 1):
+        frac = n_over / max(n_valid, 1)
+        warnings.warn(
+            f"Discarded {n_over} of {n_valid} timestamps ({100 * frac:.1f} %) "
+            f"whose code exceeds the LUT's {n_codes} entries "
+            f"({timing.to_s(float(time_lut.max())) * 1e9:.1f} ns full scale); "
+            f"the largest was {code_max}, i.e. "
+            f"~{code_max * timing.CODE_S * 1e9:.0f} ns. This LUT belongs to a "
+            "different reference clock. Coincidences need both arms in range, "
+            f"so only ~{100 * (1 - frac) ** 2:.0f} % of them survive. "
+            "Calibrate this clock and pass the matching open_shutter_time_s.",
+            UserWarning,
+            stacklevel=2,
+        )
     return out
 
 
@@ -272,9 +367,10 @@ def calculate_and_save_timestamp_differences(
     rewrite: bool = False,
     *,
     nframes: int,
+    open_shutter_time_s: float,
     tag: str = "ORT",
     mode: str = "all_pairs",
-    delta_window: float | None = None,
+    delta_window_s: float | None = None,
     apply_TDC_calibration: bool = True,
     daughterboard_number: str | None = None,
     motherboard_number: str | None = None,
@@ -333,15 +429,22 @@ def calculate_and_save_timestamp_differences(
         Ctrl-C.
     nframes : int
         Number of frames stored in each '.bin' file.
+    open_shutter_time_s : float
+        Open shutter time, i.e. one reference-clock period, in seconds (e.g.
+        ``100e-9`` at 10 MHz, ``500e-9`` at 2 MHz). Selects and validates the
+        calibration LUT, and converts ``delta_window_s`` into raw code units
+        when no LUT is applied. There is no default: the TDC's full scale is
+        this window, so nothing downstream is right without it.
     tag : str, optional
         Filename fragment selecting the files. The default is ``'ORT'``.
     mode : str, optional
         ``'all_pairs'`` (default) or ``'1v1'``; see
         'calc_diff.calculate_differences'.
-    delta_window : float | None, optional
-        Keep only differences with ``abs(delta) <= delta_window`` while
-        accumulating (bounds memory). In code units, or ps if ``time_lut``
-        is given. The default is None (keep all).
+    delta_window_s : float | None, optional
+        Keep only differences with ``abs(delta) <= delta_window_s`` while
+        accumulating (bounds memory), in seconds. Converted to whichever unit
+        the timestamps are in - ps with a LUT, raw codes without, using
+        'core.timing.CODE_S'. The default is None (keep all).
     apply_TDC_calibration : bool, optional
         Apply the density-test TDC calibration (per-pixel code -> ps LUT)
         before differencing, so the saved ``delta_ps`` is already calibrated.
@@ -441,7 +544,10 @@ def calculate_and_save_timestamp_differences(
     if apply_TDC_calibration:
         if daughterboard_number is not None and motherboard_number is not None:
             time_lut = tc.load_board_lut(
-                daughterboard_number, motherboard_number, spad
+                daughterboard_number,
+                motherboard_number,
+                spad,
+                open_shutter_time_s=open_shutter_time_s,
             )
         else:
             raise ValueError(
@@ -451,6 +557,9 @@ def calculate_and_save_timestamp_differences(
             )
 
     unit = "ps" if time_lut is not None else "code"
+    # The window is a time; the timestamps are ps with a LUT and raw codes
+    # without, so convert it into whichever unit the differences will be in.
+    delta_window_native = _native_window(delta_window_s, unit)
 
     # Build the stable, ordered list of pair labels up front (matching the
     # keys 'calculate_differences' produces) so every requested pair gets a
@@ -486,7 +595,7 @@ def calculate_and_save_timestamp_differences(
             deltas = {}
             for k in lags:
                 lagged = bs.compute_lagged_differences(
-                    pixel_ts, pixels, delta_window, mode, frame_lag=k
+                    pixel_ts, pixels, delta_window_native, mode, frame_lag=k
                 )
                 deltas.update(
                     {_lag_column(lbl, k): arr for lbl, arr in lagged.items()}
@@ -495,7 +604,10 @@ def calculate_and_save_timestamp_differences(
             # Left as it was: lag 0 is tested to be identical to this, but the
             # plain path has no reason to route through the lag machinery.
             deltas = cd.calculate_differences(
-                pixel_ts, pixels, delta_window=delta_window, mode=mode
+                pixel_ts,
+                pixels,
+                delta_window_native=delta_window_native,
+                mode=mode,
             )
         writer.add(deltas)
     parts = writer.close()
@@ -1357,10 +1469,24 @@ def _locate_delta_target(
     )
 
 
-def _delta_hist_edges(
-    bin_width_ps: float, plot_window_ps: float
-) -> np.ndarray:
-    """Histogram bin edges: bins centred on 0, spanning +/- the window."""
+def _delta_hist_edges(bin_width_s: float, plot_window_s: float) -> np.ndarray:
+    """Histogram bin edges in **ps**: bins centred on 0, spanning +/- window.
+
+    Parameters
+    ----------
+    bin_width_s : float
+        Bin width in seconds.
+    plot_window_s : float
+        Half-range in seconds.
+
+    Returns
+    -------
+    np.ndarray
+        The bin edges, in picoseconds - the unit every histogram axis and fit
+        in this module works in.
+    """
+    bin_width_ps = timing.to_ps(bin_width_s)
+    plot_window_ps = timing.to_ps(plot_window_s)
     return np.arange(
         -plot_window_ps - bin_width_ps / 2,
         plot_window_ps + bin_width_ps,
@@ -1371,9 +1497,9 @@ def _delta_hist_edges(
 def _hist_signature(
     sources: Sequence[str],
     *,
-    time_unit_ps: float,
-    bin_width_ps: float,
-    plot_window_ps: float,
+    time_unit_s: float,
+    bin_width_s: float,
+    plot_window_s: float,
     pairs: Sequence[str] | None,
     lags: Sequence[int] | None = None,
 ) -> dict:
@@ -1390,9 +1516,9 @@ def _hist_signature(
             f"{os.path.basename(src)}:{st.st_size}:{st.st_mtime_ns};".encode()
         )
     signature = {
-        "time_unit_ps": float(time_unit_ps),
-        "bin_width_ps": float(bin_width_ps),
-        "plot_window_ps": float(plot_window_ps),
+        "time_unit_s": float(time_unit_s),
+        "bin_width_s": float(bin_width_s),
+        "plot_window_s": float(plot_window_s),
         "pairs": None if pairs is None else sorted(pairs),
         "n_sources": len(sources),
         "sources_digest": digest.hexdigest(),
@@ -1521,8 +1647,8 @@ def _stream_delta_histogram(
     sources: Sequence[str],
     *,
     edges: np.ndarray,
-    time_unit_ps: float,
-    plot_window_ps: float,
+    time_unit_s: float,
+    plot_window_s: float,
     pairs: Sequence[str] | None = None,
     lags: Sequence[int] | None = None,
     quiet: bool = False,
@@ -1546,11 +1672,11 @@ def _stream_delta_histogram(
     sources : Sequence[str]
         Delta-t feathers to pool. Their columns need not match.
     edges : np.ndarray
-        Histogram bin edges, from '_delta_hist_edges'.
-    time_unit_ps : float
-        Picoseconds per raw TDC code, applied when the unit is ``'code'``.
-    plot_window_ps : float
-        Only differences with ``abs(delta_ps) <= plot_window_ps`` are counted.
+        Histogram bin edges in ps, from '_delta_hist_edges'.
+    time_unit_s : float
+        Seconds per raw TDC code, applied when the unit is ``'code'``.
+    plot_window_s : float
+        Only differences within ``+/- plot_window_s`` are counted.
     pairs : Sequence[str] | None, optional
         Restrict pooling to these pixel-pair columns. The default is None
         (pool every pair column). Frame-shifted columns are never included
@@ -1571,11 +1697,15 @@ def _stream_delta_histogram(
     stats : dict
         ``unit``, ``n`` (differences inside the window), ``total`` (real
         differences seen), ``slots`` (table cells read, padding included),
-        ``padding_fraction``, ``granularity_ps`` (smallest non-zero
-        ``abs(delta_ps)``, for the comb guard), ``n_columns`` and ``missing``.
+        ``padding_fraction``, ``granularity_s`` (smallest non-zero
+        ``abs(delta)`` in seconds, for the comb guard), ``n_columns`` and
+        ``missing``.
         With ``lags``, ``n`` and ``total`` count the lag-0 row only - they
         describe the measurement, not the bookkeeping around it.
     """
+    time_unit_ps = timing.to_ps(time_unit_s)
+    plot_window_ps = timing.to_ps(plot_window_s)
+
     if lags is None:
         groups, unit, missing = _pooled_columns(sources, pairs)
         groups = [groups]
@@ -1651,8 +1781,8 @@ def _stream_delta_histogram(
         "total": int(total),
         "slots": int(slots),
         "padding_fraction": (1.0 - total / slots) if slots else 0.0,
-        "granularity_ps": (
-            float(granularity_ps) if np.isfinite(granularity_ps) else None
+        "granularity_s": (
+            timing.to_s(granularity_ps) if np.isfinite(granularity_ps) else None
         ),
         "n_columns": len(groups[0]) if groups else 0,
         "missing": list(missing),
@@ -1667,9 +1797,9 @@ def compute_and_save_delta_histogram(
     path: str | None = None,
     *,
     feather_path: str | None = None,
-    time_unit_ps: float = _TS_CODE_PS,
-    bin_width_ps: float = _TS_CODE_PS,
-    plot_window_ps: float = 3000.0,
+    time_unit_s: float = timing.CODE_S,
+    bin_width_s: float = timing.CODE_S,
+    plot_window_s: float = 3e-9,
     pairs: Sequence[str] | None = None,
     subtract_background: bool = False,
     reuse: bool = True,
@@ -1685,12 +1815,12 @@ def compute_and_save_delta_histogram(
 
     The saved histogram is *lossless for everything downstream*: both fit
     models take ``(bin_centers, counts)``, and so does the plot. Binning at
-    ``bin_width_ps=_TS_CODE_PS`` (one TDC code) is the native resolution of
+    ``bin_width_s=timing.CODE_S`` (one TDC code) is the native resolution of
     the data, so nothing is thrown away at the default settings.
 
     The sidecar records the binning and a fingerprint of the sources; a saved
     histogram is only reused when all of it matches, so changing
-    ``bin_width_ps``, ``plot_window_ps``, ``time_unit_ps`` or ``pairs`` - or
+    ``bin_width_s``, ``plot_window_s``, ``time_unit_s`` or ``pairs`` - or
     rewriting the feather - re-streams automatically.
 
     Parameters
@@ -1702,13 +1832,14 @@ def compute_and_save_delta_histogram(
         Explicit delta-t '.feather' to read, or a ``*_delta_t_parts`` folder
         to read the parts directly (which skips needing the combined file at
         all). When given, ``path`` is ignored. The default is None.
-    time_unit_ps : float, optional
-        Picoseconds per raw TDC code, applied to a ``'code'`` feather. The
-        default is ~77 ps.
-    bin_width_ps : float, optional
-        Histogram bin width in ps. The default is ~77 ps (one code).
-    plot_window_ps : float, optional
-        Histogram half-range in ps around zero. The default is 3000.0.
+    time_unit_s : float, optional
+        Seconds per raw TDC code, applied to a ``'code'`` feather. The default
+        is 'core.timing.CODE_S' (~71.6 ps), which is clock-independent.
+    bin_width_s : float, optional
+        Histogram bin width in seconds. The default is one TDC code.
+    plot_window_s : float, optional
+        Histogram half-range in seconds around zero. The default is ``3e-9``
+        (3 ns).
     pairs : Sequence[str] | None, optional
         Restrict pooling to these pixel-pair column names. The default is
         None (pool every pair column). Frame-shifted columns are never pooled
@@ -1753,12 +1884,12 @@ def compute_and_save_delta_histogram(
         )
     lags = lag_meta["lags"] if lag_meta else None
 
-    edges = _delta_hist_edges(bin_width_ps, plot_window_ps)
+    edges = _delta_hist_edges(bin_width_s, plot_window_s)
     signature = _hist_signature(
         sources,
-        time_unit_ps=time_unit_ps,
-        bin_width_ps=bin_width_ps,
-        plot_window_ps=plot_window_ps,
+        time_unit_s=time_unit_s,
+        bin_width_s=bin_width_s,
+        plot_window_s=plot_window_s,
         pairs=pairs,
         lags=lags,
     )
@@ -1782,9 +1913,12 @@ def compute_and_save_delta_histogram(
             and counts.shape[-1] == len(edges) - 1
         ):
             if not quiet:
+                # 'n' lives under 'stats', not at the top level - reading it
+                # from the wrong place made every cache hit report "0".
+                n_saved = meta.get("stats", {}).get("n", 0)
                 print(
                     f"\n> > > Reusing the saved delta-t histogram "
-                    f"({meta.get('n', 0)} differences in the window) from "
+                    f"({n_saved} differences in the window) from "
                     f"{os.path.basename(hist_path)} - pass reuse=False to "
                     "re-stream < < <"
                 )
@@ -1801,8 +1935,9 @@ def compute_and_save_delta_histogram(
     if not quiet:
         print(
             f"\n> > > Streaming {len(sources)} delta-t feather(s) into a "
-            f"{len(edges) - 1}-bin histogram ({bin_width_ps:.0f} ps bins, "
-            f"+/-{plot_window_ps:.0f} ps)"
+            f"{len(edges) - 1}-bin histogram "
+            f"({bin_width_s * 1e12:.0f} ps bins, "
+            f"+/-{plot_window_s * 1e9:.2f} ns)"
             + (f" at lags {lags}" if lags else "")
             + " < < <\n"
         )
@@ -1810,8 +1945,8 @@ def compute_and_save_delta_histogram(
     counts, stats = _stream_delta_histogram(
         sources,
         edges=edges,
-        time_unit_ps=time_unit_ps,
-        plot_window_ps=plot_window_ps,
+        time_unit_s=time_unit_s,
+        plot_window_s=plot_window_s,
         pairs=pairs,
         lags=lags,
         quiet=quiet,
@@ -1834,7 +1969,7 @@ def compute_and_save_delta_histogram(
         print(
             f"\n> > > {stats['total']} difference(s) across "
             f"{stats['n_columns']} pair column(s); {stats['n']} inside "
-            f"+/-{plot_window_ps:.0f} ps. Padding was "
+            f"+/-{plot_window_s * 1e9:.2f} ns. Padding was "
             f"{100 * stats['padding_fraction']:.1f}% of the cells read. "
             f"Histogram saved to {hist_path} < < <"
         )
@@ -1859,10 +1994,26 @@ def _resolve_time_lut(
     daughterboard_number: str | None,
     motherboard_number: str | None,
     spad: int | str,
+    open_shutter_time_s: float | None = None,
 ) -> np.ndarray | None:
     """Load the density-test LUT to apply before differencing, or None.
 
     Mirrors what 'calculate_and_save_timestamp_differences' does inline.
+
+    Parameters
+    ----------
+    apply_TDC_calibration : bool
+        False returns None, leaving raw codes in place.
+    daughterboard_number : str | None
+        Daughterboard id, e.g. ``'D0'``.
+    motherboard_number : str | None
+        Motherboard id, e.g. ``'M0'``.
+    spad : int | str
+        Which SPAD's LUT to use, as 'tdc_calibration.load_board_lut'.
+    open_shutter_time_s : float | None, optional
+        Open shutter time, i.e. one reference-clock period, in seconds. Passed
+        through so the loader can reject a LUT from a different clock. The
+        default is None.
 
     Returns
     -------
@@ -1882,30 +2033,33 @@ def _resolve_time_lut(
             "daughterboard_number and motherboard_number, or set "
             "apply_TDC_calibration=False to save raw codes."
         )
-    return tc.load_board_lut(daughterboard_number, motherboard_number, spad)
+    return tc.load_board_lut(
+        daughterboard_number,
+        motherboard_number,
+        spad,
+        open_shutter_time_s=open_shutter_time_s,
+    )
 
 
-def _delta_grid(
-    grid_ps: float, support_ps: float
-) -> tuple[int, int, np.ndarray]:
+def _delta_grid(grid_s: float, support_s: float) -> tuple[int, int, np.ndarray]:
     """Define the native counts grid: bins centred on zero, spanning support.
 
-    Bin ``i`` covers ``[(i - zero) - 0.5, (i - zero) + 0.5] * grid_ps``, so
+    Bin ``i`` covers ``[(i - zero) - 0.5, (i - zero) + 0.5] * grid``, so
     **zero sits at a bin centre by construction**. That is the one thing the
     feather path cannot promise: its edges come from
     ``arange(-W - w/2, ...)``, which only centres a bin on zero when the
     window is an exact multiple of the width.
 
-    For raw codes (``grid_ps`` = one code) the grid is not an approximation at
+    For raw codes (``grid_s`` = one code) the grid is not an approximation at
     all: ``delta_code`` is an integer, so counts-per-code carries exactly the
     information the feather did, at ~8 bytes per *bin* instead of per *event*.
 
     Parameters
     ----------
-    grid_ps : float
-        Width of one grid cell, in ps.
-    support_ps : float
-        Half-range to cover, in ps. Rounded up to a whole number of cells.
+    grid_s : float
+        Width of one grid cell, in seconds.
+    support_s : float
+        Half-range to cover, in seconds. Rounded up to a whole number of cells.
 
     Returns
     -------
@@ -1914,13 +2068,19 @@ def _delta_grid(
     zero_index : int
         Index of the cell holding zero.
     edges : np.ndarray
-        The ``n_bins + 1`` cell edges, in ps.
+        The ``n_bins + 1`` cell edges, in **ps**.
+
+    Raises
+    ------
+    ValueError
+        Raised when ``grid_s`` or ``support_s`` is not positive.
     """
-    if grid_ps <= 0:
-        raise ValueError(f"grid_ps must be positive, got {grid_ps}")
-    if support_ps <= 0:
-        raise ValueError(f"support_ps must be positive, got {support_ps}")
-    zero_index = int(np.ceil(support_ps / grid_ps))
+    if grid_s <= 0:
+        raise ValueError(f"grid_s must be positive, got {grid_s}")
+    if support_s <= 0:
+        raise ValueError(f"support_s must be positive, got {support_s}")
+    grid_ps = timing.to_ps(grid_s)
+    zero_index = int(np.ceil(support_s / grid_s))
     n_bins = 2 * zero_index + 1
     edges = (np.arange(n_bins + 1) - zero_index - 0.5) * grid_ps
     return n_bins, zero_index, edges
@@ -1932,10 +2092,10 @@ def _counts_signature(
     labels: Sequence[str],
     mode: str,
     nframes: int,
-    delta_window: float | None,
+    delta_window_s: float | None,
     unit: str,
-    grid_ps: float,
-    support_ps: float,
+    grid_s: float,
+    support_s: float,
     lags: Sequence[int] = (0,),
 ) -> dict:
     """Everything that must match for a partial counts run to be resumed.
@@ -1956,10 +2116,12 @@ def _counts_signature(
         "n_labels": len(labels),
         "mode": mode,
         "nframes": int(nframes),
-        "delta_window": None if delta_window is None else float(delta_window),
+        "delta_window_s": (
+            None if delta_window_s is None else float(delta_window_s)
+        ),
         "unit": unit,
-        "grid_ps": float(grid_ps),
-        "support_ps": float(support_ps),
+        "grid_s": float(grid_s),
+        "support_s": float(support_s),
     }
     # Added only when there are lags to record, so a plain (no-subtraction) run
     # produces the same signature it did before lags existed - and every
@@ -1974,7 +2136,7 @@ def _accumulate_delta_counts(
     deltas: dict[str, np.ndarray],
     rows: dict[str, int],
     *,
-    grid_ps: float,
+    grid_native: float,
     zero_index: int,
 ) -> tuple[int, int]:
     """Bin one file's differences into the resident counts grid, in place.
@@ -1982,6 +2144,21 @@ def _accumulate_delta_counts(
     'np.add.at' rather than 'np.bincount': bincount pays for the whole grid on
     every call, and a single file contributes a handful of differences per
     pair, so the fixed cost would dwarf the data by orders of magnitude.
+
+    Parameters
+    ----------
+    counts : np.ndarray
+        The resident ``(n_rows, n_bins)`` grid, updated in place.
+    deltas : dict[str, np.ndarray]
+        One file's differences per pair label.
+    rows : dict[str, int]
+        Pair label -> row index in ``counts``.
+    grid_native : float
+        Width of one grid cell **in the same unit as ``deltas``** - ps with a
+        calibration LUT, raw codes without. Not seconds: it divides the raw
+        difference values, so it has to share their unit.
+    zero_index : int
+        Index of the cell holding zero.
 
     Returns
     -------
@@ -2003,7 +2180,7 @@ def _accumulate_delta_counts(
         if not arr.size:
             continue
         total += int(arr.size)
-        idx = np.rint(arr / grid_ps).astype(np.int64) + zero_index
+        idx = np.rint(arr / grid_native).astype(np.int64) + zero_index
         keep = (idx >= 0) & (idx < n_bins)
         outside += int(arr.size - np.count_nonzero(keep))
         np.add.at(counts[row], idx[keep], 1)
@@ -2066,16 +2243,17 @@ def calculate_and_save_delta_counts(
     rewrite: bool = False,
     *,
     nframes: int,
+    open_shutter_time_s: float,
     tag: str = "ORT",
     mode: str = "all_pairs",
-    delta_window: float | None = None,
+    delta_window_s: float | None = None,
     apply_TDC_calibration: bool = True,
     daughterboard_number: str | None = None,
     motherboard_number: str | None = None,
     spad: int | str = "average",
     max_files: int | None = None,
-    grid_ps: float | None = None,
-    support_ps: float = _SUPPORT_PS,
+    grid_s: float | None = None,
+    support_s: float | None = None,
     subtract_background: bool = False,
     background_lags: int | Sequence[int] = bs.BACKGROUND_LAGS,
     flush_every: int = _FLUSH_EVERY,
@@ -2095,11 +2273,11 @@ def calculate_and_save_delta_counts(
     100-file run produce the same ~100 MB artifact, against 3-135 GB of
     feather. That is what makes every pair plottable at once, and it makes
     re-binning free: 'rebin_delta_counts' turns the grid into any coarser
-    histogram in memory, so ``bin_width_ps`` and ``plot_window_ps`` stop being
+    histogram in memory, so ``bin_width_s`` and ``plot_window_s`` stop being
     compute-time decisions.
 
     **What it gives up.** No per-event data survives, so there is no
-    re-calibrating with a different LUT, no re-cutting ``delta_window``, and
+    re-calibrating with a different LUT, no re-cutting ``delta_window_s``, and
     no analysis that needs individual differences (time ordering, splitting by
     acquisition, higher-order correlations). Keep the feather until you have
     decided you never want those.
@@ -2107,7 +2285,7 @@ def calculate_and_save_delta_counts(
     **How exact it is.** For raw codes (``apply_TDC_calibration=False``) the
     default grid is one code and the result is *lossless* - integers binned
     onto their own lattice. For calibrated data the LUT smears the lattice, so
-    each difference is displaced by up to ``grid_ps / 2`` (~3.85 ps at the
+    each difference is displaced by up to ``grid_s / 2`` (~3.6 ps at the
     default), which is far below the detector jitter but is not bit-exact
     against the feather.
 
@@ -2131,16 +2309,20 @@ def calculate_and_save_delta_counts(
         Number of frames stored in each '.bin' file. Part of the resume
         signature - it sets how much of each file is read, so a checkpoint
         only resumes against the same value.
+    open_shutter_time_s : float
+        Open shutter time, i.e. one reference-clock period, in seconds (e.g.
+        ``100e-9`` at 10 MHz, ``500e-9`` at 2 MHz). Selects and validates the
+        calibration LUT, and sets the default grid support - the TDC full scale
+        is this window, so the accidental triangle reaches exactly this far.
     tag : str, optional
         Filename fragment selecting the files. The default is ``'ORT'``.
     mode : str, optional
         ``'all_pairs'`` (default) or ``'1v1'``.
-    delta_window : float | None, optional
-        Keep only differences with ``abs(delta) <= delta_window``. In code
-        units, or ps if calibrating. The default is None (keep all). Note this
-        is frozen into the artifact - unlike the feather, it cannot be
-        narrowed afterwards, so prefer leaving it None and cutting at plot
-        time.
+    delta_window_s : float | None, optional
+        Keep only differences with ``abs(delta) <= delta_window_s``, in seconds.
+        The default is None (keep all). Note this is frozen into the artifact -
+        unlike the feather, it cannot be narrowed afterwards, so prefer leaving
+        it None and cutting at plot time.
     apply_TDC_calibration : bool, optional
         Apply the per-pixel code -> ps LUT before differencing. The default is
         True, which requires ``daughterboard_number`` and
@@ -2153,14 +2335,16 @@ def calculate_and_save_delta_counts(
         Which SPAD's LUT to use. The default is ``'average'``.
     max_files : int | None, optional
         Process at most this many files. The default is None (all files).
-    grid_ps : float | None, optional
-        Width of one grid cell, in ps. The default is None, meaning one TDC
-        code (~77 ps) for raw-code data - where that is exact - and one tenth
-        of a code (~7.7 ps) for calibrated data.
-    support_ps : float, optional
-        Half-range of the grid, in ps. The default is 200 000 (200 ns), one
-        oscillator period. Differences beyond it are counted in
-        ``n_outside``.
+    grid_s : float | None, optional
+        Width of one grid cell, in seconds. The default is None, meaning one
+        TDC code ('core.timing.CODE_S', ~71.6 ps) for raw-code data - where
+        that is exact - and one tenth of a code (~7.2 ps) for calibrated data.
+    support_s : float | None, optional
+        Half-range of the grid, in seconds. The default is None, which is twice
+        the TDC full scale - read off the LUT when there is one, else from
+        ``open_shutter_time_s``. A difference cannot exceed the full scale, so
+        that covers the whole physical support at any clock; differences beyond
+        it are counted in ``n_outside``.
     subtract_background : bool, optional
         Also histogram the differences between *frame-shifted* pixel pairs, so
         the accidental background can be measured rather than fitted. The
@@ -2168,9 +2352,9 @@ def calculate_and_save_delta_counts(
         When True the artifact gains a leading lag axis with lag 0 - the
         ordinary within-frame histogram, bin-for-bin identical to the 2D one -
         as plane 0; see 'dapkel.functions.background_subtraction' and
-        ``docs/guide/background_subtraction.md``. Costs one plane of grid per lag and one
-        differencing pass per lag; the '.bin' decoding, which dominates the
-        loop, is paid once either way.
+        ``docs/guide/background_subtraction.md``. Costs one plane of grid per
+        lag and one differencing pass per lag; the '.bin' decoding, which
+        dominates the loop, is paid once either way.
     background_lags : int | Sequence[int], optional
         Frame offsets used for the accidental estimate when
         ``subtract_background`` is True. The default is ``(1, ..., 8)``. A bare
@@ -2204,18 +2388,37 @@ def calculate_and_save_delta_counts(
 
     labels, all_pixels = pixel_pairs.pair_labels(pixels, mode)
     time_lut = _resolve_time_lut(
-        apply_TDC_calibration, daughterboard_number, motherboard_number, spad
+        apply_TDC_calibration,
+        daughterboard_number,
+        motherboard_number,
+        spad,
+        open_shutter_time_s,
     )
     unit = "ps" if time_lut is not None else "code"
 
-    if grid_ps is None:
-        grid_ps = (
-            _TS_CODE_PS / _GRID_SUBDIV if unit == "ps" else _TS_CODE_PS
+    if grid_s is None:
+        grid_s = (
+            timing.CODE_S / _GRID_SUBDIV if unit == "ps" else timing.CODE_S
         )
-    # In code units the grid and the support are counts of codes, not ps.
-    grid = grid_ps if unit == "ps" else grid_ps / _TS_CODE_PS
-    support = support_ps if unit == "ps" else support_ps / _TS_CODE_PS
-    n_bins, zero_index, _ = _delta_grid(grid, support)
+    if support_s is None:
+        # The support is a *bound*, not a model parameter, so the shutter goes in
+        # as a stated full scale rather than a guess at one: over-wide costs a
+        # few empty cells, and 'resolve_tdc_full_scale_s' still prefers the LUT
+        # when there is one. The half-base that actually gets fitted is resolved
+        # at plot time, where being wrong matters.
+        full_scale_s, _ = timing.resolve_tdc_full_scale_s(
+            time_lut=time_lut, full_scale_s=open_shutter_time_s
+        )
+        support_s = _SUPPORT_FULL_SCALES * full_scale_s
+
+    # 'n_bins' and 'zero_index' depend only on the support/grid ratio, so they
+    # are unit-free; the cell width handed to '_accumulate_delta_counts' is not,
+    # because it divides the raw difference values.
+    n_bins, zero_index, _ = _delta_grid(grid_s, support_s)
+    grid_native = (
+        timing.to_ps(grid_s) if unit == "ps" else grid_s / timing.CODE_S
+    )
+    delta_window_native = _native_window(delta_window_s, unit)
 
     name = os.path.basename(os.path.normpath(path))
     counts_path = os.path.join(
@@ -2226,17 +2429,19 @@ def calculate_and_save_delta_counts(
         labels=labels,
         mode=mode,
         nframes=nframes,
-        delta_window=delta_window,
+        delta_window_s=delta_window_s,
         unit=unit,
-        grid_ps=grid_ps,
-        support_ps=support_ps,
+        grid_s=grid_s,
+        support_s=support_s,
         lags=lags,
     )
 
     # 2D without the lags, exactly as before, so an artifact written by an
     # older run still resumes and every downstream reader keeps working.
     counts = np.zeros(
-        (len(labels), n_bins) if len(lags) == 1 else (len(lags), len(labels), n_bins),
+        (len(labels), n_bins)
+        if len(lags) == 1
+        else (len(lags), len(labels), n_bins),
         dtype=np.int64,
     )
     rows = {label: i for i, label in enumerate(labels)}
@@ -2290,13 +2495,14 @@ def calculate_and_save_delta_counts(
             "signature": signature,
             "labels": labels,
             "unit": unit,
-            "grid_ps": float(grid_ps),
+            "grid_s": float(grid_s),
             # The cell width in the *stored* unit - codes when uncalibrated.
             # Keeping both means the ps-per-code assumption is not baked in:
             # a code grid can be re-scaled at load time, exactly as the
-            # feather path's 'time_unit_ps' does.
-            "grid_native": float(grid),
-            "support_ps": float(support_ps),
+            # feather path's 'time_unit_s' does.
+            "grid_native": float(grid_native),
+            "support_s": float(support_s),
+            "open_shutter_time_s": float(open_shutter_time_s),
             "n_bins": int(n_bins),
             "zero_index": int(zero_index),
             "tag": tag,
@@ -2321,8 +2527,9 @@ def calculate_and_save_delta_counts(
     print(
         f"\n> > > Histogramming delta-t straight from {len(files) - start} "
         f"'.bin' file(s) (mode='{mode}', tag='{tag}') onto a "
-        f"{'x'.join(str(d) for d in counts.shape)} grid of {grid_ps:.2f} ps "
-        f"cells spanning +/-{support_ps:.0f} ps - "
+        f"{'x'.join(str(d) for d in counts.shape)} grid of "
+        f"{grid_s * 1e12:.2f} ps cells spanning "
+        f"+/-{support_s * 1e9:.1f} ns - "
         f"{counts.nbytes / 1024**2:.0f} MB, no feather"
         + (f"; lags {lags} < < <\n" if subtract_background else " < < <\n")
     )
@@ -2335,10 +2542,17 @@ def calculate_and_save_delta_counts(
         if subtract_background:
             for li, lag in enumerate(lags):
                 deltas = bs.compute_lagged_differences(
-                    pixel_ts, pixels, delta_window, mode, frame_lag=lag
+                    pixel_ts,
+                    pixels,
+                    delta_window_native,
+                    mode,
+                    frame_lag=lag,
                 )
                 seen, out = _accumulate_delta_counts(
-                    counts[li], deltas, rows, grid_ps=grid,
+                    counts[li],
+                    deltas,
+                    rows,
+                    grid_native=grid_native,
                     zero_index=zero_index,
                 )
                 total += seen
@@ -2348,10 +2562,17 @@ def calculate_and_save_delta_counts(
             # tested to be identical to this, but the plain path has no reason
             # to route through it.
             deltas = cd.calculate_differences(
-                pixel_ts, pixels, delta_window=delta_window, mode=mode
+                pixel_ts,
+                pixels,
+                delta_window_native=delta_window_native,
+                mode=mode,
             )
             seen, out = _accumulate_delta_counts(
-                counts, deltas, rows, grid_ps=grid, zero_index=zero_index
+                counts,
+                deltas,
+                rows,
+                grid_native=grid_native,
+                zero_index=zero_index,
             )
             total += seen
             outside += out
@@ -2365,7 +2586,7 @@ def calculate_and_save_delta_counts(
         f"row(s)"
         + (f" and {len(lags)} lag plane(s)" if subtract_background else "")
         + f" binned onto {n_bins} cells; {outside} outside "
-        f"+/-{support_ps:.0f} ps. Saved to {counts_path} "
+        f"+/-{support_s * 1e9:.1f} ns. Saved to {counts_path} "
         f"(unit '{unit}') < < <"
     )
     if subtract_background:
@@ -2379,7 +2600,7 @@ def calculate_and_save_delta_counts(
         print(
             f"  NOTE: {100 * outside / max(total, 1):.2f}% of differences "
             "fell outside the grid and are counted but not binned. Raise "
-            "support_ps to keep them."
+            "support_s to keep them."
         )
     return counts_path
 
@@ -2390,7 +2611,7 @@ def load_delta_counts(
     counts_path: str | None = None,
     pairs: Sequence[str] | None = None,
     pool: bool = True,
-    time_unit_ps: float = _TS_CODE_PS,
+    time_unit_s: float = timing.CODE_S,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Load a saved counts grid and its cell centres.
 
@@ -2406,10 +2627,11 @@ def load_delta_counts(
     pool : bool, optional
         Sum the selected pairs into one histogram. The default is True; pass
         False to keep the pair axis.
-    time_unit_ps : float, optional
-        Picoseconds per raw TDC code, used to place the cell centres of an
-        *uncalibrated* (``'code'``) grid. The default is ~77 ps. Ignored for a
-        calibrated grid, whose cells are already in ps.
+    time_unit_s : float, optional
+        Seconds per raw TDC code, used to place the cell centres of an
+        *uncalibrated* (``'code'``) grid. The default is 'core.timing.CODE_S'
+        (~71.6 ps), which is clock-independent. Ignored for a calibrated grid,
+        whose cells already carry a time.
 
     Returns
     -------
@@ -2423,7 +2645,7 @@ def load_delta_counts(
         Grid cell centres, in **picoseconds** whatever the stored unit.
     info : dict
         The sidecar, plus ``name``, ``root``, ``counts_path``, the selected
-        ``labels``, the effective ``cell_ps`` and any requested pairs that
+        ``labels``, the effective ``cell_s`` and any requested pairs that
         were ``missing``. A lagged artifact's sidecar also carries ``lags``
         and ``frames_used``, which is what
         'background_subtraction.subtract_background' needs.
@@ -2468,7 +2690,7 @@ def load_delta_counts(
     cell_ps = (
         grid_native
         if meta.get("unit", "ps") == "ps"
-        else grid_native * time_unit_ps
+        else grid_native * timing.to_ps(time_unit_s)
     )
     centers = (np.arange(counts.shape[-1]) - zero_index) * cell_ps
 
@@ -2482,7 +2704,7 @@ def load_delta_counts(
         "counts_path": counts_path,
         "labels": labels,
         "missing": missing,
-        "cell_ps": cell_ps,
+        "cell_s": timing.to_s(cell_ps),
     }
     if not meta.get("complete", True):
         print(
@@ -2496,13 +2718,13 @@ def rebin_delta_counts(
     counts: np.ndarray,
     centers: np.ndarray,
     *,
-    bin_width_ps: float,
-    plot_window_ps: float,
+    bin_width_s: float,
+    plot_window_s: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Reduce a native counts grid onto a coarser histogram, in memory.
 
     Each grid cell is assigned whole to the target bin its *centre* falls in.
-    That is exact whenever ``bin_width_ps`` is a whole multiple of the grid
+    That is exact whenever ``bin_width_s`` is a whole multiple of the grid
     cell and the two lattices line up; otherwise a cell straddling a target
     edge goes entirely one way, which is the rebinning, not the data. Bin on a
     multiple of the grid when comparing against the feather path.
@@ -2513,20 +2735,20 @@ def rebin_delta_counts(
         1D pooled counts on the native grid, from 'load_delta_counts'.
     centers : np.ndarray
         The grid cell centres in ps, from 'load_delta_counts'.
-    bin_width_ps : float
-        Target bin width, in ps.
-    plot_window_ps : float
-        Target half-range, in ps.
+    bin_width_s : float
+        Target bin width, in seconds.
+    plot_window_s : float
+        Target half-range, in seconds.
 
     Returns
     -------
     counts : np.ndarray
         Counts per target bin.
     edges : np.ndarray
-        The target bin edges - the same '_delta_hist_edges' the feather path
-        uses, so the two histograms are directly comparable.
+        The target bin edges in ps - the same '_delta_hist_edges' the feather
+        path uses, so the two histograms are directly comparable.
     """
-    edges = _delta_hist_edges(bin_width_ps, plot_window_ps)
+    edges = _delta_hist_edges(bin_width_s, plot_window_s)
     counts = np.asarray(counts).ravel()
     idx = np.searchsorted(edges, centers, side="right") - 1
     inside = (idx >= 0) & (idx < len(edges) - 1)
@@ -3135,21 +3357,22 @@ def fit_gaussian_peak(
 def collect_and_plot_timestamp_differences(
     path: str | None = None,
     *,
-    time_unit_ps: float = _TS_CODE_PS,
-    bin_width_ps: float = _TS_CODE_PS,
-    plot_window_ps: float = 3000.0,
-    fit_window_ps: float | None = 1000.0,
+    open_shutter_time_s: float | None = None,
+    time_unit_s: float = timing.CODE_S,
+    bin_width_s: float = timing.CODE_S,
+    plot_window_s: float = 3e-9,
+    fit_window_s: float | None = 1e-9,
     background: str = "flat",
-    osc_period_ps: float = 100000.0,
+    full_scale_s: float | None = None,
     feather_path: str | None = None,
     pairs: Sequence[str] | None = None,
     label: str = "spdc",
     cmap_title: str | None = None,
     reuse_histogram: bool = True,
     subtract_background: bool = False,
-    peak_window_ps: float = 1000.0,
+    peak_window_s: float = 1e-9,
     wide_rebin: int = 25,
-    support_ps: float = 100000.0,
+    support_s: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Histogram the saved delta-t feather, fit the peak, and plot it.
 
@@ -3183,19 +3406,26 @@ def collect_and_plot_timestamp_differences(
         Path to the raw-data folder (its ``processed`` holds the
         feather, ``results`` receives the plot). May be None when
         ``feather_path`` is given. Required otherwise.
-    time_unit_ps : float, optional
-        Picoseconds per raw TDC code, applied to a ``delta_code`` feather.
-        The default is ~77 ps.
-    bin_width_ps : float, optional
-        Histogram bin width in ps. The default is ~77 ps (one code).
-    plot_window_ps : float, optional
-        Histogram/plot half-range in ps around zero. The default is 3000.0.
-    fit_window_ps : float | None, optional
-        Fit half-range in ps around the tallest bin. Only used for
-        ``background='flat'``. The default is 1000.0.
+    open_shutter_time_s : float | None, optional
+        Open shutter time, i.e. one reference-clock period, in seconds. Used as
+        the fallback for the TDC full scale, hence for the triangle half-base
+        and the default streaming support. The default is None, which is fine
+        only for ``background='flat'`` without ``subtract_background``; the
+        triangle models need a full scale from somewhere.
+    time_unit_s : float, optional
+        Seconds per raw TDC code, applied to a ``delta_code`` feather. The
+        default is 'core.timing.CODE_S' (~71.6 ps), which is clock-independent.
+    bin_width_s : float, optional
+        Histogram bin width in seconds. The default is one TDC code.
+    plot_window_s : float, optional
+        Histogram/plot half-range in seconds around zero. The default is
+        ``3e-9`` (3 ns).
+    fit_window_s : float | None, optional
+        Fit half-range in seconds around the tallest bin. Only used for
+        ``background='flat'``. The default is ``1e-9`` (1 ns).
     background : str, optional
         Peak-and-background model. ``'flat'`` (default) fits
-        ``Gaussian + constant`` over ``fit_window_ps`` — the legacy daplis
+        ``Gaussian + constant`` over ``fit_window_s`` — the legacy daplis
         model. ``'triangle'`` fits ``Gaussian + triangular background`` via
         'fit_gaussian_on_triangle' over the whole histogram, which is the
         physically correct model for the Kelpie ORT free-running phase and
@@ -3205,14 +3435,17 @@ def collect_and_plot_timestamp_differences(
         a narrow core on wide tails that one Gaussian averages into a single
         inflated sigma, and this separates the two. The plot then also draws
         both components and the bare triangle. For ``'triangle'`` and
-        ``'two_gaussians'`` set ``plot_window_ps`` wide (e.g. the full
-        ``osc_period_ps``) so the triangle is well constrained.
-    osc_period_ps : float, optional
-        Oscillator period in ps; equals the triangle half-base (the
-        accidental background is a triangle peaking at 0 and reaching zero at
-        ``+/- osc_period_ps``). The default is 100000.0 ps (~100 ns). Only
-        used when ``background`` is ``'triangle'`` or ``'two_gaussians'``; the
-        fit refines it.
+        ``'two_gaussians'`` set ``plot_window_s`` wide (ideally the whole full
+        scale) so the triangle is well constrained.
+    full_scale_s : float | None, optional
+        TDC full scale in seconds, which **is** the triangle half-base: the
+        accidental background peaks at 0 and reaches zero at
+        ``+/- full_scale_s``. The default is None, which resolves it from
+        ``open_shutter_time_s`` via 'core.timing.resolve_tdc_full_scale_s'.
+        Only used when ``background`` is ``'triangle'`` or ``'two_gaussians'``;
+        the fit refines it. Pass it explicitly when the shutter is longer than
+        one clock period, because then the timestamps fold and the triangle is
+        narrower than the shutter.
     feather_path : str | None, optional
         Explicit feather to read and plot directly, or a ``*_delta_t_parts``
         folder to read the parts; when given, ``path`` is ignored and the
@@ -3236,19 +3469,19 @@ def collect_and_plot_timestamp_differences(
         three-panel diagnostic beside the fit. The default is False. Requires a
         feather written with ``subtract_background=True``, and only makes sense
         with ``background='flat'`` - there is no triangle left to fit. Note the
-        streamed histogram then spans ``support_ps`` rather than
-        ``plot_window_ps``, since the residual out at +/-100 ns is the evidence
-        that the pedestal was accidental.
-    peak_window_ps : float, optional
-        Half-range the model-free coincidence count is summed over, in ps.
-        ``subtract_background`` only. The default is 1000.0.
+        streamed histogram then spans ``support_s`` rather than
+        ``plot_window_s``, since the residual out at the edge of the full scale
+        is the evidence that the pedestal was accidental.
+    peak_window_s : float, optional
+        Half-range the model-free coincidence count is summed over, in seconds.
+        ``subtract_background`` only. The default is ``1e-9`` (1 ns).
     wide_rebin : int, optional
         Histogram bins per bin of the diagnostic's two full-support panels.
         ``subtract_background`` only. The default is 25.
-    support_ps : float, optional
-        Half-range the lag histograms are streamed over, in ps.
-        ``subtract_background`` only. The default is 100000.0 (one oscillator
-        period, the whole physical support of a difference).
+    support_s : float | None, optional
+        Half-range the lag histograms are streamed over, in seconds.
+        ``subtract_background`` only. The default is None, i.e. one TDC full
+        scale - the whole physical support of a difference.
 
     Returns
     -------
@@ -3274,20 +3507,33 @@ def collect_and_plot_timestamp_differences(
     if subtract_background:
         _check_subtraction_model(background)
 
+    # The triangle half-base is the TDC full scale, so it has to come from the
+    # calibration or the clock - never from a fixed 100 ns. Resolved only when
+    # something actually needs it: a plain flat fit does not, and demanding a
+    # clock for it would break every narrow-window call that never cared.
+    needs_full_scale = background in ("triangle", "two_gaussians")
+    if needs_full_scale or (subtract_background and support_s is None):
+        full_scale_s, _ = timing.resolve_tdc_full_scale_s(
+            full_scale_s=full_scale_s,
+            open_shutter_time_s=open_shutter_time_s,
+        )
+        if support_s is None:
+            support_s = full_scale_s
+
     # The subtraction needs the whole support in one histogram: the zoom is a
     # slice of it and the diagnostic's wide panels are a regrouping, so the
     # expensive streaming pass is still paid exactly once.
-    hist_window_ps = (
-        _whole_bins(support_ps, bin_width_ps)
+    hist_window_s = (
+        _whole_bins(support_s, bin_width_s)
         if subtract_background
-        else plot_window_ps
+        else plot_window_s
     )
     counts, edges, info = compute_and_save_delta_histogram(
         path,
         feather_path=feather_path,
-        time_unit_ps=time_unit_ps,
-        bin_width_ps=bin_width_ps,
-        plot_window_ps=hist_window_ps,
+        time_unit_s=time_unit_s,
+        bin_width_s=bin_width_s,
+        plot_window_s=hist_window_s,
         pairs=pairs,
         subtract_background=subtract_background,
         reuse=reuse_histogram,
@@ -3298,11 +3544,11 @@ def collect_and_plot_timestamp_differences(
     n_in_window = int(info["n"])
 
     # Comb guard: warn if the data granularity is coarser than the bin.
-    gran = info.get("granularity_ps")
-    if gran is not None and gran > bin_width_ps * 1.5:
+    gran_s = info.get("granularity_s")
+    if gran_s is not None and gran_s > bin_width_s * 1.5:
         print(
-            f"  WARNING: delta granularity is ~{gran:.0f} ps but "
-            f"bin_width={bin_width_ps:.0f} ps -> the histogram will be a "
+            f"  WARNING: delta granularity is ~{gran_s * 1e12:.0f} ps but "
+            f"bin_width={bin_width_s * 1e12:.0f} ps -> the histogram will be a "
             "comb. Bin coarser, or ensure the fine timing is populated "
             "in the acquisition."
         )
@@ -3316,9 +3562,9 @@ def collect_and_plot_timestamp_differences(
             name=name,
             root=info["root"],
             background=background,
-            bin_width_ps=bin_width_ps,
-            zoom_window_ps=plot_window_ps,
-            peak_window_ps=peak_window_ps,
+            bin_width_s=bin_width_s,
+            zoom_window_s=plot_window_s,
+            peak_window_s=peak_window_s,
             wide_rebin=wide_rebin,
             label=label,
         )
@@ -3334,11 +3580,11 @@ def collect_and_plot_timestamp_differences(
         centers,
         name=name,
         results_dir=results_dir,
-        bin_width_ps=bin_width_ps,
-        plot_window_ps=plot_window_ps,
-        fit_window_ps=fit_window_ps,
+        bin_width_s=bin_width_s,
+        plot_window_s=plot_window_s,
+        fit_window_s=fit_window_s,
         background=background,
-        osc_period_ps=osc_period_ps,
+        full_scale_s=full_scale_s if needs_full_scale else None,
         label=label,
         cmap_title=cmap_title,
         n_in_window=n_in_window,
@@ -3358,11 +3604,11 @@ def _fit_and_plot_delta(
     *,
     name: str,
     results_dir: str,
-    bin_width_ps: float,
-    plot_window_ps: float,
-    fit_window_ps: float | None,
+    bin_width_s: float,
+    plot_window_s: float,
+    fit_window_s: float | None,
     background: str,
-    osc_period_ps: float,
+    full_scale_s: float | None,
     label: str,
     cmap_title: str | None,
     n_in_window: int,
@@ -3384,17 +3630,19 @@ def _fit_and_plot_delta(
         Dataset name, for the title and file name.
     results_dir : str
         Folder the figure is written to; created if missing.
-    bin_width_ps : float
-        Bar width for the plot, in ps.
-    plot_window_ps : float
-        Half-range the model curve is drawn over, in ps.
-    fit_window_ps : float | None
-        Fit half-range around the tallest bin; ``'flat'`` background only.
+    bin_width_s : float
+        Bar width for the plot, in seconds.
+    plot_window_s : float
+        Half-range the model curve is drawn over, in seconds.
+    fit_window_s : float | None
+        Fit half-range around the tallest bin, in seconds; ``'flat'``
+        background only.
     background : str
         ``'flat'``, ``'triangle'`` or ``'two_gaussians'``; see
         'collect_and_plot_timestamp_differences'.
-    osc_period_ps : float
-        Triangle half-base seed, in ps.
+    full_scale_s : float | None
+        Triangle half-base seed, in seconds - the TDC full scale. Required for
+        the two triangle models; may be None for ``'flat'``.
     label : str
         Short label for the title and file name.
     cmap_title : str | None
@@ -3426,9 +3674,21 @@ def _fit_and_plot_delta(
             "background must be 'flat', 'triangle' or 'two_gaussians', got "
             f"{background!r}"
         )
+    if background in ("triangle", "two_gaussians") and full_scale_s is None:
+        raise ValueError(
+            f"background={background!r} models the accidentals as a triangle "
+            "whose half-base is the TDC full scale, so it needs one: pass "
+            "full_scale_s (or open_shutter_time_s) in seconds."
+        )
+
+    bin_width_ps = timing.to_ps(bin_width_s)
+    plot_window_ps = timing.to_ps(plot_window_s)
+    fit_window_ps = None if fit_window_s is None else timing.to_ps(fit_window_s)
+    half_base_ps = None if full_scale_s is None else timing.to_ps(full_scale_s)
+
     if background == "two_gaussians":
         fit = fit_two_gaussians_on_triangle(
-            centers, counts, half_base=osc_period_ps
+            centers, counts, half_base=half_base_ps
         )
         # Present the narrow component as *the* sigma: it is the one that
         # carries the timing resolution, and it keeps the reported keys, the
@@ -3447,7 +3707,7 @@ def _fit_and_plot_delta(
             fit["amp"] = np.nan
     elif background == "triangle":
         fit = fit_gaussian_on_triangle(
-            centers, counts, half_base=osc_period_ps
+            centers, counts, half_base=half_base_ps
         )
     else:
         fit = fit_gaussian_peak(centers, counts, fit_window=fit_window_ps)
@@ -3598,7 +3858,7 @@ def _fit_and_plot_delta(
 
 
 def _snap_binning(
-    bin_width_ps: float, plot_window_ps: float, cell_ps: float
+    bin_width_s: float, plot_window_s: float, cell_s: float
 ) -> tuple[float, float]:
     """Round a binning onto the counts grid, and say so if it moved.
 
@@ -3617,12 +3877,21 @@ def _snap_binning(
     * the **window** to a whole number of bins, so zero lands on a bin centre
       rather than up to half a bin off it.
 
+    Parameters
+    ----------
+    bin_width_s : float
+        Requested bin width, in seconds.
+    plot_window_s : float
+        Requested half-range, in seconds.
+    cell_s : float
+        Width of one native grid cell, in seconds.
+
     Returns
     -------
     tuple[float, float]
-        The snapped ``(bin_width_ps, plot_window_ps)``.
+        The snapped ``(bin_width_s, plot_window_s)``, in seconds.
     """
-    raw = bin_width_ps / cell_ps
+    raw = bin_width_s / cell_s
     cells = max(int(round(raw)), 1)
     if cells % 2 == 0:
         lower, upper = cells - 1, cells + 1
@@ -3631,25 +3900,27 @@ def _snap_binning(
             if lower < 1 or abs(upper - raw) <= abs(raw - lower)
             else lower
         )
-    width = cells * cell_ps
-    bins = max(int(round(plot_window_ps / width)), 1)
+    width = cells * cell_s
+    bins = max(int(round(plot_window_s / width)), 1)
     window = bins * width
 
     moved = []
-    if abs(width - bin_width_ps) > 1e-9:
+    if abs(width - bin_width_s) > 1e-21:
         moved.append(
-            f"bin_width {bin_width_ps:.2f} -> {width:.2f} ps "
+            f"bin_width {bin_width_s * 1e12:.2f} -> {width * 1e12:.2f} ps "
             f"({cells} cells, odd so bin edges fall between cells)"
         )
-    if abs(window - plot_window_ps) > 1e-9:
+    if abs(window - plot_window_s) > 1e-21:
         moved.append(
-            f"window {plot_window_ps:.0f} -> {window:.0f} ps ({bins} bins)"
+            f"window {plot_window_s * 1e12:.0f} -> {window * 1e12:.0f} ps "
+            f"({bins} bins)"
         )
     if moved:
         print(
-            f"  snapped to the {cell_ps:.2f} ps grid: {'; '.join(moved)}. "
-            "Every bin now holds the same number of cells and zero is a bin "
-            "centre; pass snap_to_grid=False to take the numbers literally."
+            f"  snapped to the {cell_s * 1e12:.2f} ps grid: "
+            f"{'; '.join(moved)}. Every bin now holds the same number of cells "
+            "and zero is a bin centre; pass snap_to_grid=False to take the "
+            "numbers literally."
         )
     return width, window
 
@@ -3658,18 +3929,19 @@ def collect_and_plot_delta_counts(
     path: str | None = None,
     *,
     counts_path: str | None = None,
-    time_unit_ps: float = _TS_CODE_PS,
-    bin_width_ps: float = _TS_CODE_PS,
-    plot_window_ps: float = 3000.0,
-    fit_window_ps: float | None = 1000.0,
+    open_shutter_time_s: float | None = None,
+    time_unit_s: float = timing.CODE_S,
+    bin_width_s: float = timing.CODE_S,
+    plot_window_s: float = 3e-9,
+    fit_window_s: float | None = 1e-9,
     background: str = "flat",
-    osc_period_ps: float = 100000.0,
+    full_scale_s: float | None = None,
     pairs: Sequence[str] | None = None,
     label: str = "spdc",
     cmap_title: str | None = None,
     snap_to_grid: bool = True,
     subtract_background: bool = False,
-    peak_window_ps: float = 1000.0,
+    peak_window_s: float = 1e-9,
     wide_rebin: int = 25,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Rebin a saved counts grid, fit the peak, and plot it.
@@ -3685,7 +3957,7 @@ def collect_and_plot_delta_counts(
     ``calculate_and_save_delta_counts(..., subtract_background=True)``.
 
     Nothing is read from disk except one ~100 MB array, and the rebinning is
-    in memory, so changing ``bin_width_ps`` or ``plot_window_ps`` costs
+    in memory, so changing ``bin_width_s`` or ``plot_window_s`` costs
     milliseconds rather than a full pass over the data - and every pixel pair
     is available at once instead of whichever columns were streamed.
 
@@ -3697,24 +3969,30 @@ def collect_and_plot_delta_counts(
         given.
     counts_path : str | None, optional
         Explicit counts '.npy', ignoring ``path``. The default is None.
-    time_unit_ps : float, optional
-        Picoseconds per raw TDC code, for an uncalibrated grid. The default
-        is ~77 ps.
-    bin_width_ps : float, optional
-        Histogram bin width in ps. The default is ~77 ps (one code). Use a
+    open_shutter_time_s : float | None, optional
+        Open shutter time, i.e. one reference-clock period, in seconds. The
+        fallback source for the TDC full scale, hence the triangle half-base.
+        The default is None, which is fine only for ``background='flat'``.
+    time_unit_s : float, optional
+        Seconds per raw TDC code, for an uncalibrated grid. The default is
+        'core.timing.CODE_S' (~71.6 ps), which is clock-independent.
+    bin_width_s : float, optional
+        Histogram bin width in seconds. The default is one TDC code. Use a
         whole multiple of the artifact's grid cell for an exact rebin.
-    plot_window_ps : float, optional
-        Histogram/plot half-range in ps around zero. The default is 3000.0.
-        Unlike the feather path, widening this is free - it is a slice of what
-        is already loaded.
-    fit_window_ps : float | None, optional
-        Fit half-range in ps around the tallest bin. ``'flat'`` background
-        only. The default is 1000.0.
+    plot_window_s : float, optional
+        Histogram/plot half-range in seconds around zero. The default is
+        ``3e-9`` (3 ns). Unlike the feather path, widening this is free - it is
+        a slice of what is already loaded.
+    fit_window_s : float | None, optional
+        Fit half-range in seconds around the tallest bin. ``'flat'`` background
+        only. The default is ``1e-9`` (1 ns).
     background : str, optional
         ``'flat'`` (default), ``'triangle'`` or ``'two_gaussians'``; see
         'collect_and_plot_timestamp_differences'.
-    osc_period_ps : float, optional
-        Triangle half-base seed in ps. The default is 100000.0.
+    full_scale_s : float | None, optional
+        Triangle half-base seed in seconds - the TDC full scale. The default is
+        None, which resolves it from the artifact's own
+        ``open_shutter_time_s``, then from this call's.
     pairs : Sequence[str] | None, optional
         Restrict pooling to these pixel-pair labels. The default is None
         (pool every pair).
@@ -3723,8 +4001,8 @@ def collect_and_plot_delta_counts(
     cmap_title : str | None, optional
         Optional override for the plot title. The default is None.
     snap_to_grid : bool, optional
-        Round ``bin_width_ps`` to a whole number of grid cells and
-        ``plot_window_ps`` to a whole number of bins. The default is True,
+        Round ``bin_width_s`` to a whole number of grid cells and
+        ``plot_window_s`` to a whole number of bins. The default is True,
         and you almost always want it - see the note below. Pass False to
         take the numbers literally.
     subtract_background : bool, optional
@@ -3733,9 +4011,9 @@ def collect_and_plot_delta_counts(
         ``background='flat'`` - there is no triangle left to fit. Writes a
         second, three-panel figure whose middle panel is the evidence that the
         pedestal really was accidental; read it before quoting anything.
-    peak_window_ps : float, optional
-        Half-range the model-free coincidence count is summed over, in ps.
-        ``subtract_background`` only. The default is 1000.0.
+    peak_window_s : float, optional
+        Half-range the model-free coincidence count is summed over, in seconds.
+        ``subtract_background`` only. The default is ``1e-9`` (1 ns).
     wide_rebin : int, optional
         Grid cells per bin in the two full-support panels of the diagnostic
         figure. ``subtract_background`` only. The default is 25, which smooths
@@ -3786,21 +4064,34 @@ def collect_and_plot_delta_counts(
         counts_path=counts_path,
         pairs=pairs,
         pool=True,
-        time_unit_ps=time_unit_ps,
+        time_unit_s=time_unit_s,
     )
     if info["missing"]:
         print(f"  no such pixel-pair row(s): {info['missing']}")
 
-    cell_ps = float(info["cell_ps"])
+    # The artifact records the clock it was built at, so a triangle fit can get
+    # its half-base without the caller restating it.
+    needs_full_scale = background in ("triangle", "two_gaussians")
+    if needs_full_scale:
+        full_scale_s, _ = timing.resolve_tdc_full_scale_s(
+            full_scale_s=full_scale_s,
+            open_shutter_time_s=(
+                open_shutter_time_s
+                if open_shutter_time_s is not None
+                else info.get("open_shutter_time_s")
+            ),
+        )
+
+    cell_ps = timing.to_ps(float(info["cell_s"]))
     if snap_to_grid:
-        bin_width_ps, plot_window_ps = _snap_binning(
-            bin_width_ps, plot_window_ps, cell_ps
+        bin_width_s, plot_window_s = _snap_binning(
+            bin_width_s, plot_window_s, timing.to_s(cell_ps)
         )
     else:
-        ratio = bin_width_ps / cell_ps
+        ratio = timing.to_ps(bin_width_s) / cell_ps
         if abs(ratio - round(ratio)) > 1e-9:
             print(
-                f"  WARNING: bin_width={bin_width_ps:.2f} ps is "
+                f"  WARNING: bin_width={bin_width_s * 1e12:.2f} ps is "
                 f"{ratio:.2f} grid cells, so bins hold {int(ratio)} or "
                 f"{int(ratio) + 1} of them and the histogram carries a "
                 f"~{100 / max(int(ratio), 1):.0f}% sawtooth. Leave "
@@ -3823,9 +4114,9 @@ def collect_and_plot_delta_counts(
         lag_counts, lag_centers = _rebin_lag_planes(
             grid_counts,
             grid_centers,
-            bin_width_ps=bin_width_ps,
-            plot_window_ps=_whole_bins(
-                float(np.abs(grid_centers).max()), bin_width_ps
+            bin_width_s=bin_width_s,
+            plot_window_s=_whole_bins(
+                timing.to_s(float(np.abs(grid_centers).max())), bin_width_s
             ),
         )
         sub = _subtract_lag_background(
@@ -3835,9 +4126,9 @@ def collect_and_plot_delta_counts(
             name=info["name"],
             root=info["root"],
             background=background,
-            bin_width_ps=bin_width_ps,
-            zoom_window_ps=plot_window_ps,
-            peak_window_ps=peak_window_ps,
+            bin_width_s=bin_width_s,
+            zoom_window_s=plot_window_s,
+            peak_window_s=peak_window_s,
             wide_rebin=wide_rebin,
             label=label,
         )
@@ -3851,8 +4142,8 @@ def collect_and_plot_delta_counts(
         counts, edges = rebin_delta_counts(
             grid_counts,
             grid_centers,
-            bin_width_ps=bin_width_ps,
-            plot_window_ps=plot_window_ps,
+            bin_width_s=bin_width_s,
+            plot_window_s=plot_window_s,
         )
         centers = (edges[:-1] + edges[1:]) / 2
         n_in_window = int(counts.sum())
@@ -3860,8 +4151,9 @@ def collect_and_plot_delta_counts(
         print(
             f"\n> > > {int(grid_counts.sum())} difference(s) on the "
             f"{grid_centers.size}-cell grid across {len(info['labels'])} pair "
-            f"row(s); {n_in_window} inside +/-{plot_window_ps:.0f} ps, rebinned "
-            f"to {counts.size} x {bin_width_ps:.0f} ps < < <"
+            f"row(s); {n_in_window} inside "
+            f"+/-{plot_window_s * 1e9:.2f} ns, rebinned to "
+            f"{counts.size} x {bin_width_s * 1e12:.0f} ps < < <"
         )
 
     counts, centers, fit = _fit_and_plot_delta(
@@ -3869,11 +4161,11 @@ def collect_and_plot_delta_counts(
         centers,
         name=info["name"],
         results_dir=store.results_dir(info["root"], _KIND, create=False),
-        bin_width_ps=bin_width_ps,
-        plot_window_ps=plot_window_ps,
-        fit_window_ps=fit_window_ps,
+        bin_width_s=bin_width_s,
+        plot_window_s=plot_window_s,
+        fit_window_s=fit_window_s,
         background=background,
-        osc_period_ps=osc_period_ps,
+        full_scale_s=full_scale_s if needs_full_scale else None,
         label=label,
         cmap_title=cmap_title,
         n_in_window=n_in_window,
@@ -3895,9 +4187,9 @@ def _subtract_lag_background(
     name: str,
     root: str,
     background: str,
-    bin_width_ps: float,
-    zoom_window_ps: float,
-    peak_window_ps: float,
+    bin_width_s: float,
+    zoom_window_s: float,
+    peak_window_s: float,
     wide_rebin: int,
     label: str,
 ) -> dict:
@@ -3907,7 +4199,7 @@ def _subtract_lag_background(
     is: the feather path and the counts path can only be compared if the
     subtraction, the reported numbers and the figure are literally the same
     code. Each caller supplies an ``(n_lags, n_bins)`` histogram already binned
-    at ``bin_width_ps`` and spanning the whole support; the zoom is a *slice* of
+    at ``bin_width_s`` and spanning the whole support; the zoom is a *slice* of
     it and the diagnostic's wide panels are a regrouping, so no caller re-reads
     anything.
 
@@ -3924,12 +4216,12 @@ def _subtract_lag_background(
         Dataset name and data-folder root, for the title and the figure path.
     background : str
         The caller's fit model; only ``'flat'`` is meaningful here.
-    bin_width_ps : float
-        Width of one bin of ``lag_counts``, in ps.
-    zoom_window_ps : float
-        Half-range kept for the fitted/returned residual.
-    peak_window_ps : float
-        Half-range the model-free count is summed over.
+    bin_width_s : float
+        Width of one bin of ``lag_counts``, in seconds.
+    zoom_window_s : float
+        Half-range kept for the fitted/returned residual, in seconds.
+    peak_window_s : float
+        Half-range the model-free count is summed over, in seconds.
     wide_rebin : int
         Bins of ``lag_counts`` per bin of the two full-support panels.
     label : str
@@ -3956,15 +4248,16 @@ def _subtract_lag_background(
         )
     _check_subtraction_model(background)
 
-    keep = np.abs(centers) <= zoom_window_ps
+    keep = np.abs(centers) <= timing.to_ps(zoom_window_s)
     sub = bs.subtract_background(
         lag_counts[:, keep], centers[keep], frames_used
     )
-    sub["model_free"] = bs.integrate_residual(sub, window_ps=peak_window_ps)
+    sub["model_free"] = bs.integrate_residual(sub, window_s=peak_window_s)
 
-    # The whole support, coarsely binned: this is the evidence panel. A
-    # residual that is not flat and zero out at +/-100 ns means the pedestal
-    # was not purely accidental, and then no number above is worth quoting.
+    # The whole support, coarsely binned: this is the evidence panel. A residual
+    # that is not flat and zero out at the edge of the full scale means the
+    # pedestal was not purely accidental, and then no number above is worth
+    # quoting.
     step = max(int(wide_rebin), 1)
     if step % 2 == 0:
         # Bins are centred on zero, so an odd group keeps the coarse edges on
@@ -3973,8 +4266,8 @@ def _subtract_lag_background(
     wide_counts, wide_centers = _rebin_lag_planes(
         lag_counts,
         centers,
-        bin_width_ps=step * bin_width_ps,
-        plot_window_ps=float(np.abs(centers).max()),
+        bin_width_s=step * bin_width_s,
+        plot_window_s=timing.to_s(float(np.abs(centers).max())),
     )
     full = bs.subtract_background(wide_counts, wide_centers, frames_used)
     sub["full"] = full
@@ -3986,11 +4279,14 @@ def _subtract_lag_background(
         f"over the whole support < < <"
     )
     print(
-        f"  coincidences within +/-{peak_window_ps:.0f} ps: {peak['n']:.0f} "
+        f"  coincidences within +/-{peak_window_s * 1e12:.0f} ps: "
+        f"{peak['n']:.0f} "
         f"+/- {peak['n_err']:.0f}  ({peak['significance']:.1f} sigma), on "
         f"{peak['n_background']:.0f} accidentals -> CAR {peak['car']:.3f}"
     )
-    far = np.abs(full["centers"]) > max(5 * peak_window_ps, 15000.0)
+    far = np.abs(full["centers"]) > max(
+        5 * timing.to_ps(peak_window_s), 15000.0
+    )
     far_sum = float(full["residual"][far].sum())
     far_err = float(np.sqrt((full["error"][far] ** 2).sum()))
     print(
@@ -4030,7 +4326,7 @@ def _check_subtraction_model(background: str) -> None:
         )
 
 
-def _whole_bins(window_ps: float, bin_width_ps: float) -> float:
+def _whole_bins(window_s: float, bin_width_s: float) -> float:
     """Round a half-range up to a whole number of bins.
 
     '_delta_hist_edges' places bin *centres* at multiples of the width starting
@@ -4038,22 +4334,50 @@ def _whole_bins(window_ps: float, bin_width_ps: float) -> float:
     number of bins - and unless it is, a histogram built over the support and
     one built over a narrower window sit on different lattices, which would
     make the zoom slice and a direct rebin disagree.
+
+    Parameters
+    ----------
+    window_s : float
+        Requested half-range, in seconds.
+    bin_width_s : float
+        Bin width, in seconds.
+
+    Returns
+    -------
+    float
+        The half-range rounded up to a whole number of bins, in seconds.
     """
-    return float(np.ceil(window_ps / bin_width_ps) * bin_width_ps)
+    return float(np.ceil(window_s / bin_width_s) * bin_width_s)
 
 
 def _rebin_lag_planes(
     counts: np.ndarray,
     centers: np.ndarray,
     *,
-    bin_width_ps: float,
-    plot_window_ps: float,
+    bin_width_s: float,
+    plot_window_s: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Rebin every lag plane of a pooled grid onto one common histogram.
 
     Same 'rebin_delta_counts' per plane rather than anything cleverer: the
     lags are only subtractable if their bins are the *same* bins, and reusing
     the one function is how that stays true.
+
+    Parameters
+    ----------
+    counts : np.ndarray
+        ``(n_lags, n_cells)`` counts on the native grid, lag 0 first.
+    centers : np.ndarray
+        Native grid cell centres, in ps.
+    bin_width_s : float
+        Target bin width, in seconds.
+    plot_window_s : float
+        Target half-range, in seconds.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        The rebinned ``(n_lags, n_bins)`` counts and the bin centres in ps.
     """
     planes = []
     edges = None
@@ -4061,8 +4385,8 @@ def _rebin_lag_planes(
         binned, edges = rebin_delta_counts(
             plane,
             centers,
-            bin_width_ps=bin_width_ps,
-            plot_window_ps=plot_window_ps,
+            bin_width_s=bin_width_s,
+            plot_window_s=plot_window_s,
         )
         planes.append(binned)
     return np.vstack(planes), (edges[:-1] + edges[1:]) / 2

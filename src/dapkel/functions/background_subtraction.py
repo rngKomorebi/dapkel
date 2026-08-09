@@ -1,9 +1,10 @@
 """Measure the accidental background instead of modelling it: frame shifting.
 
-The ORT accidental background is a *triangle* filling +/-100 ns and it sits
-directly under the coincidence peak, so the number you report depends on how
-you model it (see ``docs/ort_triangle_background.md``). This module removes it
-without a model.
+The ORT accidental background is a *triangle* filling +/- one TDC full scale -
+one reference-clock period, so 20 ns at 50 MHz, 100 ns at 10 MHz, 500 ns at
+2 MHz - and it sits directly under the coincidence peak, so the number you
+report depends on how you model it (see ``docs/ort_triangle_background.md``).
+This module removes it without a model.
 
 An SPDC pair is always in **one frame**. So
 
@@ -67,7 +68,7 @@ BACKGROUND_LAGS = (1, 2, 3, 4, 5, 6, 7, 8)
 def compute_lagged_differences(
     pixel_timestamps: dict[Pixel, np.ndarray],
     pixels: Sequence[Sequence[Pixel]],
-    delta_window: float | None = None,
+    delta_window_native: float | None = None,
     mode: str = "all_pairs",
     *,
     frame_lag: int = 0,
@@ -89,9 +90,13 @@ def compute_lagged_differences(
     pixels : Sequence[Sequence[tuple[int, int]]]
         Two groups ``[group_a, group_b]``; a bare ``(row, col)`` is accepted
         for a one-pixel group.
-    delta_window : float | None, optional
-        Keep only differences with ``abs(delta) <= delta_window``, in the same
-        units as the timestamps. The default is None (keep all).
+    delta_window_native : float | None, optional
+        Keep only differences with ``abs(delta) <=
+        delta_window_native``, **in the same units as the timestamps** (ps
+        with a calibration LUT, raw codes without) rather than in seconds
+        like the rest of the package - the unit is the caller's to know.
+        'delta_t' converts a ``delta_window_s`` for you. The default is
+        None (keep all).
     mode : str, optional
         ``'all_pairs'`` (default) or ``'1v1'``, as
         'calc_diff.calculate_differences'.
@@ -125,8 +130,8 @@ def compute_lagged_differences(
         tb_w = tb[frame_lag:]
         both = ~np.isnan(ta_w) & ~np.isnan(tb_w)
         d = tb_w[both] - ta_w[both]
-        if delta_window is not None:
-            d = d[np.abs(d) <= delta_window]
+        if delta_window_native is not None:
+            d = d[np.abs(d) <= delta_window_native]
         out[pairs.pair_label(a, b)] = d
     return out
 
@@ -192,7 +197,7 @@ def subtract_background(
     dict
         ``centers``, ``signal`` (lag 0), ``background`` (mean of the rescaled
         shifted lags), ``residual``, ``error`` (1 sigma, Poisson),
-        ``bin_width_ps``, ``k`` (number of background lags) and ``scale`` (the
+        ``bin_width_s``, ``k`` (number of background lags) and ``scale`` (the
         per-lag frame-count correction applied).
 
     Raises
@@ -243,13 +248,13 @@ def subtract_background(
         "background": background,
         "residual": signal - background,
         "error": np.sqrt(signal + var_bkg),
-        "bin_width_ps": cell_ps,
+        "bin_width_s": cell_ps * 1e-12,
         "k": k,
         "scale": scale,
     }
 
 
-def integrate_residual(sub: dict, *, window_ps: float) -> dict:
+def integrate_residual(sub: dict, *, window_s: float) -> dict:
     """Model-free coincidence count: sum the residual over a window.
 
     This is the payoff of the subtraction. No peak shape is assumed, so it is
@@ -261,7 +266,7 @@ def integrate_residual(sub: dict, *, window_ps: float) -> dict:
     ----------
     sub : dict
         Output of 'subtract_background'.
-    window_ps : float
+    window_s : float
         Half-range summed over, in ps. Widen it until the answer stops
         growing; a window narrower than the peak undercounts.
 
@@ -270,9 +275,9 @@ def integrate_residual(sub: dict, *, window_ps: float) -> dict:
     dict
         ``n`` (coincidences), ``n_err`` (1 sigma), ``significance``
         (``n / n_err``), ``n_background`` (accidentals removed from the same
-        window), ``car`` (``n / n_background``), ``window_ps`` and ``n_bins``.
+        window), ``car`` (``n / n_background``), ``window_s`` and ``n_bins``.
     """
-    keep = np.abs(sub["centers"]) <= window_ps
+    keep = np.abs(sub["centers"]) <= window_s * 1e12
     n = float(sub["residual"][keep].sum())
     n_err = float(np.sqrt((sub["error"][keep] ** 2).sum()))
     n_bkg = float(sub["background"][keep].sum())
@@ -285,7 +290,7 @@ def integrate_residual(sub: dict, *, window_ps: float) -> dict:
         # ratio 'delta_t' reports as 'car' from a fit. The two answer
         # different questions and will not agree.
         "car": n / n_bkg if n_bkg else np.inf,
-        "window_ps": float(window_ps),
+        "window_s": float(window_s),
         "n_bins": int(np.count_nonzero(keep)),
     }
 
@@ -319,9 +324,9 @@ def plot_background_subtraction(
     """Draw the subtraction: overlay, full-range residual, and the peak.
 
     Three panels, because the middle one is the evidence and it is the one
-    people skip: if the residual is *not* flat and zero out at +/-100 ns, the
-    pedestal was not accidental and no number from the third panel means
-    anything.
+    people skip: if the residual is *not* flat and zero out to the edge of the
+    TDC full scale, the pedestal was not accidental and no number from the third
+    panel means anything.
 
     Parameters
     ----------
@@ -352,7 +357,7 @@ def plot_background_subtraction(
         lw=1.2,
         label=f"shifted frames (mean of {wide['k']} lags)",
     )
-    ax.set_ylabel(f"per {wide['bin_width_ps']:.0f} ps")
+    ax.set_ylabel(f"per {wide['bin_width_s'] * 1e12:.0f} ps")
     ax.set_title(f"{label.upper()} delta-t, {name}")
     _legend_outside(ax)
     ax.grid(True, lw=0.5, alpha=0.6)
@@ -363,7 +368,7 @@ def plot_background_subtraction(
     )
     ax.plot(x, wide["residual"], lw=1.0, label="lag 0 - accidentals")
     ax.axhline(0, color="k", lw=0.8)
-    ax.set_ylabel(f"excess / {wide['bin_width_ps']:.0f} ps")
+    ax.set_ylabel(f"excess / {wide['bin_width_s'] * 1e12:.0f} ps")
     ax.set_title("Residual over the full support")
     _legend_outside(ax)
     ax.grid(True, lw=0.5, alpha=0.6)
@@ -375,7 +380,7 @@ def plot_background_subtraction(
     )
     ax.step(xz, result["residual"], where="mid", lw=1.0, label="subtracted")
     ax.axhline(0, color="k", lw=0.8)
-    ax.set_ylabel(f"excess / {result['bin_width_ps']:.0f} ps")
+    ax.set_ylabel(f"excess / {result['bin_width_s'] * 1e12:.0f} ps")
     ax.set_title("Coincidence peak on a zero baseline")
     _legend_outside(ax)
     ax.grid(True, lw=0.5, alpha=0.6)

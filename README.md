@@ -72,16 +72,18 @@ costs a load, not a re-read of the raw data.
 ```python
 from dapkel.functions import data_quality, dcr_analysis
 
-# 0. Did the TDC actually record timing? Codes should spread over 0..~1300,
+# 0. Did the TDC actually record timing? Codes should spread over the whole
+#    range for the clock in use (~1397 codes at 10 MHz, ~6985 at 2 MHz),
 #    not collapse onto a handful of values.
 data_quality.plot_time_code_histogram(
     "path/to/data", pixel=(16, 16), nframes=10_000
 )
 
-# 1 + 2. Compute the full-sensor DCR map and save both figures. 'acq_window' is
+# 1 + 2. Compute the full-sensor DCR map and save both figures.
+#        'open_shutter_time_s' is
 #    the photon-sensitive part of each frame, in SECONDS.
 dcr_analysis.collect_and_plot_dcr_64(
-    "path/to/data", nframes=1000, acq_window=100e-9
+    "path/to/data", nframes=1000, open_shutter_time_s=100e-9
 )
 ```
 
@@ -92,7 +94,9 @@ re-reading the raw files:
 from dapkel.core import store
 from dapkel.functions import dcr_analysis
 
-dcr_analysis.compute_and_save_dcr_64("path/to/data", 1000, acq_window=100e-9)
+dcr_analysis.compute_and_save_dcr_64(
+    "path/to/data", 1000, open_shutter_time_s=100e-9
+)
 
 dcr, meta = store.load_map("path/to/data", kind="dcr", tag="64")
 fig = dcr_analysis.plot_heatmap(dcr)

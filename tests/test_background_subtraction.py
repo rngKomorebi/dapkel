@@ -136,7 +136,7 @@ def test_subtraction_recovers_the_injected_pairs() -> None:
         counts, centers, bs.frames_per_lag(nframes, lags)
     )
 
-    peak = bs.integrate_residual(out, window_ps=1.0)
+    peak = bs.integrate_residual(out, window_s=1.0e-12)
     assert abs(peak["n"] - n_pairs) < 4 * peak["n_err"], (
         f"recovered {peak['n']:.0f} +/- {peak['n_err']:.0f} injected pairs, "
         f"expected {n_pairs}"
@@ -207,7 +207,7 @@ def test_integrate_residual_windows_and_adds_errors_in_quadrature() -> None:
     counts[1:] = [10, 10, 10, 10, 10, 10, 10]
     out = bs.subtract_background(counts, centers, [1000] * 3)
 
-    got = bs.integrate_residual(out, window_ps=100.0)
+    got = bs.integrate_residual(out, window_s=100.0e-12)
     assert got["n_bins"] == 3
     # 30 + 50 + 30 above a background of 10 per bin.
     np.testing.assert_allclose(got["n"], 110.0)
@@ -217,7 +217,7 @@ def test_integrate_residual_windows_and_adds_errors_in_quadrature() -> None:
         got["n_err"], np.sqrt((out["error"][2:5] ** 2).sum())
     )
     # A wider window sees the tails too.
-    assert bs.integrate_residual(out, window_ps=300.0)["n_bins"] == 7
+    assert bs.integrate_residual(out, window_s=300.0e-12)["n_bins"] == 7
 
 
 def test_plot_returns_a_figure_without_writing_anything() -> None:

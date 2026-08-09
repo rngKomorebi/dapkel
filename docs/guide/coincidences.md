@@ -14,17 +14,42 @@ A daplis-style pipeline for coincidence / timing-jitter analysis of the Kelpie
 
 ## Timing model
 
-Each acquisition window is ~9 µs, but the ring-oscillator TDC is a free-running
-~10 MHz clock. The recorded `time_series` value is therefore the oscillator
-*code* within one ~100 ns period (codes up to ~1300), and the timestamp in
-picoseconds is
+Each acquisition window is ~9 µs, but the ring-oscillator TDC measures only
+within one period of the **reference clock**. The recorded `time_series` value is
+the oscillator *code* on that range, and the timestamp is
 
 ```
-t_ps = code * time_unit_ps        with  time_unit_ps ≈ 100 ns / 1300 ≈ 77 ps
+t = code * time_unit_s        with  time_unit_s ≈ 71.6 ps  (core.timing.CODE_S)
 ```
 
-on average. The exact per-code bin widths come from a density-test LUT — pass it
-as `time_lut` once you have one; see [TDC calibration](tdc_calibration.md).
+on average. The ring sets that code width, so it does **not** change with the
+clock — only the number of codes does, as 1/f:
+
+| clock | full scale | codes |
+|---|---|---|
+| 50 MHz | 20 ns | ~279 |
+| 10 MHz | 100 ns | ~1397 |
+| 5 MHz | 200 ns | ~2794 |
+| 2 MHz | 500 ns | ~6985 |
+
+That full scale is what every entry point needs, as `open_shutter_time_s` (one
+clock period) or `full_scale_s`. It bounds a difference, so it is also the
+accidental triangle's half-base — see
+[the triangle background](../ort_triangle_background.md).
+
+The exact per-code bin widths come from a density-test LUT — pass it as
+`time_lut` once you have one; see [TDC calibration](tdc_calibration.md). **A LUT
+is specific to its clock**; the loaders check that for you and refuse a
+mismatch, because the silent version of that mistake costs 96 % of the
+coincidences at 2 MHz.
+
+### Units
+
+Every time parameter in the package is in **seconds**, with an `_s` suffix:
+`bin_width_s`, `plot_window_s`, `fit_window_s`, `support_s`, `time_unit_s`,
+`delta_window_s`, `open_shutter_time_s`. Histogram bin centres, edges and plot
+axes are in picoseconds — that is the scale the TDC lives on — and the
+conversion happens on entry.
 
 There is one timestamp per photon, per window, per macropixel.
 
@@ -122,7 +147,7 @@ processed/
   <dataset>_delta_hist.meta.json   <- binning, source fingerprint, statistics
 ```
 
-The sidecar records `bin_width_ps`, `plot_window_ps`, `time_unit_ps`, `pairs`
+The sidecar records `bin_width_s`, `plot_window_s`, `time_unit_s`, `pairs`
 and a fingerprint of the source files. A saved histogram is reused only when
 all of it matches, so changing the binning or rewriting the feather re-streams
 automatically; pass `reuse=False` (or `reuse_histogram=False` to the plot
@@ -135,7 +160,10 @@ another read of the feather.
 
 ```python
 counts, centers, fit = dt.collect_and_plot_timestamp_differences(
-    path, background="triangle", plot_window_ps=100_000
+    path,
+    background="triangle",
+    open_shutter_time_s=100e-9,
+    plot_window_s=100e-9,
 )
 narrow = np.abs(centers) < 1000
 dt.fit_gaussian_peak(centers[narrow], counts[narrow])
@@ -191,25 +219,32 @@ columns you could afford to stream.
 
 ### Choosing the grid
 
-Two arguments, `grid_ps` (cell width) and `support_ps` (half-range):
+Two arguments, `grid_s` (cell width) and `support_s` (half-range):
 
 | data | default cell | why |
 |---|---|---|
-| raw codes (`apply_TDC_calibration=False`) | one code, ~77 ps | `delta_code` is an **integer**, so counts-per-code is a re-encoding, not a summary — exactly lossless |
-| calibrated (`unit='ps'`) | 1/10 code, ~7.7 ps | the per-pixel LUT smears the code lattice; 7.7 ps is ~5× finer than the jitter |
+| raw codes (`apply_TDC_calibration=False`) | one code, ~71.6 ps | `delta_code` is an **integer**, so counts-per-code is a re-encoding, not a summary — exactly lossless |
+| calibrated (`unit='ps'`) | 1/10 code, ~7.2 ps | the per-pixel LUT smears the code lattice; 7.2 ps is ~5× finer than the jitter |
 
-`support_ps` defaults to 200 ns — one oscillator period, the entire range a
-difference can physically occupy. Anything landing outside is reported as
-`n_outside` rather than dropped silently; if that is not ~0, widen it.
+`support_s` defaults to **twice the TDC full scale** — read off the LUT when
+there is one, else from `open_shutter_time_s`. A difference cannot exceed the
+full scale, so that covers the whole physical support at any clock; a fixed
+200 ns was 10× too wide at 50 MHz and 2.5× too narrow at 2 MHz. Anything landing
+outside is reported as `n_outside` rather than dropped silently; if that is not
+~0, widen it.
 
 ### Re-binning is free, and exact
 
-`plot_window_ps` becomes a slice and `bin_width_ps` a reduce, both in memory:
+`plot_window_s` becomes a slice and `bin_width_s` a reduce, both in memory:
 
 ```python
 dt.collect_and_plot_delta_counts(
-    path, pairs=["6,10-21,22"], bin_width_ps=71,
-    plot_window_ps=10e3, background="triangle", osc_period_ps=200e3,
+    path,
+    pairs=["6,10-21,22"],
+    bin_width_s=71e-12,
+    plot_window_s=10e-9,
+    background="triangle",
+    full_scale_s=500e-9,        # or leave it to open_shutter_time_s
 )
 ```
 
@@ -230,7 +265,7 @@ it is the same histogram. Pass `snap_to_grid=False` to take your numbers
 literally, and you will be warned about the sawtooth you are asking for.
 
 The one honest disagreement is the outermost bin at each end. The feather path
-cuts data at `abs(delta) <= plot_window_ps` but draws edges half a bin beyond
+cuts data at `abs(delta) <= plot_window_s` but draws edges half a bin beyond
 it, so its first and last bins can only ever be part filled; the counts path
 fills them. That, not the method, is why fitted `sigma` differs by ~1%.
 
@@ -269,7 +304,7 @@ than fitted. Both stage-1 paths take it, and both give the same residual — see
 dt.calculate_and_save_delta_counts(path, [signal, idler], nframes=10_000,
                                    subtract_background=True)
 counts, centers, fit = dt.collect_and_plot_delta_counts(
-    path, subtract_background=True, peak_window_ps=2_000.0)
+    path, subtract_background=True, peak_window_s=2e-9)
 
 # feather path: same call, but the lags cost one column set each - so ~9x the
 # feather at the default eight lags. Use fewer, or use the counts path.
@@ -277,7 +312,7 @@ dt.calculate_and_save_timestamp_differences(path, [signal, idler], nframes=10_00
                                             subtract_background=True,
                                             background_lags=(1, 2, 3, 4))
 counts, centers, fit = dt.collect_and_plot_timestamp_differences(
-    path, subtract_background=True, peak_window_ps=2_000.0)
+    path, subtract_background=True, peak_window_s=2e-9)
 ```
 
 The feather's lag columns are named `<pair>@lag<k>`; lag 0 keeps the bare pair

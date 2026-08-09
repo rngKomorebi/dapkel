@@ -51,7 +51,7 @@ Two versions, selected with `firmware_version`
 | `firmware_version` | cycle | notes |
 |---|---|---|
 | `"short_exposure"` (default) | always **9 µs** | the photon-sensitive exposure inside the cycle is 50–500 ns, typically 100 ns |
-| `"long_exposure"` | **`exp_time` + 9 µs** | you set X, the firmware adds 9 µs. `exp_time` is required |
+| `"long_exposure"` | **`exp_time_s` + 9 µs** | you set X, the firmware adds 9 µs. `exp_time_s` is required |
 
 `"short_window"` / `"full_window"` are accepted as aliases of the two, since
 that is what [`resolve_live_time`][dapkel.core.timing.resolve_live_time] and
@@ -62,7 +62,7 @@ that is what [`resolve_live_time`][dapkel.core.timing.resolve_live_time] and
     in dapkel reads it: it is produced by an exe we do not control, so no
     analysis result is allowed to depend on it. The cycle length is a property
     of the firmware and the requested exposure, and `Kelpie_run.m` states it
-    directly: `exp_time = 0 → 9 µs`, `1e-6 → 10 µs`, `2e-6 → 11 µs`.
+    directly: `exp_time_s = 0 → 9 µs`, `1e-6 → 10 µs`, `2e-6 → 11 µs`.
 
     It is worth knowing what the counter says, though, because it disagrees
     with the nominal figure. It is a 200 MHz tick count over the whole run,
@@ -128,7 +128,7 @@ hm.compute_and_save_hitmap(path, 10_000, "timestamp", "ORT",
 
 # long-exposure firmware: you set X, the firmware adds 9 µs
 hm.compute_and_save_hitmap(path, 10_000, "timestamp", "ORT",
-                           firmware_version="long_exposure", exp_time=91e-6)
+                           firmware_version="long_exposure", exp_time_s=91e-6)
 
 hm.collect_and_plot_hitmap(path, "timestamp", "ORT")   # counts + rate figures
 ```

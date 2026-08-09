@@ -55,7 +55,7 @@ def as_pixel_list(group: Pixel | Sequence[Pixel]) -> list[Pixel]:
 def calculate_differences(
     pixel_timestamps: dict[Pixel, np.ndarray],
     pixels: Sequence[Sequence[Pixel]],
-    delta_window: float | None = None,
+    delta_window_native: float | None = None,
     mode: str = "all_pairs",
 ) -> dict[str, np.ndarray]:
     """Compute per-window timestamp differences for pairs of pixels.
@@ -77,9 +77,14 @@ def calculate_differences(
         Two groups ``[group_a, group_b]``, each a sequence of
         ``(row, col)`` pixels (e.g. the signal and idler blobs read off the
         hitmap). A single ``(row, col)`` is accepted for a one-pixel group.
-    delta_window : float | None, optional
-        If given, keep only differences with ``abs(delta) <= delta_window``
-        (same units as the timestamps). The default is None (keep all).
+    delta_window_native : float | None, optional
+        If given, keep only differences with
+        ``abs(delta) <= delta_window_native``. **In the same units as
+        ``pixel_timestamps``** - picoseconds when a calibration LUT has been
+        applied upstream, raw TDC codes when it has not - which is why this one
+        parameter is not in seconds like the rest of the package: the unit is
+        the caller's to know. 'delta_t' converts a ``delta_window_s`` for you.
+        The default is None (keep all).
     mode : str, optional
         ``'all_pairs'`` (default) forms the full cross product of
         ``group_a`` x ``group_b`` — use this for SPDC/HBT when it is not
@@ -120,8 +125,8 @@ def calculate_differences(
         tb = pixel_timestamps[b]
         both = ~np.isnan(ta) & ~np.isnan(tb)
         d = tb[both] - ta[both]
-        if delta_window is not None:
-            d = d[np.abs(d) <= delta_window]
+        if delta_window_native is not None:
+            d = d[np.abs(d) <= delta_window_native]
         deltas_all[f"{a[0]},{a[1]}-{b[0]},{b[1]}"] = d
 
     return deltas_all

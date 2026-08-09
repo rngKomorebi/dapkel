@@ -239,6 +239,9 @@ def test_confirm_rewrite_actually_waits(tmp_path):
 
 PAIRS = [[(0, 0), (0, 1)], [(1, 0), (1, 1)]]
 NFRAMES = 20
+# One reference-clock period at 10 MHz. Stage 1 requires it: the TDC full scale
+# is this window, so nothing downstream is right without it.
+SHUTTER_S = 100e-9
 
 
 def _fake_run(tmp_path, n_files=6):
@@ -270,6 +273,7 @@ def test_end_to_end_streams_parts_and_combines_them(tmp_path, monkeypatch):
         PAIRS,
         apply_TDC_calibration=False,
         nframes=NFRAMES,
+        open_shutter_time_s=SHUTTER_S,
     )
 
     parts_dir = tmp_path / "run" / "processed" / "run_delta_t_parts"
@@ -295,6 +299,7 @@ def test_end_to_end_part_size_does_not_change_the_result(tmp_path, monkeypatch):
             PAIRS,
             apply_TDC_calibration=False,
             nframes=NFRAMES,
+            open_shutter_time_s=SHUTTER_S,
         )
         results[part_mb] = _columns(out)
 
@@ -306,7 +311,11 @@ def test_end_to_end_part_size_does_not_change_the_result(tmp_path, monkeypatch):
 
 def test_end_to_end_rewrite_guard(tmp_path, monkeypatch, capsys):
     folder = _fake_run(tmp_path, n_files=2)
-    kwargs = {"apply_TDC_calibration": False, "nframes": NFRAMES}
+    kwargs = {
+        "apply_TDC_calibration": False,
+        "nframes": NFRAMES,
+        "open_shutter_time_s": SHUTTER_S,
+    }
     monkeypatch.setattr(dt, "_PART_MB", 1 / 1024)
     dt.calculate_and_save_timestamp_differences(str(folder), PAIRS, **kwargs)
 
@@ -328,7 +337,11 @@ def test_end_to_end_rewrite_guard(tmp_path, monkeypatch, capsys):
 def test_end_to_end_rewrite_does_not_pool_the_previous_run(tmp_path, monkeypatch):
     """Stale parts must be cleared, or a rewrite doubles the data."""
     folder = _fake_run(tmp_path, n_files=3)
-    kwargs = {"apply_TDC_calibration": False, "nframes": NFRAMES}
+    kwargs = {
+        "apply_TDC_calibration": False,
+        "nframes": NFRAMES,
+        "open_shutter_time_s": SHUTTER_S,
+    }
     monkeypatch.setattr(dt, "_PART_MB", 1 / 1024)
     first = _columns(
         dt.calculate_and_save_timestamp_differences(str(folder), PAIRS, **kwargs)
@@ -358,6 +371,7 @@ def test_end_to_end_keeps_the_parts_after_combining(tmp_path, monkeypatch):
         PAIRS,
         apply_TDC_calibration=False,
         nframes=NFRAMES,
+        open_shutter_time_s=SHUTTER_S,
     )
 
     parts_dir = tmp_path / "run" / "processed" / "run_delta_t_parts"
@@ -387,17 +401,22 @@ def test_end_to_end_keeps_the_parts_after_combining(tmp_path, monkeypatch):
 TIME_UNIT_PS = 77.0
 BIN_PS = 77.0
 WINDOW_PS = 3000.0
+# The library takes seconds; these tests were written in ps, so convert once
+# here rather than restating every number.
+TIME_UNIT_S = TIME_UNIT_PS * 1e-12
+BIN_S = BIN_PS * 1e-12
+WINDOW_S = WINDOW_PS * 1e-12
 
 
 def _reference_histogram(
-    feather, *, edges, time_unit_ps=TIME_UNIT_PS, window_ps=WINDOW_PS
+    feather, *, edges, time_unit_s=TIME_UNIT_S, window_s=WINDOW_S
 ):
     """Histogram the old way: load everything, pool it, bin it once."""
     df, unit = dt._read_delta_feather(feather)
     vals = df.to_numpy().ravel()
     pooled = vals[~np.isnan(vals)]
-    deltas_ps = pooled if unit == "ps" else pooled * time_unit_ps
-    inside = deltas_ps[np.abs(deltas_ps) <= window_ps]
+    deltas_ps = pooled if unit == "ps" else pooled * time_unit_s * 1e12
+    inside = deltas_ps[np.abs(deltas_ps) <= window_s * 1e12]
     return np.histogram(inside, bins=edges)[0], inside.size
 
 
@@ -431,8 +450,8 @@ def test_streamed_histogram_is_identical_to_loading_the_whole_table(tmp_path):
     counts, stats = dt._stream_delta_histogram(
         [combined],
         edges=edges,
-        time_unit_ps=TIME_UNIT_PS,
-        plot_window_ps=WINDOW_PS,
+        time_unit_s=TIME_UNIT_S,
+        plot_window_s=WINDOW_S,
         quiet=True,
     )
     expected, expected_n = _reference_histogram(combined, edges=edges)
@@ -456,8 +475,8 @@ def test_parts_and_combined_give_the_same_histogram(tmp_path):
     edges = dt._delta_hist_edges(BIN_PS, WINDOW_PS)
     kwargs = {
         "edges": edges,
-        "time_unit_ps": TIME_UNIT_PS,
-        "plot_window_ps": WINDOW_PS,
+        "time_unit_s": TIME_UNIT_S,
+        "plot_window_s": WINDOW_S,
         "quiet": True,
     }
 
@@ -471,7 +490,7 @@ def test_parts_and_combined_give_the_same_histogram(tmp_path):
 
 
 def test_ps_feathers_are_not_rescaled(tmp_path):
-    """A 'ps' feather is already calibrated; time_unit_ps must not apply."""
+    """A 'ps' feather is already calibrated; time_unit_s must not apply."""
     path = str(tmp_path / "run_delta_t.feather")
     dt._write_delta_feather(
         path, {"0,0-1,1": np.array([0.0, 100.0, -100.0])}, ["0,0-1,1"], "ps"
@@ -481,15 +500,15 @@ def test_ps_feathers_are_not_rescaled(tmp_path):
     counts, stats = dt._stream_delta_histogram(
         [path],
         edges=edges,
-        time_unit_ps=TIME_UNIT_PS,
-        plot_window_ps=WINDOW_PS,
+        time_unit_s=TIME_UNIT_S,
+        plot_window_s=WINDOW_S,
         quiet=True,
     )
     np.testing.assert_array_equal(
         counts, _reference_histogram(path, edges=edges)[0]
     )
     assert stats["unit"] == "ps"
-    assert stats["granularity_ps"] == 100.0  # not 100 * 77
+    assert stats["granularity_s"] == 100.0e-12  # not 100 * 77
 
 
 def test_padding_is_dropped_and_measured(tmp_path):
@@ -504,8 +523,8 @@ def test_padding_is_dropped_and_measured(tmp_path):
     counts, stats = dt._stream_delta_histogram(
         [path],
         edges=dt._delta_hist_edges(BIN_PS, WINDOW_PS),
-        time_unit_ps=TIME_UNIT_PS,
-        plot_window_ps=WINDOW_PS,
+        time_unit_s=TIME_UNIT_S,
+        plot_window_s=WINDOW_S,
         quiet=True,
     )
 
@@ -528,8 +547,8 @@ def test_out_of_window_differences_are_excluded_but_still_counted(tmp_path):
     counts, stats = dt._stream_delta_histogram(
         [path],
         edges=dt._delta_hist_edges(BIN_PS, WINDOW_PS),
-        time_unit_ps=TIME_UNIT_PS,
-        plot_window_ps=WINDOW_PS,
+        time_unit_s=TIME_UNIT_S,
+        plot_window_s=WINDOW_S,
         quiet=True,
     )
 
@@ -543,8 +562,8 @@ def test_missing_pairs_are_reported_not_fatal(tmp_path, capsys):
     counts, stats = dt._stream_delta_histogram(
         [combined],
         edges=dt._delta_hist_edges(BIN_PS, WINDOW_PS),
-        time_unit_ps=TIME_UNIT_PS,
-        plot_window_ps=WINDOW_PS,
+        time_unit_s=TIME_UNIT_S,
+        plot_window_s=WINDOW_S,
         pairs=[LABELS[0], "31,31-30,30"],
         quiet=True,
     )
@@ -596,7 +615,7 @@ def test_a_different_binning_re_streams(tmp_path):
 
     dt.compute_and_save_delta_histogram(str(root), quiet=True)
     counts, edges, info = dt.compute_and_save_delta_histogram(
-        str(root), bin_width_ps=BIN_PS * 4, quiet=True
+        str(root), bin_width_s=BIN_S * 4, quiet=True
     )
 
     assert info["reused"] is False
@@ -748,6 +767,7 @@ def test_stage_one_refuses_to_start_on_top_of_stale_parts(tmp_path):
             [[(0, 0)], [(1, 1)]],
             nframes=NFRAMES,
             apply_TDC_calibration=False,
+            open_shutter_time_s=SHUTTER_S,
         )
     # The refusal must not have destroyed the parts it refused over.
     assert len(dt._all_part_files(str(processed / "run_delta_t_parts"))) == 2
@@ -838,7 +858,8 @@ def test_one_batch_and_many_batches_histogram_identically(tmp_path):
         assert reader.num_record_batches > 1
 
     edges = dt._delta_hist_edges(77.0, 3080.0)
-    kwargs = dict(edges=edges, time_unit_ps=77.0, plot_window_ps=3080.0,
+    kwargs = dict(edges=edges, time_unit_s=77.0e-12,
+                  plot_window_s=3080.0e-12,
                   pairs=None, quiet=True)
     one_counts, one_stats = dt._stream_delta_histogram([single], **kwargs)
     many_counts, many_stats = dt._stream_delta_histogram([many], **kwargs)
@@ -941,8 +962,8 @@ def test_every_lag_is_histogrammed_in_one_pass(tmp_path):
     edges = dt._delta_hist_edges(BIN_PS, WINDOW_PS)
     kwargs = {
         "edges": edges,
-        "time_unit_ps": TIME_UNIT_PS,
-        "plot_window_ps": WINDOW_PS,
+        "time_unit_s": TIME_UNIT_S,
+        "plot_window_s": WINDOW_S,
         "quiet": True,
     }
 
@@ -1000,10 +1021,10 @@ def test_the_subtracted_driver_returns_the_residual(tmp_path):
 
     counts, centers, fit = dt.collect_and_plot_timestamp_differences(
         feather_path=path,
-        bin_width_ps=100.0,
-        plot_window_ps=500.0,
-        support_ps=1000.0,
-        peak_window_ps=100.0,
+        bin_width_s=100.0e-12,
+        plot_window_s=500.0e-12,
+        support_s=1000.0e-12,
+        peak_window_s=100.0e-12,
         subtract_background=True,
         label="test",
     )

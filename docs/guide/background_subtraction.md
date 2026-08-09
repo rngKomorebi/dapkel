@@ -1,6 +1,8 @@
 # Background subtraction — removing the accidentals by shifting frames
 
-The ORT accidental background is a **triangle** filling ±100 ns, and it sits
+The ORT accidental background is a **triangle** filling ± one TDC full scale
+(one reference-clock period: 20 ns at 50 MHz, 100 ns at 10 MHz, 500 ns at
+2 MHz), and it sits
 directly under the coincidence peak — [why](../ort_triangle_background.md).
 Fitting it is possible (`fit_gaussian_on_triangle`), but then the coincidence
 count you report depends on a model: on the triangle really being a triangle,
@@ -43,9 +45,9 @@ dt.calculate_and_save_delta_counts(
 counts, centers, fit = dt.collect_and_plot_delta_counts(
     path,
     subtract_background=True,
-    bin_width_ps=231.0,
-    plot_window_ps=10_000.0,
-    peak_window_ps=2_000.0,
+    bin_width_s=231e-12,
+    plot_window_s=10e-9,
+    peak_window_s=2e-9,
 )
 print(fit["model_free"])       # {'n': ..., 'n_err': ..., 'car': ..., ...}
 ```
@@ -65,8 +67,8 @@ dt.calculate_and_save_timestamp_differences(
     subtract_background=True, background_lags=(1, 2, 3, 4),
 )
 counts, centers, fit = dt.collect_and_plot_timestamp_differences(
-    path, subtract_background=True, bin_width_ps=231.0,
-    plot_window_ps=10_000.0, peak_window_ps=2_000.0,
+    path, subtract_background=True, bin_width_s=231e-12,
+    plot_window_s=10e-9, peak_window_s=2e-9,
 )
 ```
 
@@ -126,7 +128,7 @@ period — not by the analysis. Nothing downstream of the camera can change it.
 **It does give you two things worth having:**
 
 * a **model-free coincidence count**. Sum the residual over a window
-  (`peak_window_ps`, reported as `fit["model_free"]`). No Gaussian, no triangle,
+  (`peak_window_s`, reported as `fit["model_free"]`). No Gaussian, no triangle,
   no fitter that can trade peak area against background slope;
 * a **test of whether the pedestal is accidental at all**. If the residual is
   flat and zero away from the peak, it was. If it is not, something else is
@@ -203,15 +205,16 @@ file count. The subtraction only ever uses the ratio
 cancels — so a part folder left by a run that died is as usable as a complete
 feather.
 
-The grid is the counts path's own — `grid_ps` cells over ±`support_ps`, one TDC
+The grid is the counts path's own — `grid_s` cells over ±`support_s`, one TDC
 code per cell for raw-code data (where that is *lossless*, since `delta_code` is
 an integer) and a tenth of a code when calibrated. See
 [Choosing the grid](coincidences.md#choosing-the-grid).
 
-Holding the full support matters here: the flat-zero residual out at ±100 ns is
+Holding the full support matters here: the flat-zero residual out at the edge of
+the full scale is
 the evidence, and you cannot see it through a ±10 ns window. That is why the
-feather path streams over `support_ps` (default 100 ns) rather than
-`plot_window_ps` when subtracting — the fitted zoom is then a *slice* of that
+feather path streams over `support_s` (one TDC full scale by default) rather than
+`plot_window_s` when subtracting — the fitted zoom is then a *slice* of that
 histogram and the diagnostic's wide panels a regrouping of it, so widening the
 plot window afterwards costs nothing and the panels cannot disagree about a bin
 edge.
@@ -234,7 +237,7 @@ count *is* the coincidence count.
 
 ## A real subtlety: the continuum is slightly over-subtracted
 
-On real data the residual integrated over the whole ±100 ns comes out a little
+On real data the residual integrated over the whole full scale comes out a little
 **below** the peak excess — a deficit of ~0.2% of the accidental continuum.
 
 That is physics, not a bug. ORT keeps **one timestamp per pixel per frame**, the

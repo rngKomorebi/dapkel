@@ -1,5 +1,13 @@
 # Why the Kelpie ORT coincidence background is a triangle
 
+> **Note on the clock.** This document is written for the 10 MHz reference clock,
+> where the oscillator period `P` is 100 ns. `P` is **one period of the reference
+> clock**, so it is 20 ns at 50 MHz, 200 ns at 5 MHz and 500 ns at 2 MHz, and the
+> triangle's base, the CAR penalty `T/P` and the number of folded cycles all move
+> with it. Every formula below is in terms of `P`; only the numbers assume
+> 100 ns. In code, pass `open_shutter_time_s` (or `full_scale_s`) — nothing
+> assumes 100 ns any more.
+
 **TL;DR** — The Kelpie ORT timestamp records only *where in a 100 ns oscillator
 cycle* a photon arrived, not *which* cycle inside the ~9 µs frame. That single
 fact — **losing the absolute timestamp and keeping only the phase** — turns the
@@ -181,7 +189,8 @@ triangle from −100 ns to +100 ns with a sharp spike at 0.
 The information that would flatten the background — the cycle index `k`, i.e. the
 absolute time within the frame — **was never recorded**. Verified against the
 MATLAB reference decoder (`kelpie_data_ddr3.m`): the timestamp field is only a
-10‑bit coarse + 4‑bit fine value that wraps at ~1300 codes (~100 ns), with no
+10‑bit coarse + 4‑bit fine value that wraps at `P / 71.6 ps` codes (~1397 at
+10 MHz, ~6985 at 2 MHz; the field itself saturates at 8184 ≈ 586 ns), with no
 counter for `k`. You cannot un‑fold a triangle back into a flat background
 without `k`.
 
@@ -208,6 +217,6 @@ Only recovering absolute time, or shrinking the fold:
 
 The triangle explains the background **shape** and the **contrast**, but not the
 peak **width** (~500 ps measured vs ~100 ps expected). That is a timing‑
-resolution question — code→time calibration (the flat 77 ps/code is only an
+resolution question — code→time calibration (the flat ~71.6 ps/code is only an
 average; the density‑test LUT gives per‑code widths) and detector jitter — and
 is independent of everything in this document.
