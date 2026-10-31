@@ -40,7 +40,7 @@ __all__ = [
 #: Analysis name: the stage-1 file stem and the results sub-folder.
 _KIND = "hitmap"
 
-# Default open shutter time, in seconds - the usual short_window setting. Used
+# Default open shutter time, in seconds - the usual short_exposure setting. Used
 # only as a fallback for a sidecar saved before 'frame_live_s' was recorded in
 # it; every new hitmap stores the live time 'timing.resolve_live_time' resolved
 # from the firmware version and open_shutter_time_s it was given.
@@ -120,7 +120,7 @@ def _accumulate_hitmap(
 
 
 def compute_hitmap(
-    folder: str,
+    path: str,
     nframes: int,
     mode: str = "timestamp",
     tag: str = "ORT",
@@ -132,8 +132,8 @@ def compute_hitmap(
 
     Parameters
     ----------
-    folder : str
-        Path to the folder with the '.bin' data files.
+    path : str
+        Path to the path with the '.bin' data files.
     nframes : int
         Number of frames stored in each '.bin' file.
     mode : str, optional
@@ -144,7 +144,7 @@ def compute_hitmap(
     tag : str, optional
         Filename fragment selecting the files (e.g. ``'ORT'``, ``'ORC'``,
         or a SPAD quadrant tag ``'S0C'``). Use ``''`` to match every
-        '.bin' file in the folder. The default is ``'ORT'``.
+        '.bin' file in the path. The default is ``'ORT'``.
     max_files : int | None, optional
         Process at most this many files (after natural sorting). Useful
         for a quick preview over a large batch. The default is None (all
@@ -155,7 +155,7 @@ def compute_hitmap(
     np.ndarray
         The (32, 32) hitmap.
     """
-    files = io.find_bin_files(folder, tag)
+    files = io.find_bin_files(path, tag)
     if max_files is not None:
         files = files[:max_files]
     return _accumulate_hitmap(
@@ -164,7 +164,7 @@ def compute_hitmap(
 
 
 def compute_hitmap_64(
-    folder: str,
+    path: str,
     nframes: int,
     max_files: int | None = None,
 ) -> np.ndarray:
@@ -176,8 +176,8 @@ def compute_hitmap_64(
 
     Parameters
     ----------
-    folder : str
-        Path to the folder with the S*C '.bin' data files.
+    path : str
+        Path to the path with the S*C '.bin' data files.
     nframes : int
         Number of frames stored in each '.bin' file.
     max_files : int | None, optional
@@ -192,11 +192,11 @@ def compute_hitmap_64(
     ------
     FileNotFoundError
         Raised when no '.bin' files for any of the four SPAD tags are
-        found in the folder.
+        found in the path.
     """
     tag_files = {}
     for tag in _SPAD_LAYOUT:
-        files = glob.glob(os.path.join(folder, f"*_{tag}*.bin"))
+        files = glob.glob(os.path.join(path, f"*_{tag}*.bin"))
         if files:
             files = sorted(
                 files,
@@ -207,7 +207,7 @@ def compute_hitmap_64(
             tag_files[tag] = files[:max_files] if max_files else files
     if not tag_files:
         raise FileNotFoundError(
-            "No S0C/S1C/S2C/S3C .bin files found in:\n  " + folder
+            "No S0C/S1C/S2C/S3C .bin files found in:\n  " + path
         )
 
     quadrants = {
@@ -224,6 +224,7 @@ def plot_hitmap(
     clabel: str = "hits",
     name: str = "Hitmap",
     show_total: bool = True,
+    clip_colorbar_to: float | None = 99.0,
 ) -> plt.Figure:
     """Render a (32, 32)/(64, 64) map as a 2D image.
 
@@ -248,6 +249,11 @@ def plot_hitmap(
     show_total : bool, optional
         Include the summed total in the title. Meaningful for counts, not
         for a rate map. The default is True.
+    clip_colorbar_to : float | None, optional
+        Percentile used as the colour-scale ceiling, so a few hot pixels do
+        not compress the rest of the map into one shade. The default is 99.
+        Pass None for an unclipped scale running to the true maximum - the
+        one quoted in the title either way.
 
     Returns
     -------
@@ -266,6 +272,7 @@ def plot_hitmap(
         title=f"{name}  {rows}×{cols}\n{stats}  [{clabel}]",
         clabel=clabel,
         cmap=cmap,
+        clip_colorbar_to=clip_colorbar_to,
     )
 
 
@@ -301,13 +308,13 @@ def _acquisition_meta(
     nframes : int
         Frames per file, as the acquisition was set.
     firmware_version : str
-        ``'short_window'`` or ``'full_window'``; see
+        ``'short_exposure'`` or ``'long_exposure'``; see
         'core.timing.resolve_live_time'.
     exp_time_s : float | None
-        Legacy exposure time requested of 'full_window' firmware, in seconds.
+        Legacy exposure time requested of 'long_exposure' firmware, in seconds.
     open_shutter_time_s : float | None
         Photon-sensitive shutter window per frame, in seconds. Required for
-        ``firmware_version='short_window'`` - this is what the rate divides
+        ``firmware_version='short_exposure'`` - this is what the rate divides
         by.
 
     Returns
@@ -318,7 +325,7 @@ def _acquisition_meta(
     Raises
     ------
     ValueError
-        Raised when ``firmware_version='short_window'`` but no
+        Raised when ``firmware_version='short_exposure'`` but no
         ``open_shutter_time_s`` is given.
     """
     nfr = int(nframes)
@@ -331,7 +338,7 @@ def _acquisition_meta(
     )
     if live_s is None:
         raise ValueError(
-            "firmware_version='short_window' needs open_shutter_time_s (the "
+            "firmware_version='short_exposure' needs open_shutter_time_s (the "
             "photon-sensitive shutter time per frame, in seconds, e.g. "
             "500e-9)."
         )
@@ -356,7 +363,7 @@ def compute_and_save_hitmap(
     mode: str = "timestamp",
     tag: str = "ORT",
     *,
-    firmware_version: str = "short_window",
+    firmware_version: str = "short_exposure",
     exp_time_s: float | None = None,
     open_shutter_time_s: float | None = 500e-9,
     max_files: int | None = None,
@@ -385,19 +392,20 @@ def compute_and_save_hitmap(
         Filename fragment selecting the files. The default is ``'ORT'``.
     firmware_version : str, optional
         Which firmware took the data, i.e. how much of each ~9 µs frame is
-        photon-sensitive: ``'short_window'`` (the default) means only
-        ``open_shutter_time_s`` is live; ``'full_window'`` means the whole
+        photon-sensitive: ``'short_exposure'`` (the default) means only
+        ``open_shutter_time_s`` is live; ``'long_exposure'`` means the whole
         ``exp_time_s + 9 µs`` cycle is live. See
         'core.timing.resolve_live_time'.
     exp_time_s : float | None, optional
-        Legacy exposure time requested of ``firmware_version='full_window'``,
+        Legacy exposure time requested of ``firmware_version='long_exposure'``,
         in seconds; the firmware adds 9 µs to it. Required for
-        ``firmware_version='full_window'``, ignored otherwise. The default
+        ``firmware_version='long_exposure'``, ignored otherwise. The default
         is None.
     open_shutter_time_s : float | None, optional
-        Photon-sensitive shutter window per frame, in seconds (50-500 ns on
-        the short-window firmware). This is the rate's denominator - required
-        for ``firmware_version='short_window'``. The default is ``500e-9``
+        Photon-sensitive shutter window per frame, in seconds (anywhere from
+        ~50 ns to the full 9 µs cycle on the short-exposure firmware, so it
+        cannot be guessed). This is the rate's denominator - required
+        for ``firmware_version='short_exposure'``. The default is ``500e-9``
         (500 ns).
     max_files : int | None, optional
         Process at most this many files. The default is None (all files).
@@ -434,7 +442,7 @@ def compute_and_save_hitmap_64(
     path: str,
     nframes: int,
     *,
-    firmware_version: str = "short_window",
+    firmware_version: str = "short_exposure",
     exp_time_s: float | None = None,
     open_shutter_time_s: float | None = 500e-9,
     max_files: int | None = None,
@@ -454,11 +462,11 @@ def compute_and_save_hitmap_64(
     nframes : int
         Number of frames the acquisition was set to record per '.bin' file.
     firmware_version : str, optional
-        ``'short_window'`` (default, only ``open_shutter_time_s`` is live) or
-        ``'full_window'`` (``exp_time_s`` + 9 µs, entirely live); see
+        ``'short_exposure'`` (default, only ``open_shutter_time_s`` is live) or
+        ``'long_exposure'`` (``exp_time_s`` + 9 µs, entirely live); see
         'compute_and_save_hitmap'.
     exp_time_s : float | None, optional
-        Legacy exposure time requested of ``firmware_version='full_window'``,
+        Legacy exposure time requested of ``firmware_version='long_exposure'``,
         in seconds. The default is None.
     open_shutter_time_s : float | None, optional
         Photon-sensitive shutter window per frame, in seconds - the rate's
@@ -507,8 +515,8 @@ def _live_seconds(meta: dict) -> tuple[float | None, float]:
     """Return the acquisition's ``(total live seconds, live seconds/frame)``.
 
     ``total_frames * frame_live_s``: the shutter-open time of the run - only
-    ``open_shutter_time_s`` under short-window firmware, the whole ``exp_time_s + 9 µs``
-    cycle under full-window - so this is the denominator of the photon rate.
+    ``open_shutter_time_s`` under short-exposure firmware, the whole ``exp_time_s + 9 µs``
+    cycle under long-exposure - so this is the denominator of the photon rate.
     Both factors are read from the sidecar, the ``nframes``/``open_shutter_time_s``/
     firmware the stage-1 call was given, and neither is re-derived from the
     '.bin' files: their size is a fixed DDR3 dump larger than the acquisition,
@@ -536,6 +544,7 @@ def collect_and_plot_hitmap(
     npy_path: str | None = None,
     cmap: str | None = None,
     rate: bool = True,
+    clip_colorbar_to: float | None = 99.0,
 ) -> np.ndarray:
     """Load a saved hitmap '.npy' and save its hitmap plot(s).
 
@@ -569,6 +578,11 @@ def collect_and_plot_hitmap(
         use the active style's ``image.cmap``.
     rate : bool, optional
         Also save the photon-rate hitmap. The default is True.
+    clip_colorbar_to : float | None, optional
+        Percentile the colour scale of both maps is clipped at, so a few hot
+        pixels do not compress the rest into one shade. The default is 99.
+        Pass None to run the scale to the true maximum - the value quoted in
+        the title either way, which is why a clipped bar ends below it.
 
     Returns
     -------
@@ -612,13 +626,18 @@ def collect_and_plot_hitmap(
     results_dir = store.results_dir(root, _KIND)
 
     # 1) counts / occupancy map
-    fig_counts = plot_hitmap(hitmap, cmap=cmap, clabel=counts_clabel)
+    fig_counts = plot_hitmap(
+        hitmap,
+        cmap=cmap,
+        clabel=counts_clabel,
+        clip_colorbar_to=clip_colorbar_to,
+    )
     store.save_figure(fig_counts, results_dir, f"{base}.png")
     plt.close(fig_counts)
 
     # 2) photon-rate map: hits / live seconds, i.e.
     #    hits / (nframes * n_files * open_shutter_time_s). Only the acquisition window
-    #    inside each ~9 us frame is photon-sensitive (short-window firmware),
+    #    inside each ~9 us frame is photon-sensitive (short-exposure firmware),
     #    so this is the photon flux during the exposure, not diluted by the
     #    readout dead time, for both modes.
     #
@@ -642,6 +661,7 @@ def collect_and_plot_hitmap(
                 clabel="Hz",
                 name="Photon rate",
                 show_total=False,
+                clip_colorbar_to=clip_colorbar_to,
             )
             store.save_figure(fig_rate, results_dir, f"{base}_rate.png")
             # plt.close(fig_rate)  # left open on purpose, for interactive use

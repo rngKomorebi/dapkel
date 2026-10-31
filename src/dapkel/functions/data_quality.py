@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 
-from dapkel.core import io
+from dapkel.core import io, timing
 from dapkel.functions import calc_diff as cd
 from dapkel.functions.calc_diff import Pixel
 from dapkel.functions.unpack import unpack
@@ -34,7 +34,7 @@ __all__ = [
 
 
 def collect_time_mat(
-    folder: str,
+    path: str,
     pixels: Pixel | Sequence[Pixel],
     *,
     nframes: int,
@@ -49,8 +49,8 @@ def collect_time_mat(
 
     Parameters
     ----------
-    folder : str
-        Path to the folder with the '.bin' data files.
+    path : str
+        Path to the path with the '.bin' data files.
     pixels : tuple[int, int] | Sequence[tuple[int, int]]
         A single ``(row, col)`` pixel or a sequence of them.
     nframes : int
@@ -66,7 +66,7 @@ def collect_time_mat(
         Mapping ``(row, col) -> 1D array`` of valid TDC codes.
     """
     pix = cd.as_pixel_list(pixels)
-    files = io.find_bin_files(folder, tag)
+    files = io.find_bin_files(path, tag)
     if max_files is not None:
         files = files[:max_files]
 
@@ -84,26 +84,27 @@ def collect_time_mat(
 
 
 def plot_time_code_histogram(
-    folder: str,
+    path: str,
     pixel: Pixel,
     *,
     nframes: int,
     tag: str = "ORT",
     bins: int | np.ndarray = 256,
-    time_unit_s: float | None = None,
     max_files: int | None = None,
 ) -> tuple[plt.Figure, np.ndarray]:
     """Histogram one pixel's TDC codes over all frames (QA / jitter view).
 
     Mirrors the ``Kelpie_run.m`` timestamp inspection. Useful to confirm, on a
-    fresh acquisition, that the timing is populated (codes should span the full
-    full code range for the reference clock in use - ~279 codes at 50 MHz,
-    ~1397 at 10 MHz, ~6985 at 2 MHz - not collapse onto a few values).
+    fresh acquisition, that the timing is populated: the codes should span the
+    whole code range of the reference clock in use - ~279 codes at 50 MHz,
+    ~1397 at 10 MHz, ~6985 at 2 MHz - and not collapse onto a few values. The
+    span is printed in the title as a full scale in ns, which is the same
+    measurement every other analysis takes off the data.
 
     Parameters
     ----------
-    folder : str
-        Path to the folder with the '.bin' data files.
+    path : str
+        Path to the path with the '.bin' data files.
     pixel : tuple[int, int]
         The ``(row, col)`` pixel to inspect.
     nframes : int
@@ -112,9 +113,6 @@ def plot_time_code_histogram(
         Filename fragment selecting the files. The default is ``'ORT'``.
     bins : int | np.ndarray, optional
         Bins for ``np.histogram``. The default is 256.
-    time_unit_s : float | None, optional
-        Seconds per code for the x-axis (the axis itself is drawn in ps); None
-        (default) keeps raw codes.
     max_files : int | None, optional
         Process at most this many files. The default is None.
 
@@ -127,20 +125,27 @@ def plot_time_code_histogram(
     """
     r, c = int(pixel[0]), int(pixel[1])
     codes = collect_time_mat(
-        folder, (r, c), nframes=nframes, tag=tag, max_files=max_files
+        path, (r, c), nframes=nframes, tag=tag, max_files=max_files
     )[(r, c)]
 
-    scale = time_unit_s * 1e12 if time_unit_s else 1.0
-    unit = "ps" if time_unit_s else "TDC code"
-
+    # The x axis stays in raw codes: the question this plot answers is whether
+    # the codes span the TDC's range, and the code range *is* the evidence. The
+    # range they span is reported in the title, in ns, which is the run's own
+    # full scale ('core.timing.full_scale_from_max_code') - the number every
+    # other analysis now measures rather than being told.
     fig, ax = plt.subplots()
     if codes.size:
-        ax.hist(codes * scale, bins=bins, alpha=0.75)
-    ax.set_xlabel(f"Timestamp  ({unit})")
+        ax.hist(codes, bins=bins, alpha=0.75)
+    ax.set_xlabel("Timestamp  (TDC code)")
     ax.set_ylabel("Counts")
+    span = (
+        f"{timing.full_scale_from_max_code(int(codes.max())) * 1e9:.1f} ns"
+        if codes.size
+        else "nothing"
+    )
     ax.set_title(
         f"Pixel ({r},{c})  time codes  (n={codes.size}, "
-        f"{np.unique(codes).size} unique)"
+        f"{np.unique(codes).size} unique, spanning {span})"
     )
     ax.grid(True, linewidth=0.5, alpha=0.6)
     fig.tight_layout()

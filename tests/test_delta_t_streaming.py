@@ -14,6 +14,7 @@ a run that dies mid-way.
 
 from __future__ import annotations
 
+import inspect
 import os
 
 import numpy as np
@@ -121,6 +122,22 @@ def test_mixed_units_are_refused(tmp_path):
 
     with pytest.raises(ValueError, match="mixed delta_unit"):
         dt._combine_delta_feathers([a, b], str(tmp_path / "out.feather"))
+
+
+def test_a_raw_code_feather_is_refused_rather_than_read_as_ps(tmp_path):
+    """Stage 1 now always writes ps, so a 'code' feather predates this.
+
+    Reading it as picoseconds would be wrong by ~14x without looking wrong, and
+    it cannot be fixed up either: the calibration is per code and a saved
+    difference has lost both operands.
+    """
+    path = str(tmp_path / "old_delta_t.feather")
+    dt._write_delta_feather(
+        path, {"0,0-1,1": np.arange(5.0)}, ["0,0-1,1"], "code"
+    )
+
+    with pytest.raises(ValueError, match="not picoseconds"):
+        dt._pooled_columns([path], None)
 
 
 def test_nan_padded_legacy_feathers_still_count_correctly(tmp_path):
@@ -239,9 +256,6 @@ def test_confirm_rewrite_actually_waits(tmp_path):
 
 PAIRS = [[(0, 0), (0, 1)], [(1, 0), (1, 1)]]
 NFRAMES = 20
-# One reference-clock period at 10 MHz. Stage 1 requires it: the TDC full scale
-# is this window, so nothing downstream is right without it.
-SHUTTER_S = 100e-9
 
 
 def _fake_run(tmp_path, n_files=6):
@@ -273,7 +287,6 @@ def test_end_to_end_streams_parts_and_combines_them(tmp_path, monkeypatch):
         PAIRS,
         apply_TDC_calibration=False,
         nframes=NFRAMES,
-        open_shutter_time_s=SHUTTER_S,
     )
 
     parts_dir = tmp_path / "run" / "processed" / "run_delta_t_parts"
@@ -299,7 +312,6 @@ def test_end_to_end_part_size_does_not_change_the_result(tmp_path, monkeypatch):
             PAIRS,
             apply_TDC_calibration=False,
             nframes=NFRAMES,
-            open_shutter_time_s=SHUTTER_S,
         )
         results[part_mb] = _columns(out)
 
@@ -314,7 +326,6 @@ def test_end_to_end_rewrite_guard(tmp_path, monkeypatch, capsys):
     kwargs = {
         "apply_TDC_calibration": False,
         "nframes": NFRAMES,
-        "open_shutter_time_s": SHUTTER_S,
     }
     monkeypatch.setattr(dt, "_PART_MB", 1 / 1024)
     dt.calculate_and_save_timestamp_differences(str(folder), PAIRS, **kwargs)
@@ -340,7 +351,6 @@ def test_end_to_end_rewrite_does_not_pool_the_previous_run(tmp_path, monkeypatch
     kwargs = {
         "apply_TDC_calibration": False,
         "nframes": NFRAMES,
-        "open_shutter_time_s": SHUTTER_S,
     }
     monkeypatch.setattr(dt, "_PART_MB", 1 / 1024)
     first = _columns(
@@ -371,7 +381,6 @@ def test_end_to_end_keeps_the_parts_after_combining(tmp_path, monkeypatch):
         PAIRS,
         apply_TDC_calibration=False,
         nframes=NFRAMES,
-        open_shutter_time_s=SHUTTER_S,
     )
 
     parts_dir = tmp_path / "run" / "processed" / "run_delta_t_parts"
@@ -398,36 +407,35 @@ def test_end_to_end_keeps_the_parts_after_combining(tmp_path, monkeypatch):
 # measured against: it is bin-for-bin what loading the whole table and
 # histogramming it in one go would have produced.
 
-TIME_UNIT_PS = 77.0
 BIN_PS = 77.0
 WINDOW_PS = 3000.0
 # The library takes seconds; these tests were written in ps, so convert once
 # here rather than restating every number.
-TIME_UNIT_S = TIME_UNIT_PS * 1e-12
 BIN_S = BIN_PS * 1e-12
 WINDOW_S = WINDOW_PS * 1e-12
+# Half-base of the accidental triangle the fixtures fake, in ps: one 10 MHz
+# reference-clock period, which is what the read side has to *measure* now
+# rather than be told.
+FULL_SCALE_PS = 100_000.0
 
 
-def _reference_histogram(
-    feather, *, edges, time_unit_s=TIME_UNIT_S, window_s=WINDOW_S
-):
+def _reference_histogram(feather, *, edges):
     """Histogram the old way: load everything, pool it, bin it once."""
-    df, unit = dt._read_delta_feather(feather)
+    df, _ = dt._read_delta_feather(feather)
     vals = df.to_numpy().ravel()
     pooled = vals[~np.isnan(vals)]
-    deltas_ps = pooled if unit == "ps" else pooled * time_unit_s * 1e12
-    inside = deltas_ps[np.abs(deltas_ps) <= window_s * 1e12]
+    inside = pooled[np.abs(pooled) <= max(abs(edges[0]), abs(edges[-1]))]
     return np.histogram(inside, bins=edges)[0], inside.size
 
 
 def _spread_deltas(rng, n):
-    """Codes with a coincidence peak at 0 on a wide accidental background."""
-    peak = rng.normal(0.0, 4.0, size=n // 4)
-    accidental = rng.uniform(-1300.0, 1300.0, size=n - n // 4)
+    """Differences in ps: a peak at 0 on a wide accidental background."""
+    peak = rng.normal(0.0, 300.0, size=n // 4)
+    accidental = rng.uniform(-FULL_SCALE_PS, FULL_SCALE_PS, size=n - n // 4)
     return np.concatenate([peak, accidental])
 
 
-def _feather_of_parts(tmp_path, n_batches=12, unit="code"):
+def _feather_of_parts(tmp_path, n_batches=12, unit="ps"):
     """Write a multi-batch delta-t feather and return (combined, parts_dir)."""
     rng = np.random.default_rng(7)
     parts_dir = tmp_path / "parts"
@@ -445,21 +453,17 @@ def _feather_of_parts(tmp_path, n_batches=12, unit="code"):
 def test_streamed_histogram_is_identical_to_loading_the_whole_table(tmp_path):
     """The baseline property: streaming must change memory, not numbers."""
     combined, _ = _feather_of_parts(tmp_path)
-    edges = dt._delta_hist_edges(BIN_PS, WINDOW_PS)
+    edges = dt._delta_hist_edges(BIN_S, WINDOW_S)
 
     counts, stats = dt._stream_delta_histogram(
-        [combined],
-        edges=edges,
-        time_unit_s=TIME_UNIT_S,
-        plot_window_s=WINDOW_S,
-        quiet=True,
+        [combined], edges=edges, quiet=True
     )
     expected, expected_n = _reference_histogram(combined, edges=edges)
 
     assert counts.sum() > 0, "the fixture produced no counts in the window"
     np.testing.assert_array_equal(counts, expected)
     assert stats["n"] == expected_n
-    assert stats["unit"] == "code"
+    assert stats["unit"] == "ps"
 
 
 def test_streaming_reads_more_than_one_batch(tmp_path):
@@ -472,13 +476,8 @@ def test_streaming_reads_more_than_one_batch(tmp_path):
 def test_parts_and_combined_give_the_same_histogram(tmp_path):
     """Plotting from the parts must not need the giant combined file."""
     combined, parts_dir = _feather_of_parts(tmp_path)
-    edges = dt._delta_hist_edges(BIN_PS, WINDOW_PS)
-    kwargs = {
-        "edges": edges,
-        "time_unit_s": TIME_UNIT_S,
-        "plot_window_s": WINDOW_S,
-        "quiet": True,
-    }
+    edges = dt._delta_hist_edges(BIN_S, WINDOW_S)
+    kwargs = {"edges": edges, "quiet": True}
 
     from_combined, stats_c = dt._stream_delta_histogram([combined], **kwargs)
     from_parts, stats_p = dt._stream_delta_histogram(
@@ -489,26 +488,30 @@ def test_parts_and_combined_give_the_same_histogram(tmp_path):
     assert stats_p["n"] == stats_c["n"]
 
 
-def test_ps_feathers_are_not_rescaled(tmp_path):
-    """A 'ps' feather is already calibrated; time_unit_s must not apply."""
+def test_the_streaming_pass_measures_the_support_it_saw(tmp_path):
+    """The largest difference present is the TDC full scale.
+
+    That is the triangle's half-base and the default plot window, so measuring
+    it here is what replaces being told a clock period.
+    """
     path = str(tmp_path / "run_delta_t.feather")
     dt._write_delta_feather(
-        path, {"0,0-1,1": np.array([0.0, 100.0, -100.0])}, ["0,0-1,1"], "ps"
+        path,
+        {"0,0-1,1": np.array([0.0, 100.0, -100.0, FULL_SCALE_PS])},
+        ["0,0-1,1"],
+        "ps",
     )
-    edges = dt._delta_hist_edges(BIN_PS, WINDOW_PS)
 
     counts, stats = dt._stream_delta_histogram(
-        [path],
-        edges=edges,
-        time_unit_s=TIME_UNIT_S,
-        plot_window_s=WINDOW_S,
-        quiet=True,
+        [path], edges=dt._delta_hist_edges(BIN_S), quiet=True
     )
-    np.testing.assert_array_equal(
-        counts, _reference_histogram(path, edges=edges)[0]
-    )
+
     assert stats["unit"] == "ps"
-    assert stats["granularity_s"] == 100.0e-12  # not 100 * 77
+    assert stats["granularity_s"] == 100.0e-12
+    assert stats["support_s"] == pytest.approx(FULL_SCALE_PS * 1e-12)
+    # The default edges span the whole physical support, so nothing is lost.
+    assert counts.sum() == 4
+    assert stats["n_outside"] == 0
 
 
 def test_padding_is_dropped_and_measured(tmp_path):
@@ -518,14 +521,10 @@ def test_padding_is_dropped_and_measured(tmp_path):
         path,
         {"0,0-1,1": np.zeros(100), "0,0-2,2": np.zeros(4)},
         ["0,0-1,1", "0,0-2,2"],
-        "code",
+        "ps",
     )
     counts, stats = dt._stream_delta_histogram(
-        [path],
-        edges=dt._delta_hist_edges(BIN_PS, WINDOW_PS),
-        time_unit_s=TIME_UNIT_S,
-        plot_window_s=WINDOW_S,
-        quiet=True,
+        [path], edges=dt._delta_hist_edges(BIN_S, WINDOW_S), quiet=True
     )
 
     assert counts.sum() == 104  # 104 real values, not 200 padded cells
@@ -535,35 +534,37 @@ def test_padding_is_dropped_and_measured(tmp_path):
 
 
 def test_out_of_window_differences_are_excluded_but_still_counted(tmp_path):
+    """Narrow edges still see everything - they just do not bin it.
+
+    The drivers histogram over the whole support, but the helper accepts any
+    edges, and a difference outside them has to be counted rather than lost.
+    """
     path = str(tmp_path / "run_delta_t.feather")
     inside = np.zeros(6)
-    outside = np.full(4, 1000.0)  # 1000 codes * 77 ps >> 3000 ps
+    outside = np.full(4, FULL_SCALE_PS)  # 100 ns >> the 3 ns edges
     dt._write_delta_feather(
         path,
         {"0,0-1,1": np.concatenate([inside, outside])},
         ["0,0-1,1"],
-        "code",
+        "ps",
     )
     counts, stats = dt._stream_delta_histogram(
-        [path],
-        edges=dt._delta_hist_edges(BIN_PS, WINDOW_PS),
-        time_unit_s=TIME_UNIT_S,
-        plot_window_s=WINDOW_S,
-        quiet=True,
+        [path], edges=dt._delta_hist_edges(BIN_S, WINDOW_S), quiet=True
     )
 
     assert counts.sum() == 6
     assert stats["n"] == 6
+    assert stats["n_outside"] == 4
     assert stats["total"] == 10  # the granularity guard sees them all
+    # ... and the support is measured from all of them, not just the binned ones.
+    assert stats["support_s"] == pytest.approx(FULL_SCALE_PS * 1e-12)
 
 
 def test_missing_pairs_are_reported_not_fatal(tmp_path, capsys):
     combined, _ = _feather_of_parts(tmp_path)
     counts, stats = dt._stream_delta_histogram(
         [combined],
-        edges=dt._delta_hist_edges(BIN_PS, WINDOW_PS),
-        time_unit_s=TIME_UNIT_S,
-        plot_window_s=WINDOW_S,
+        edges=dt._delta_hist_edges(BIN_S, WINDOW_S),
         pairs=[LABELS[0], "31,31-30,30"],
         quiet=True,
     )
@@ -620,7 +621,7 @@ def test_a_different_binning_re_streams(tmp_path):
 
     assert info["reused"] is False
     assert counts.size == len(edges) - 1
-    assert counts.size < len(dt._delta_hist_edges(BIN_PS, WINDOW_PS)) - 1
+    assert counts.size < len(dt._delta_hist_edges(BIN_S)) - 1
 
 
 def test_a_rewritten_feather_re_streams(tmp_path):
@@ -630,7 +631,7 @@ def test_a_rewritten_feather_re_streams(tmp_path):
 
     feather = str(root / "processed" / "run_delta_t.feather")
     dt._write_delta_feather(
-        feather, {"0,0-1,1": np.zeros(500)}, ["0,0-1,1"], "code"
+        feather, {"0,0-1,1": np.zeros(500)}, ["0,0-1,1"], "ps"
     )
     second, _, info = dt.compute_and_save_delta_histogram(
         str(root), quiet=True
@@ -671,17 +672,20 @@ def test_plot_streams_and_returns_the_histogram(tmp_path):
     matplotlib.use("Agg")
     root = _hist_run(tmp_path)
 
-    counts, centers, fit = dt.collect_and_plot_timestamp_differences(
-        str(root), background="flat"
-    )
+    counts, centers, fit = dt.collect_and_plot_timestamp_differences(str(root))
 
     assert counts.shape == centers.shape
     assert fit["n"] == int(counts.sum())
     assert os.path.isfile(
         root / "results" / "coincidences" / "run_spdc_delta_t.png"
     )
-    # The fitted numbers must come from the same counts the caller gets back.
-    refit = dt.fit_gaussian_peak(centers, counts, fit_window=1000.0)
+    # The fitted numbers must come from the same counts the caller gets back -
+    # here through the triangle, which is the model a raw histogram gets, on
+    # the same measured support (a cached read, not another pass).
+    _, _, info = dt.compute_and_save_delta_histogram(str(root), quiet=True)
+    refit = dt.fit_gaussian_on_triangle(
+        centers, counts, half_base=info["support_s"] * 1e12
+    )
     assert refit["sigma"] == fit["sigma"]
 
 
@@ -767,7 +771,6 @@ def test_stage_one_refuses_to_start_on_top_of_stale_parts(tmp_path):
             [[(0, 0)], [(1, 1)]],
             nframes=NFRAMES,
             apply_TDC_calibration=False,
-            open_shutter_time_s=SHUTTER_S,
         )
     # The refusal must not have destroyed the parts it refused over.
     assert len(dt._all_part_files(str(processed / "run_delta_t_parts"))) == 2
@@ -857,10 +860,8 @@ def test_one_batch_and_many_batches_histogram_identically(tmp_path):
     with dt._open_delta_feather(many) as reader:
         assert reader.num_record_batches > 1
 
-    edges = dt._delta_hist_edges(77.0, 3080.0)
-    kwargs = dict(edges=edges, time_unit_s=77.0e-12,
-                  plot_window_s=3080.0e-12,
-                  pairs=None, quiet=True)
+    edges = dt._delta_hist_edges(77.0e-12, 3080.0e-12)
+    kwargs = dict(edges=edges, pairs=None, quiet=True)
     one_counts, one_stats = dt._stream_delta_histogram([single], **kwargs)
     many_counts, many_stats = dt._stream_delta_histogram([many], **kwargs)
 
@@ -959,13 +960,8 @@ def test_mixed_lag_sets_are_refused(tmp_path):
 def test_every_lag_is_histogrammed_in_one_pass(tmp_path):
     """One row per lag, lag 0 first, and row 0 is the plain histogram."""
     path = _lagged_feather(tmp_path)
-    edges = dt._delta_hist_edges(BIN_PS, WINDOW_PS)
-    kwargs = {
-        "edges": edges,
-        "time_unit_s": TIME_UNIT_S,
-        "plot_window_s": WINDOW_S,
-        "quiet": True,
-    }
+    edges = dt._delta_hist_edges(BIN_S, WINDOW_S)
+    kwargs = {"edges": edges, "quiet": True}
 
     plain, plain_stats = dt._stream_delta_histogram([path], **kwargs)
     lagged, lag_stats = dt._stream_delta_histogram(
@@ -989,25 +985,26 @@ def test_subtracting_needs_a_feather_with_lag_columns(tmp_path):
         )
 
 
-def test_subtracting_refuses_a_triangle_before_reading_anything(
-    tmp_path, monkeypatch
-):
-    """The streaming pass is minutes on a real feather - check the model first."""
+def test_the_fit_model_follows_the_histogram(tmp_path):
+    """Triangle on raw data, flat on a residual - and no way to say otherwise.
+
+    The two are one decision, not two: the accidental pedestal is either still
+    in the histogram, where on ORT it is a triangle, or it has been measured
+    away and the residual is flat about zero. The old fixed 'flat' default was
+    the combination wrong on raw data, fitting a constant to a slope.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
-    path = _lagged_feather(tmp_path)
+    root = _hist_run(tmp_path)
 
-    def _boom(*args, **kwargs):
-        raise AssertionError("the feather must not be read at all")
+    _, _, raw = dt.collect_and_plot_timestamp_differences(str(root))
 
-    monkeypatch.setattr(dt, "_stream_delta_histogram", _boom)
-    with pytest.raises(ValueError, match="no triangle left"):
-        dt.collect_and_plot_timestamp_differences(
-            feather_path=path,
-            subtract_background=True,
-            background="triangle",
-        )
+    # 'half_base' is the triangle's own parameter; a flat fit has no such thing.
+    assert "half_base" in raw
+    assert "background" not in inspect.signature(
+        dt.collect_and_plot_timestamp_differences
+    ).parameters
 
 
 def test_the_subtracted_driver_returns_the_residual(tmp_path):
@@ -1019,15 +1016,17 @@ def test_the_subtracted_driver_returns_the_residual(tmp_path):
     (root / "processed").mkdir(parents=True)
     path = _lagged_feather(root / "processed")
 
-    counts, centers, fit = dt.collect_and_plot_timestamp_differences(
-        feather_path=path,
-        bin_width_s=100.0e-12,
-        plot_window_s=500.0e-12,
-        support_s=1000.0e-12,
-        peak_window_s=100.0e-12,
-        subtract_background=True,
-        label="test",
-    )
+    # Three bins in the fit window against four Gaussian parameters: this
+    # fixture is about the subtraction, and the peak fit is expected to bow out.
+    with pytest.warns(RuntimeWarning, match="did not converge"):
+        counts, centers, fit = dt.collect_and_plot_timestamp_differences(
+            feather_path=path,
+            bin_width_s=100.0e-12,
+            plot_window_s=500.0e-12,
+            fit_window_s=100.0e-12,
+            subtract_background=True,
+            label="test",
+        )
 
     assert counts.shape == centers.shape
     np.testing.assert_allclose(counts, fit["subtraction"]["residual"])
@@ -1039,3 +1038,111 @@ def test_the_subtracted_driver_returns_the_residual(tmp_path):
     results = root / "results" / "coincidences"
     assert (results / "run_test_delta_t_sub.png").is_file()
     assert (results / "run_test_background_subtraction.png").is_file()
+
+
+# --------------------------------------------------------------------------
+# a flat-background fit has to survive a background-subtracted residual
+# --------------------------------------------------------------------------
+
+
+def _residual_peak(baseline, sigma_ps=500.0, seed=0):
+    """A lag-subtracted-style histogram: a peak on zero-mean noise."""
+    x = np.arange(-10000, 10000, 20.0)
+    rng = np.random.default_rng(seed)
+    y = (
+        1300 * np.exp(-(x**2) / (2 * sigma_ps**2))
+        + baseline
+        + rng.normal(0, 40, x.size)
+    )
+    return x, y
+
+
+@pytest.mark.parametrize("baseline", [-3.0, 0.0, 150.0])
+def test_the_flat_fit_survives_a_zero_mean_baseline(baseline):
+    """Subtraction leaves a residual whose baseline sits at or below zero.
+
+    The flat level used to be bounded at zero from below while being seeded
+    from the tail median, so on exactly the histograms 'subtract_background'
+    produces the seed landed on or outside its own bound, curve_fit raised
+    'x0 is infeasible', and the caller drew a plot with no fit on it.
+    """
+    x, y = _residual_peak(baseline)
+
+    fit = dt.fit_gaussian_peak(x, y, fit_window=1000.0)
+
+    assert fit["ok"]
+    assert fit["sigma"] == pytest.approx(500.0, rel=0.05)
+
+
+def test_a_fit_that_does_not_converge_says_so():
+    """Silence is what made the failure hard to see - it must warn."""
+    with pytest.warns(RuntimeWarning, match="did not converge"):
+        fit = dt.fit_gaussian_peak(np.array([0.0, 1.0]), np.array([1.0, 1.0]))
+
+    assert not fit["ok"]
+    assert np.isnan(fit["sigma"])
+
+
+def test_a_width_the_data_does_not_determine_is_not_a_fit(monkeypatch):
+    """Converging is not succeeding.
+
+    Fitting a Gaussian on a *flat* background over a stretch of data that has
+    no peak in it - a lag-subtracted residual that is still a triangle, say,
+    which is what a non-stationary run leaves - lets amplitude, width and
+    baseline trade against each other freely. curve_fit returns, and the
+    covariance is what says the answer is worth nothing: on a real Ne-lamp run
+    it came out as sigma 39 ns +/- 2.7 us, drawn as a curve and printed as a
+    number. The optimiser's basin is not reproducible across platforms, so the
+    covariance is handed over directly here; the guard is what is under test.
+    """
+    x, y = _residual_peak(0.0)
+    popt = np.array([1300.0, 0.0, 39257.0, 0.0])
+    pcov = np.diag([1e6, 1e6, 2665891.0**2, 1e6])
+    monkeypatch.setattr(dt, "curve_fit", lambda *a, **k: (popt, pcov))
+
+    with pytest.warns(RuntimeWarning, match="not determined by the data"):
+        fit = dt.fit_gaussian_peak(x, y, fit_window=1000.0)
+
+    assert not fit["ok"]
+    assert np.isnan(fit["sigma"])
+
+
+# --------------------------------------------------------------------------
+# every reported width carries its uncertainty
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("value", "err", "kwargs", "expected"), [
+    (76.5, 34.2, {}, "76 \u00b1 34 ps"),
+    (76.5, 34.2, {"sep": " +- "}, "76 +- 34 ps"),
+    (76.5, np.nan, {}, "76 ps"),
+    (76.5, np.inf, {}, "76 ps"),
+    (1234.0, 56.0, {"unit": "ns"}, "1234 \u00b1 56 ns"),
+])
+def test_a_width_is_printed_with_its_error(value, err, kwargs, expected):
+    """A fit with no covariance still has a best-fit width worth showing.
+
+    Printing '+- nan' beside it would read as a bug rather than as 'unknown',
+    so the error is dropped instead.
+    """
+    assert dt._pm(value, err, **kwargs) == expected
+
+
+def test_the_derived_widths_carry_derived_errors(tmp_path):
+    """FWHM and per-detector are sigma times a constant - so are their errors.
+
+    They are worked out where the values are, not in the legend, so a number
+    read off a figure and the same number out of the returned dict cannot
+    disagree.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    root = _hist_run(tmp_path)
+
+    _, _, fit = dt.collect_and_plot_timestamp_differences(str(root))
+
+    assert fit["fwhm_err"] == pytest.approx(2.355 * fit["sigma_err"])
+    assert fit["jitter_per_detector_err"] == pytest.approx(
+        fit["sigma_err"] / np.sqrt(2)
+    )

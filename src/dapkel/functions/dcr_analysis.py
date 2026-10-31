@@ -2,7 +2,7 @@
 
 DCR is accumulated dark counts divided by the time the sensor was actually
 collecting. That live time is NOT the frame period: under the current
-``short_window`` firmware only the user-set ``open_shutter_time_s`` of each
+``short_exposure`` firmware only the user-set ``open_shutter_time_s`` of each
 ~9 us frame is photon-sensitive, so ``open_shutter_time_s`` is required.
 
 What counts as "a count" depends on the acquisition program, exactly as in
@@ -185,36 +185,36 @@ def _accumulate_dcr(
 
 
 def compute_dcr_32(
-    folder: str,
+    path: str,
     nframes: int,
     exp_time_s: float | None = None,
     tag: str = "",
     *,
     mode: str = "count",
     pileup_correct: bool = False,
-    firmware_version: str = "short_window",
+    firmware_version: str = "short_exposure",
     open_shutter_time_s: float | None = 500e-9,
 ) -> np.ndarray:
     """Unpack the binary data and compute the (32, 32) DCR map.
 
     Normalised by the *live* time per frame, which depends on the firmware
-    (see 'core.timing.resolve_live_time'): ``'short_window'`` counts only
-    ``open_shutter_time_s`` as live, ``'full_window'`` the whole frame.
+    (see 'core.timing.resolve_live_time'): ``'short_exposure'`` counts only
+    ``open_shutter_time_s`` as live, ``'long_exposure'`` the whole frame.
 
     Parameters
     ----------
-    folder : str
-        Path to the folder with the '.bin' data files.
+    path : str
+        Path to the path with the '.bin' data files.
     nframes : int
         Number of frames stored in each '.bin' file.
     exp_time_s : float | None, optional
-        Legacy exposure time in seconds (``firmware_version='full_window'``
+        Legacy exposure time in seconds (``firmware_version='long_exposure'``
         only): 0 → 9 µs actual, 10e-6 → 19 µs. If None, the 9 µs
         free-running base is used. The default is None.
     tag : str, optional
         SPAD quadrant tag - 'S0C'...'S3C' in counting mode, 'S0T'...'S3T' (or
         'ORT') in timestamping mode. The default is "", which matches every
-        '.bin' file in the folder.
+        '.bin' file in the path.
     mode : str, optional
         ``'count'`` (default) sums the per-pixel photon counter; use
         ``'timestamp'`` for ``S*T``/``ORT`` data, where that field holds
@@ -227,11 +227,11 @@ def compute_dcr_32(
         censoring is inverted, ``r = -ln(1 - p) / open_shutter_time_s``. The default is
         False, which reports the raw occupancy rate.
     firmware_version : str, optional
-        ``'short_window'`` (default) or ``'full_window'``; see
+        ``'short_exposure'`` (default) or ``'long_exposure'``; see
         'resolve_live_time'.
     open_shutter_time_s : float | None, optional
         Photon-sensitive window per frame, in seconds (required for
-        ``firmware_version='short_window'``). The default is ``500e-9``
+        ``firmware_version='short_exposure'``). The default is ``500e-9``
         (500 ns).
 
     Returns
@@ -242,7 +242,7 @@ def compute_dcr_32(
     Raises
     ------
     ValueError
-        Raised when ``firmware_version='short_window'`` but no ``open_shutter_time_s``
+        Raised when ``firmware_version='short_exposure'`` but no ``open_shutter_time_s``
         is given, or when ``mode`` is unknown or contradicts ``tag``.
     """
     _check_mode(mode, tag)
@@ -252,12 +252,12 @@ def compute_dcr_32(
     )
     if live is None:
         raise ValueError(
-            "firmware_version='short_window' needs open_shutter_time_s (the "
+            "firmware_version='short_exposure' needs open_shutter_time_s (the "
             "photon-sensitive window per frame, in seconds, e.g. 200e-9)."
         )
     # The DCR quadrant tags are matched with a leading underscore ('*_S0C*')
     # so a tag cannot match a filename that merely contains those characters.
-    files = io.find_bin_files(folder, tag, require_separator=True)
+    files = io.find_bin_files(path, tag, require_separator=True)
     return _accumulate_dcr(
         files, nframes, live,
         mode=mode, pileup_correct=pileup_correct, label=tag,
@@ -265,13 +265,13 @@ def compute_dcr_32(
 
 
 def compute_dcr_64(
-    folder: str,
+    path: str,
     nframes: int,
     exp_time_s: float | None = None,
     *,
     mode: str = "count",
     pileup_correct: bool = False,
-    firmware_version: str = "short_window",
+    firmware_version: str = "short_exposure",
     open_shutter_time_s: float | None = 500e-9,
 ) -> np.ndarray:
     """Unpack the binary data and compute the (64, 64) DCR map.
@@ -281,12 +281,12 @@ def compute_dcr_64(
 
     Parameters
     ----------
-    folder : str
-        Path to the folder with the '.bin' data files.
+    path : str
+        Path to the path with the '.bin' data files.
     nframes : int
         Number of frames stored in each '.bin' file.
     exp_time_s : float | None, optional
-        Legacy exposure time in seconds (``firmware_version='full_window'``
+        Legacy exposure time in seconds (``firmware_version='long_exposure'``
         only). If None, the 9 µs free-running base is used. The default
         is None.
     mode : str, optional
@@ -296,11 +296,11 @@ def compute_dcr_64(
     pileup_correct : bool, optional
         ``'timestamp'`` mode only; see 'compute_dcr_32'. The default is False.
     firmware_version : str, optional
-        ``'short_window'`` (default) or ``'full_window'``; see
+        ``'short_exposure'`` (default) or ``'long_exposure'``; see
         'resolve_live_time'.
     open_shutter_time_s : float | None, optional
         Photon-sensitive window per frame, in seconds (required for
-        ``firmware_version='short_window'``). The default is ``500e-9``
+        ``firmware_version='short_exposure'``). The default is ``500e-9``
         (500 ns).
 
     Returns
@@ -312,9 +312,9 @@ def compute_dcr_64(
     ------
     FileNotFoundError
         Raised when no '.bin' files for any of the four SPAD tags are
-        found in the folder.
+        found in the path.
     ValueError
-        Raised when ``firmware_version='short_window'`` but no ``open_shutter_time_s``
+        Raised when ``firmware_version='short_exposure'`` but no ``open_shutter_time_s``
         is given, or when ``mode`` is unknown.
     """
     _check_mode(mode)
@@ -324,7 +324,7 @@ def compute_dcr_64(
     )
     if live is None:
         raise ValueError(
-            "firmware_version='short_window' needs open_shutter_time_s (the "
+            "firmware_version='short_exposure' needs open_shutter_time_s (the "
             "photon-sensitive window per frame, in seconds, e.g. 200e-9)."
         )
     frame_time_s = live
@@ -334,7 +334,7 @@ def compute_dcr_64(
     tag_files = {}
     for tag in _SPAD_LAYOUT:
         files = glob.glob(
-            os.path.join(folder, f"*_{_quadrant_tag(tag, mode)}*.bin")
+            os.path.join(path, f"*_{_quadrant_tag(tag, mode)}*.bin")
         )
         if files:
             tag_files[tag] = sorted(
@@ -347,7 +347,7 @@ def compute_dcr_64(
         letter = _MODE_TAG_LETTER[mode]
         raise FileNotFoundError(
             f"No S0{letter}/S1{letter}/S2{letter}/S3{letter} .bin files "
-            f"found in:\n  {folder}"
+            f"found in:\n  {path}"
         )
 
     quadrants = {
@@ -485,14 +485,14 @@ def compute_and_save_dcr_32(
     *,
     mode: str = "count",
     pileup_correct: bool = False,
-    firmware_version: str = "short_window",
+    firmware_version: str = "short_exposure",
     open_shutter_time_s: float | None = 500e-9,
 ) -> str:
     """Compute the (32, 32) DCR map and save it under ``processed/``.
 
     The stage-1 half of the DCR analysis: unpack once, write the array plus a
     '.meta.json' sidecar, and return the path. 'collect_and_plot_dcr_32' can
-    then replot it with ``from_saved=True`` without re-unpacking.
+    then replot it with ``reuse=True`` without re-unpacking.
 
     Parameters
     ----------
@@ -510,7 +510,7 @@ def compute_and_save_dcr_32(
     pileup_correct : bool, optional
         ``'timestamp'`` mode only; see 'compute_dcr_32'. The default is False.
     firmware_version : str, optional
-        ``'short_window'`` (default) or ``'full_window'``.
+        ``'short_exposure'`` (default) or ``'long_exposure'``.
     open_shutter_time_s : float | None, optional
         Photon-sensitive window per frame, in seconds. The default is
         ``500e-9`` (500 ns).
@@ -544,7 +544,7 @@ def compute_and_save_dcr_64(
     *,
     mode: str = "count",
     pileup_correct: bool = False,
-    firmware_version: str = "short_window",
+    firmware_version: str = "short_exposure",
     open_shutter_time_s: float | None = 500e-9,
 ) -> str:
     """Assemble the (64, 64) full-sensor DCR map and save it.
@@ -562,7 +562,7 @@ def compute_and_save_dcr_64(
     pileup_correct : bool, optional
         ``'timestamp'`` mode only; see 'compute_dcr_32'. The default is False.
     firmware_version : str, optional
-        ``'short_window'`` (default) or ``'full_window'``.
+        ``'short_exposure'`` (default) or ``'long_exposure'``.
     open_shutter_time_s : float | None, optional
         Photon-sensitive window per frame, in seconds. The default is
         ``500e-9`` (500 ns).
@@ -600,9 +600,9 @@ def collect_and_plot_dcr_32(
     *,
     mode: str = "count",
     pileup_correct: bool = False,
-    firmware_version: str = "short_window",
+    firmware_version: str = "short_exposure",
     open_shutter_time_s: float | None = 500e-9,
-    from_saved: bool = False,
+    reuse: bool = False,
 ) -> np.ndarray:
     """Unpack, compute, and plot the (32, 32) DCR map for a SPAD tag.
 
@@ -638,13 +638,13 @@ def collect_and_plot_dcr_32(
     pileup_correct : bool, optional
         ``'timestamp'`` mode only; see 'compute_dcr_32'. The default is False.
     firmware_version : str, optional
-        ``'short_window'`` (default) or ``'full_window'``; see
+        ``'short_exposure'`` (default) or ``'long_exposure'``; see
         'resolve_live_time'.
     open_shutter_time_s : float | None, optional
         Photon-sensitive window per frame, in seconds (required for
-        ``firmware_version='short_window'``). The default is ``500e-9``
+        ``firmware_version='short_exposure'``). The default is ``500e-9``
         (500 ns).
-    from_saved : bool, optional
+    reuse : bool, optional
         Load the map saved by 'compute_and_save_dcr_32' instead of
         re-unpacking the '.bin' files - use this to retry a colormap. The
         default is False, which computes and then saves the array.
@@ -664,7 +664,7 @@ def collect_and_plot_dcr_32(
         f"(mode='{mode}') and plotting the heatmap and distribution < < <\n"
     )
 
-    if from_saved:
+    if reuse:
         dcr, _ = store.load_map(path, kind=_KIND, tag=tag)
     else:
         dcr = compute_dcr_32(
@@ -714,9 +714,9 @@ def collect_and_plot_dcr_64(
     *,
     mode: str = "count",
     pileup_correct: bool = False,
-    firmware_version: str = "short_window",
+    firmware_version: str = "short_exposure",
     open_shutter_time_s: float | None = 500e-9,
-    from_saved: bool = False,
+    reuse: bool = False,
 ) -> np.ndarray:
     """Unpack, compute, and plot the (64, 64) full sensor DCR map.
 
@@ -749,13 +749,13 @@ def collect_and_plot_dcr_64(
     pileup_correct : bool, optional
         ``'timestamp'`` mode only; see 'compute_dcr_32'. The default is False.
     firmware_version : str, optional
-        ``'short_window'`` (default) or ``'full_window'``; see
+        ``'short_exposure'`` (default) or ``'long_exposure'``; see
         'resolve_live_time'.
     open_shutter_time_s : float | None, optional
         Photon-sensitive window per frame, in seconds (required for
-        ``firmware_version='short_window'``). The default is ``500e-9``
+        ``firmware_version='short_exposure'``). The default is ``500e-9``
         (500 ns).
-    from_saved : bool, optional
+    reuse : bool, optional
         Load the map saved by 'compute_and_save_dcr_64' instead of
         re-unpacking the '.bin' files. The default is False, which computes
         and then saves the array.
@@ -776,7 +776,7 @@ def collect_and_plot_dcr_64(
         "and plotting the heatmap and distribution < < <\n"
     )
 
-    if from_saved:
+    if reuse:
         dcr, _ = store.load_map(path, kind=_KIND, tag="64")
     else:
         dcr = compute_dcr_64(

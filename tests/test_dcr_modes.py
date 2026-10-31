@@ -176,7 +176,7 @@ def test_pileup_correct_is_ignored_in_count_mode(monkeypatch):
 
 def test_meta_records_mode_and_correction():
     meta = dcr_analysis._dcr_meta(
-        "path", 8192, "S0T", None, "short_window", 8e-6, "timestamp", True
+        "path", 8192, "S0T", None, "short_exposure", 8e-6, "timestamp", True
     )
     assert meta["mode"] == "timestamp"
     assert meta["pileup_correct"] is True
@@ -184,6 +184,6 @@ def test_meta_records_mode_and_correction():
 
 def test_meta_never_claims_a_correction_in_count_mode():
     meta = dcr_analysis._dcr_meta(
-        "path", 8192, "S0C", None, "short_window", 8e-6, "count", True
+        "path", 8192, "S0C", None, "short_exposure", 8e-6, "count", True
     )
     assert meta["pileup_correct"] is False

@@ -60,7 +60,7 @@ many repeated `.bin` acquisitions per counter, named like
 acquisition for statistics.
 
 The `01` preliminary batches use a `CT01_` / `CT02_` prefix and are excluded by
-the default `file_prefix="CT_"`, so the two acquisitions are never silently
+the default `tag="CT_"`, so the two acquisitions are never silently
 mixed.
 
 ## The combined 64×64 map

@@ -99,11 +99,36 @@ The package is consistent about this, and `__all__` groups follow it:
 | `compute_*` | raw files or an array in → array out | none |
 | `plot_*` | array in → `plt.Figure` out | none |
 | `compute_and_save_*` | raw files in → path to a stage-1 artifact | writes `processed/` |
-| `collect_and_*` | folder in → paths to figures | reads `processed/`, writes `results/` |
+| `collect_and_*` | data folder in → paths to figures | reads `processed/`, writes `results/` |
 | `load_*` | path in → array out | reads |
 
 Keeping `plot_*` free of I/O is what lets you iterate on a figure in a notebook
 without touching disk.
+
+### Parameter names are shared, not per-module
+
+One concept, one name, everywhere. A new analysis picks from this list rather
+than inventing a synonym — `folder`, `file_prefix`, `from_saved`, `grid_s` and
+`cmap_title` were all synonyms of entries in it, and every one of them made a
+caller stop and check which module they were in.
+
+| name | meaning |
+|---|---|
+| `path` | the data folder (never `folder`) |
+| `tag` | filename fragment selecting the files (never `file_prefix`) |
+| `nframes` | frames per `.bin`, as the acquisition was set |
+| `max_files` | process at most this many files |
+| `exp_time_s`, `open_shutter_time_s`, `firmware_version` | the live-time trio, for rate normalisation **only** |
+| `bin_width_s`, `plot_window_s`, `fit_window_s` | histogram/fit ranges |
+| `rewrite`, `reuse`, `quiet` | housekeeping (never `from_saved`) |
+| `label`, `title`, `cmap` | figure text and colours (never `cmap_title`) |
+
+And the harder rule: **if the data can answer it, do not add a parameter.** The
+TDC full scale used to be asked for three ways at once; it is now measured from
+the largest code a run produced. Ask yourself whether the caller could get the
+number wrong — if so, they will, and the code should read it instead. The one
+survivor is `clock_period_s` in `tdc_calibration`, because a density test fixes
+only *relative* code widths and something has to set the absolute scale.
 
 ## Docstrings
 
@@ -156,12 +181,12 @@ KIND = "afterpulsing"
 _UNIT = "%"
 
 
-def compute_afterpulsing(folder: str, nframes: int, tag: str = "AP") -> np.ndarray:
+def compute_afterpulsing(path: str, nframes: int, tag: str = "AP") -> np.ndarray:
     """Compute the (32, 32) afterpulsing probability map.
 
     Parameters
     ----------
-    folder : str
+    path : str
         Data folder holding the '.bin' files.
     nframes : int
         Number of frames stored in each '.bin' file.
@@ -173,7 +198,7 @@ def compute_afterpulsing(folder: str, nframes: int, tag: str = "AP") -> np.ndarr
     np.ndarray
         (32, 32) afterpulsing probability in percent.
     """
-    files = io.find_bin_files(folder, tag)
+    files = io.find_bin_files(path, tag)
     counts = reduce.accumulate_frames(
         files, lambda ts, pc: pc.sum(axis=2), nframes=nframes
     )
@@ -184,11 +209,11 @@ def compute_afterpulsing(folder: str, nframes: int, tag: str = "AP") -> np.ndarr
 
 
 def compute_and_save_afterpulsing(
-    folder: str, nframes: int, tag: str = "AP"
+    path: str, nframes: int, tag: str = "AP"
 ) -> str:
     """Compute the map and save it under ``processed/``; return the path."""
-    ap = compute_afterpulsing(folder, nframes, tag)
-    return store.save_map(ap, folder, kind=KIND, tag=tag, unit=_UNIT)
+    ap = compute_afterpulsing(path, nframes, tag)
+    return store.save_map(ap, path, kind=KIND, tag=tag, unit=_UNIT)
 
 
 def plot_afterpulsing(ap: np.ndarray, cmap: str | None = None):
@@ -198,14 +223,14 @@ def plot_afterpulsing(ap: np.ndarray, cmap: str | None = None):
     )
 
 
-def collect_and_plot_afterpulsing(folder: str, tag: str = "AP") -> list[str]:
+def collect_and_plot_afterpulsing(path: str, tag: str = "AP") -> list[str]:
     """Load the saved map and write its figures to ``results/afterpulsing``."""
-    ap, meta = store.load_map(folder, kind=KIND, tag=tag)
+    ap, meta = store.load_map(path, kind=KIND, tag=tag)
     return [
-        store.save_figure(plot_afterpulsing(ap), folder, KIND, f"{tag}_heatmap.png"),
+        store.save_figure(plot_afterpulsing(ap), path, KIND, f"{tag}_heatmap.png"),
         store.save_figure(
             plots.sorted_distribution(ap, ylabel=f"AP ({_UNIT})"),
-            folder,
+            path,
             KIND,
             f"{tag}_distribution.png",
         ),

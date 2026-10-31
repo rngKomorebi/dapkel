@@ -51,13 +51,18 @@ within 5 % of it. Counting mode has no such ceiling and ignores the flag.
 The normalisation uses the **live** time per frame, which depends on the
 firmware — see [`core.timing.resolve_live_time`][dapkel.core.timing.resolve_live_time].
 
-- **`short_window`** (current firmware, the default) — each ~9 µs frame is mostly
-  readout and only the user-set `open_shutter_time_s` (e.g. `200e-9` s) is
-  photon-sensitive. You must pass `open_shutter_time_s`; `compute_dcr_32` raises
-  without it rather than guessing.
-- **`full_window`** (legacy) — the whole frame is live, so the per-frame time
+- **`short_exposure`** (current firmware, the default) — each ~9 µs frame is
+  mostly readout and only the user-set `open_shutter_time_s` is
+  photon-sensitive. That window sits inside the cycle without extending it and is
+  settable from ~50 ns up to the full 9 µs, so a wrong guess is a rate error of up
+  to two decades. You must pass `open_shutter_time_s`; `compute_dcr_32` raises
+  without it rather than guessing. Nothing in the data reveals it, which is why
+  it is one of the few timescales still asked for — and note it is **not** the
+  TDC full scale, which [the coincidence pipeline](coincidences.md) measures for
+  itself.
+- **`long_exposure`** (legacy) — the whole frame is live, so the per-frame time
   comes from `resolve_frame_time`: explicit `exp_time_s` + 9 µs overhead, else
-  `frame_rate_cnt.txt`, else the 9 µs free-running fallback.
+  the 9 µs free-running fallback.
 
 Under the legacy firmware the exposure argument passed to `Kelpie_v2.exe` maps
 to an actual frame period with 9 µs of overhead: `0 → 9 µs`, `10 µs → 19 µs`.

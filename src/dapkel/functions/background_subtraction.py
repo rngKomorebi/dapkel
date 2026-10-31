@@ -68,7 +68,6 @@ BACKGROUND_LAGS = (1, 2, 3, 4, 5, 6, 7, 8)
 def compute_lagged_differences(
     pixel_timestamps: dict[Pixel, np.ndarray],
     pixels: Sequence[Sequence[Pixel]],
-    delta_window_native: float | None = None,
     mode: str = "all_pairs",
     *,
     frame_lag: int = 0,
@@ -84,19 +83,12 @@ def compute_lagged_differences(
     Parameters
     ----------
     pixel_timestamps : dict[tuple[int, int], np.ndarray]
-        Mapping ``(row, col) -> 1D array`` of per-frame timestamps, NaN where
-        the pixel did not fire. All arrays share the same length, as
-        'delta_t' structures them.
+        Mapping ``(row, col) -> 1D array`` of per-frame timestamps in
+        picoseconds, NaN where the pixel did not fire. All arrays share the
+        same length, as 'delta_t' structures them.
     pixels : Sequence[Sequence[tuple[int, int]]]
         Two groups ``[group_a, group_b]``; a bare ``(row, col)`` is accepted
         for a one-pixel group.
-    delta_window_native : float | None, optional
-        Keep only differences with ``abs(delta) <=
-        delta_window_native``, **in the same units as the timestamps** (ps
-        with a calibration LUT, raw codes without) rather than in seconds
-        like the rest of the package - the unit is the caller's to know.
-        'delta_t' converts a ``delta_window_s`` for you. The default is
-        None (keep all).
     mode : str, optional
         ``'all_pairs'`` (default) or ``'1v1'``, as
         'calc_diff.calculate_differences'.
@@ -129,10 +121,7 @@ def compute_lagged_differences(
         ta_w = ta[:hi]
         tb_w = tb[frame_lag:]
         both = ~np.isnan(ta_w) & ~np.isnan(tb_w)
-        d = tb_w[both] - ta_w[both]
-        if delta_window_native is not None:
-            d = d[np.abs(d) <= delta_window_native]
-        out[pairs.pair_label(a, b)] = d
+        out[pairs.pair_label(a, b)] = tb_w[both] - ta_w[both]
     return out
 
 
@@ -314,19 +303,39 @@ def _legend_outside(ax: plt.Axes) -> None:
     )
 
 
+def _clip_to_window(d: dict, window_s: float | None) -> dict:
+    """Restrict a 'subtract_background' result to ``|delta| <= window_s``.
+
+    The panels share one x range, so the arrays are sliced rather than the axes
+    merely limited: 'set_xlim' alone would leave the y scale set by the part of
+    the triangle that is no longer on screen, and the peak would be a stub at
+    the bottom of the panel.
+    """
+    if window_s is None:
+        return d
+    keep = np.abs(d["centers"]) <= window_s * 1e12
+    if keep.all():
+        return d
+    return {
+        k: (v[keep] if isinstance(v, np.ndarray) and v.shape == keep.shape else v)
+        for k, v in d.items()
+    }
+
+
 def plot_background_subtraction(
     result: dict,
     *,
     full: dict | None = None,
     name: str = "",
     label: str = "spdc",
+    window_s: float | None = None,
 ) -> plt.Figure:
-    """Draw the subtraction: overlay, full-range residual, and the peak.
+    """Draw the subtraction: overlay, residual, and the peak.
 
     Three panels, because the middle one is the evidence and it is the one
-    people skip: if the residual is *not* flat and zero out to the edge of the
-    TDC full scale, the pedestal was not accidental and no number from the third
-    panel means anything.
+    people skip: if the residual is *not* flat and zero over the plotted range,
+    the pedestal was not accidental and no number from the third panel means
+    anything.
 
     Parameters
     ----------
@@ -339,13 +348,18 @@ def plot_background_subtraction(
         Dataset name, for the title. The default is "".
     label : str, optional
         Short measurement label. The default is ``'spdc'``.
+    window_s : float | None, optional
+        Half-range shown, in seconds - applied to *all three* panels so they
+        line up column by column. The default is None, which lets each panel
+        span whatever it was given.
 
     Returns
     -------
     plt.Figure
         The figure. Writes nothing.
     """
-    wide = full if full is not None else result
+    wide = _clip_to_window(full if full is not None else result, window_s)
+    result = _clip_to_window(result, window_s)
     fig, axes = plt.subplots(3, 1)
 
     x = wide["centers"] / 1000.0
@@ -369,7 +383,11 @@ def plot_background_subtraction(
     ax.plot(x, wide["residual"], lw=1.0, label="lag 0 - accidentals")
     ax.axhline(0, color="k", lw=0.8)
     ax.set_ylabel(f"excess / {wide['bin_width_s'] * 1e12:.0f} ps")
-    ax.set_title("Residual over the full support")
+    ax.set_title(
+        "Residual over the plotted window"
+        if window_s is not None
+        else "Residual over the full support"
+    )
     _legend_outside(ax)
     ax.grid(True, lw=0.5, alpha=0.6)
 
@@ -387,5 +405,7 @@ def plot_background_subtraction(
 
     for ax in axes:
         ax.set_xlabel("Timestamp difference  (ns)")
+        if window_s is not None:
+            ax.set_xlim(-window_s * 1e9, window_s * 1e9)
     fig.tight_layout()
     return fig

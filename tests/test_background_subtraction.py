@@ -81,15 +81,20 @@ def test_lag_zero_matches_calc_diff() -> None:
     np.testing.assert_array_equal(mine[LABEL], theirs[LABEL])
 
 
-def test_lag_zero_matches_calc_diff_under_a_delta_window() -> None:
-    """The window cut must behave identically too, or stage 1 diverges."""
+def test_lag_zero_matches_calc_diff_on_a_busy_run() -> None:
+    """Agreement has to hold at scale, not just on a handful of frames.
+
+    Stage 1 picks between these two functions on one boolean, so any divergence
+    would show up as 'subtract_background' quietly changing the measurement it
+    is supposed to leave alone.
+    """
     ts = _random_frames(5_000, 0.3, 0.25, n_pairs=200, seed=11)
 
-    mine = bs.compute_lagged_differences(ts, PIXELS, 300.0, frame_lag=0)
-    theirs = cd.calculate_differences(ts, PIXELS, 300.0)
+    mine = bs.compute_lagged_differences(ts, PIXELS, frame_lag=0)
+    theirs = cd.calculate_differences(ts, PIXELS)
 
     np.testing.assert_array_equal(mine[LABEL], theirs[LABEL])
-    assert np.all(np.abs(mine[LABEL]) <= 300.0)
+    assert mine[LABEL].size > 0, "the fixture produced no coincidences"
 
 
 def test_lag_shifts_group_b_by_whole_frames() -> None:

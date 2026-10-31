@@ -80,8 +80,9 @@ data_quality.plot_time_code_histogram(
 )
 
 # 1 + 2. Compute the full-sensor DCR map and save both figures.
-#        'open_shutter_time_s' is
-#    the photon-sensitive part of each frame, in SECONDS.
+#        'open_shutter_time_s' is the photon-sensitive part of each frame, in
+#        SECONDS. It sets the rate normalisation and nothing else - it is not
+#        the TDC full scale, which every analysis measures from the data.
 dcr_analysis.collect_and_plot_dcr_64(
     "path/to/data", nframes=1000, open_shutter_time_s=100e-9
 )
@@ -103,7 +104,7 @@ fig = dcr_analysis.plot_heatmap(dcr)
 ```
 
 Each driver can also skip straight to stage 2 from what is already in
-`processed/`: `dcr_analysis` and `crosstalk_analysis` take `from_saved=True`,
+`processed/`: `dcr_analysis` and `crosstalk_analysis` take `reuse=True`,
 `hitmap_analysis` takes `npy_path=`, `delta_t` takes `feather_path=`, and TDC
 lookup tables come back through `tdc_calibration.load_lut`.
 

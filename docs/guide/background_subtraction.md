@@ -47,7 +47,7 @@ counts, centers, fit = dt.collect_and_plot_delta_counts(
     subtract_background=True,
     bin_width_s=231e-12,
     plot_window_s=10e-9,
-    peak_window_s=2e-9,
+    fit_window_s=2e-9,
 )
 print(fit["model_free"])       # {'n': ..., 'n_err': ..., 'car': ..., ...}
 ```
@@ -68,7 +68,7 @@ dt.calculate_and_save_timestamp_differences(
 )
 counts, centers, fit = dt.collect_and_plot_timestamp_differences(
     path, subtract_background=True, bin_width_s=231e-12,
-    plot_window_s=10e-9, peak_window_s=2e-9,
+    plot_window_s=10e-9, fit_window_s=2e-9,
 )
 ```
 
@@ -128,7 +128,7 @@ period — not by the analysis. Nothing downstream of the camera can change it.
 **It does give you two things worth having:**
 
 * a **model-free coincidence count**. Sum the residual over a window
-  (`peak_window_s`, reported as `fit["model_free"]`). No Gaussian, no triangle,
+  (`fit_window_s`, reported as `fit["model_free"]`). No Gaussian, no triangle,
   no fitter that can trade peak area against background slope;
 * a **test of whether the pedestal is accidental at all**. If the residual is
   flat and zero away from the peak, it was. If it is not, something else is
@@ -149,12 +149,12 @@ Read that line before quoting anything from the peak.
 
 ## The fit model must be flat
 
-Once the triangle has been subtracted there is no triangle left to fit, so
-`subtract_background=True` with `background='triangle'` (or `'two_gaussians'`)
-is refused rather than quietly fitted. The residual sits on a zero baseline,
-which is precisely the case `fit_gaussian_peak` is valid for — and unlike on raw
-data, the flat background is not an approximation over a narrow window, it is
-the truth over the whole support.
+Once the triangle has been subtracted there is no triangle left to fit — which
+is why the model is not a parameter. `subtract_background` settles it: flat on
+the residual, triangular on a raw histogram. The residual sits on a zero
+baseline, which is precisely the case `fit_gaussian_peak` is valid for — and
+unlike on raw data, the flat background is not an approximation over a narrow
+window, it is the truth over the whole support.
 
 Two numbers come out, and they answer different questions:
 
@@ -188,12 +188,12 @@ not appear in `background_lags`.
 
 ```
 processed/
-  <dataset>_delta_counts.npy         <- (n_lags, n_pairs, n_bins) int64, lag 0 first
-  <dataset>_delta_counts.meta.json   <- lags, frames_used, labels, progress
+  <dataset>_<tag>_delta_counts.npy   <- (n_lags, n_pairs, n_bins) int64, lag 0 first
+  <dataset>_<tag>_delta_counts.meta.json <- lags, frames_used, labels, progress
   <dataset>_delta_t.feather          <- or: '<pair>' and '<pair>@lag<k>' columns
   <dataset>_delta_hist.npy           <- the streamed (n_lags, n_bins) histogram
 results/coincidences/
-  <dataset>_<label>_delta_counts_sub.png        <- the fitted residual (counts path)
+  <dataset>_<tag>_<label>_delta_counts_sub.png  <- the fitted residual (counts path)
   <dataset>_<label>_delta_t_sub.png             <- the fitted residual (feather path)
   <dataset>_<label>_background_subtraction.png  <- the three-panel diagnostic
 ```
@@ -205,16 +205,16 @@ file count. The subtraction only ever uses the ratio
 cancels — so a part folder left by a run that died is as usable as a complete
 feather.
 
-The grid is the counts path's own — `grid_s` cells over ±`support_s`, one TDC
-code per cell for raw-code data (where that is *lossless*, since `delta_code` is
-an integer) and a tenth of a code when calibrated. See
-[Choosing the grid](coincidences.md#choosing-the-grid).
+The grid is the counts path's own — `bin_width_s` cells over the run's measured
+full scale, one TDC code per cell for uncalibrated data (where that is
+*lossless*, since the codes are integers) and a tenth of a code when calibrated.
+See [Choosing the grid](coincidences.md#choosing-the-grid).
 
 Holding the full support matters here: the flat-zero residual out at the edge of
-the full scale is
-the evidence, and you cannot see it through a ±10 ns window. That is why the
-feather path streams over `support_s` (one TDC full scale by default) rather than
-`plot_window_s` when subtracting — the fitted zoom is then a *slice* of that
+the full scale is the evidence, and you cannot see it through a ±10 ns window.
+Neither path needs telling how far that is — the feather path histograms the
+whole physical support of a difference in one pass, and the counts grid is sized
+from the run's own largest code. The fitted zoom is then a *slice* of that
 histogram and the diagnostic's wide panels a regrouping of it, so widening the
 plot window afterwards costs nothing and the panels cannot disagree about a bin
 edge.

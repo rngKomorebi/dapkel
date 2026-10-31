@@ -20,6 +20,7 @@ what these tests are about.
 
 from __future__ import annotations
 
+import json
 import os
 
 import numpy as np
@@ -33,15 +34,9 @@ PIXELS = [[(0, 0), (0, 1)], [(1, 0), (1, 1)]]
 LABELS = ["0,0-1,0", "0,0-1,1", "0,1-1,0", "0,1-1,1"]
 
 NFRAMES = 50
-# One reference-clock period at 10 MHz; stage 1 requires it.
-SHUTTER_S = 100e-9
 
-# Random codes reach ~8 200, so differences reach ~630 000 ps. A support this
-# wide holds all of them, which is what the totals tests need.
-WIDE_PS = 1e6
 # The library takes seconds everywhere; these tests were written in ps, so a
-# single conversion keeps the numbers above readable.
-WIDE_S = WIDE_PS * 1e-12
+# single conversion keeps the numbers below readable.
 CODE_S = dt._TS_CODE_PS * 1e-12
 
 
@@ -70,7 +65,6 @@ def _counts_run(path, **kwargs):
         tag="ORT",
         apply_TDC_calibration=False,
         nframes=NFRAMES,
-        open_shutter_time_s=SHUTTER_S,
         **kwargs,
     )
 
@@ -83,14 +77,13 @@ def _feather_run(path):
         tag="ORT",
         apply_TDC_calibration=False,
         nframes=NFRAMES,
-        open_shutter_time_s=SHUTTER_S,
     )
 
 
 def _counts_path(path):
     return os.path.join(
         store.processed_dir(path, create=False),
-        f"{os.path.basename(path)}{dt._COUNTS_SUFFIX}",
+        f"{os.path.basename(path)}_ort{dt._COUNTS_SUFFIX}",
     )
 
 
@@ -145,7 +138,7 @@ def test_accumulate_is_lossless_for_integer_codes():
     codes = np.array([-3.0, -3.0, 0.0, 1.0, 1.0, 1.0, 7.0])
 
     total, outside = dt._accumulate_delta_counts(
-        counts, {"a": codes}, {"a": 0}, grid_native=1.0, zero_index=zero
+        counts, {"a": codes}, {"a": 0}, grid_ps=1.0, zero_index=zero
     )
 
     assert (total, outside) == (7, 0)
@@ -163,7 +156,7 @@ def test_out_of_range_differences_are_counted_not_dropped():
         counts,
         {"a": np.array([0.0, 4.0, 50.0, -50.0])},
         {"a": 0},
-        grid_native=1.0,
+        grid_ps=1.0,
         zero_index=zero,
     )
 
@@ -180,7 +173,7 @@ def test_unknown_pair_labels_are_ignored():
         counts,
         {"a": np.array([1.0]), "not-a-row": np.array([1.0, 2.0])},
         {"a": 0},
-        grid_native=1.0,
+        grid_ps=1.0,
         zero_index=zero,
     )
 
@@ -223,24 +216,32 @@ def test_rebinning_onto_a_multiple_of_the_grid_is_a_plain_regrouping():
 
 
 def _both_paths(bin_folder, bin_width, window):
-    """Histogram the same '.bin' files down both stage-1 paths."""
+    """Histogram the same '.bin' files down both stage-1 paths.
+
+    The feather path now histograms the whole physical support in one pass, so
+    the comparison window is a *slice* of it. Both paths place bin centres at
+    multiples of the width about zero ('_delta_hist_edges' / '_delta_grid'), so
+    the slice lands on exactly the bins a direct rebin produces.
+    """
     _feather_run(bin_folder)
     _counts_run(bin_folder)
 
-    want, edges, info = dt.compute_and_save_delta_histogram(
-        bin_folder,
-        bin_width_s=bin_width * 1e-12,
-        plot_window_s=window * 1e-12,
-        quiet=True,
+    full, full_edges, info = dt.compute_and_save_delta_histogram(
+        bin_folder, bin_width_s=bin_width * 1e-12, quiet=True
     )
+    full_centres = (full_edges[:-1] + full_edges[1:]) / 2
+
     grid_counts, centres, _ = dt.load_delta_counts(bin_folder)
-    got, got_edges = dt.rebin_delta_counts(
+    got, edges = dt.rebin_delta_counts(
         grid_counts,
         centres,
         bin_width_s=bin_width * 1e-12,
         plot_window_s=window * 1e-12,
     )
-    np.testing.assert_allclose(got_edges, edges)
+
+    keep = np.abs(full_centres) <= max(abs(edges[0]), abs(edges[-1]))
+    want = full[keep]
+    np.testing.assert_allclose(full_centres[keep], (edges[:-1] + edges[1:]) / 2)
     return got, want, edges, info
 
 
@@ -249,50 +250,55 @@ def test_counts_path_reproduces_the_feather_histogram_exactly(bin_folder):
 
     Uncalibrated, so the differences are integers and the counts grid is
     lossless; binned on a whole multiple of one code, so the rebin is a plain
-    regrouping. A difference in the interior would be a defect, not a
-    rounding. The outermost bin on each side is excluded here and pinned
-    separately below - the two paths genuinely disagree there, and the counts
-    path is the one that is right.
+    regrouping. Any difference at all would be a defect, not a rounding -
+    including in the outermost bins, which the feather path used to leave
+    half-filled before both paths were put on one lattice.
     """
     # Wide: the fabricated codes spread over the whole grid, so a narrow
-    # window around zero would compare two empty histograms.
-    bin_width = 4 * dt._TS_CODE_PS
+    # window around zero would compare two empty histograms. An *odd* number of
+    # cells per bin, because that is what puts the target edges between cells -
+    # the drivers snap to it, and comparing on an even one would only measure
+    # which side of a tie a float landed ('_snap_binning').
+    bin_width = 3 * dt._TS_CODE_PS
     window = 600 * bin_width
 
     got, want, _, info = _both_paths(bin_folder, bin_width, window)
 
-    np.testing.assert_array_equal(got[1:-1], want[1:-1])
-    assert want[1:-1].sum() > 0, "the fixture produced no data to compare"
+    np.testing.assert_array_equal(got, want)
+    assert want.sum() > 0, "the fixture produced no data to compare"
     assert int(info["n"]) > 0
 
 
-def test_the_feather_paths_outermost_bins_are_undercounted(bin_folder):
-    """A known, pre-existing quirk of the feather path - pinned, not fixed.
+def test_both_paths_put_zero_at_a_bin_centre_and_fill_the_edge_bins(
+    bin_folder,
+):
+    """The lattice is shared, so the outermost bins agree too.
 
-    Its edges run half a bin past the window (``arange(-W - w/2, ...)``) but
-    it cuts the data at ``abs(delta) <= W``, so the first and last bins can
-    only ever be half-filled. The counts path assigns whole grid cells to
-    whichever bin their centre falls in, so it fills them properly.
-
-    Only the two extreme bins can differ, and only in that direction.
+    The feather path used to draw edges half a bin past its window
+    (``arange(-W - w/2, ...)``) while cutting the data at ``abs(delta) <= W``,
+    which left the first and last bins permanently half-filled and made zero a
+    bin centre only when the window happened to be a whole number of bins. Both
+    paths now build edges the same way, which is what the full-support histogram
+    needs: every plot window is a slice of one lattice.
     """
-    bin_width = 4 * dt._TS_CODE_PS
+    bin_width = 3 * dt._TS_CODE_PS
     window = 600 * bin_width
 
     got, want, edges, _ = _both_paths(bin_folder, bin_width, window)
+    centres = (edges[:-1] + edges[1:]) / 2
 
-    assert got[0] >= want[0]
-    assert got[-1] >= want[-1]
-    # The excess is exactly the range the feather path's cut threw away.
-    assert edges[0] < -window
-    assert edges[-1] > window
-    assert got.sum() - want.sum() == (got[0] - want[0]) + (got[-1] - want[-1])
+    assert got[0] == want[0]
+    assert got[-1] == want[-1]
+    assert got.sum() == want.sum()
+    # Zero is a bin centre, and the edges sit half a bin outside the window.
+    assert centres[centres.size // 2] == pytest.approx(0.0, abs=1e-9)
+    np.testing.assert_allclose(centres, -centres[::-1], atol=1e-9)
 
 
 def test_the_two_paths_see_the_same_number_of_differences(bin_folder):
     """Totals must match over the whole support, not just inside a window."""
     _feather_run(bin_folder)
-    counts_path = _counts_run(bin_folder, support_s=WIDE_S)
+    counts_path = _counts_run(bin_folder)
 
     _, _, info = dt.compute_and_save_delta_histogram(bin_folder, quiet=True)
     meta = store.read_meta(counts_path)
@@ -302,12 +308,34 @@ def test_the_two_paths_see_the_same_number_of_differences(bin_folder):
     assert meta["total_in_grid"] == meta["total"]
 
 
-def test_a_narrow_support_reports_what_it_lost(bin_folder):
-    """The default support is narrower than these fabricated codes reach."""
-    meta = store.read_meta(_counts_run(bin_folder, support_s=200e-9))
+def test_the_grid_is_sized_from_the_data_so_nothing_falls_outside(bin_folder):
+    """The support is measured, not configured - and it has to be wide enough.
 
-    assert meta["n_outside"] > 0
-    assert meta["total_in_grid"] == meta["total"] - meta["n_outside"]
+    It comes from the largest code in the first file, which bounds every
+    difference the run can produce, so ``n_outside`` is the proof that no part
+    of the accidental triangle was clipped.
+    """
+    meta = store.read_meta(_counts_run(bin_folder))
+
+    max_code = meta["max_code"]
+    assert max_code > 0
+    assert meta["support_s"] >= dt.timing.full_scale_from_max_code(max_code)
+    assert meta["n_outside"] == 0
+    assert meta["total_in_grid"] == meta["total"] > 0
+
+
+def test_the_measured_support_matches_the_feather_paths(bin_folder):
+    """Both stage-1 paths must agree about how far the differences reach."""
+    _feather_run(bin_folder)
+    counts_path = _counts_run(bin_folder)
+
+    _, _, info = dt.compute_and_save_delta_histogram(bin_folder, quiet=True)
+    grid_support_s = store.read_meta(counts_path)["support_s"]
+
+    # The feather path measures the largest difference exactly; the grid is that
+    # bound plus a margin, so it must cover it and not wildly exceed it.
+    assert info["support_s"] <= grid_support_s
+    assert grid_support_s < 3 * info["support_s"]
 
 
 def _continuous_grid(deltas, cell):
@@ -315,7 +343,7 @@ def _continuous_grid(deltas, cell):
     n_bins, zero, _ = dt._delta_grid(cell * 1e-12, 200e-9)
     counts = np.zeros((1, n_bins), dtype=np.int64)
     dt._accumulate_delta_counts(
-        counts, {"a": deltas}, {"a": 0}, grid_native=cell, zero_index=zero
+        counts, {"a": deltas}, {"a": 0}, grid_ps=cell, zero_index=zero
     )
     return counts[0], (np.arange(n_bins) - zero) * cell
 
@@ -424,8 +452,30 @@ def test_different_inputs_will_not_overwrite_without_rewrite(bin_folder):
             tag="ORT",
             apply_TDC_calibration=False,
             nframes=NFRAMES,
-            open_shutter_time_s=SHUTTER_S,
         )
+
+
+def test_two_programs_in_one_folder_keep_separate_artifacts(bin_folder):
+    """The tag is in the file name, so a second program does not collide."""
+    rng = np.random.default_rng(20261030)
+    for i in range(3):
+        with open(os.path.join(bin_folder, f"S0T_{i}.bin"), "wb") as f:
+            f.write(rng.bytes(io.BYTES_PER_FRAME * NFRAMES))
+
+    ort = _counts_run(bin_folder)
+    s0t = dt.calculate_and_save_delta_counts(
+        bin_folder,
+        PIXELS,
+        tag="S0T",
+        apply_TDC_calibration=False,
+        nframes=NFRAMES,
+    )
+
+    assert ort != s0t
+    assert os.path.basename(s0t).endswith("_s0t_delta_counts.npy")
+    _, _, ort_info = dt.load_delta_counts(bin_folder)
+    _, _, s0t_info = dt.load_delta_counts(bin_folder, tag="S0T")
+    assert (ort_info["n_files"], s0t_info["n_files"]) == (6, 3)
 
 
 def _die_after(monkeypatch, n_files):
@@ -451,19 +501,25 @@ def test_an_interrupted_run_resumes_without_double_counting(
     This is what replaces the feather path's part folder: there is one file,
     so two runs cannot interleave, and progress is "the first N files".
     """
-    reference = np.load(_counts_run(bin_folder, flush_every=1))
+    # Checkpointing cadence is a module constant, not a parameter, so the
+    # test moves the constant.
+    monkeypatch.setattr(dt, "_FLUSH_EVERY", 1)
+    reference = np.load(_counts_run(bin_folder))
     reference_total = store.read_meta(_counts_path(bin_folder))["total"]
 
-    real = _die_after(monkeypatch, 3)
+    # 4, not 3: the counts path reads the first file once up front to measure
+    # the code range its grid has to span, so the first *data* unpack is the
+    # second call.
+    real = _die_after(monkeypatch, 4)
     with pytest.raises(KeyboardInterrupt):
-        _counts_run(bin_folder, flush_every=1, rewrite=True)
+        _counts_run(bin_folder, rewrite=True)
 
     partial = store.read_meta(_counts_path(bin_folder))
     assert partial["complete"] is False
     assert partial["files_done"] == 3
 
     monkeypatch.setattr(dt, "unpack", real)
-    resumed_path = _counts_run(bin_folder, flush_every=1)
+    resumed_path = _counts_run(bin_folder)
     resumed_meta = store.read_meta(resumed_path)
 
     np.testing.assert_array_equal(np.load(resumed_path), reference)
@@ -479,11 +535,15 @@ def test_a_checkpoint_inconsistent_with_its_sidecar_is_not_resumed(
     Resuming a newer array against an older sidecar would re-count files and
     inflate the coincidence total - worse than simply starting again.
     """
-    reference = np.load(_counts_run(bin_folder, flush_every=1))
+    monkeypatch.setattr(dt, "_FLUSH_EVERY", 1)
+    reference = np.load(_counts_run(bin_folder))
 
-    real = _die_after(monkeypatch, 3)
+    # 4, not 3: the counts path reads the first file once up front to measure
+    # the code range its grid has to span, so the first *data* unpack is the
+    # second call.
+    real = _die_after(monkeypatch, 4)
     with pytest.raises(KeyboardInterrupt):
-        _counts_run(bin_folder, flush_every=1, rewrite=True)
+        _counts_run(bin_folder, rewrite=True)
     monkeypatch.setattr(dt, "unpack", real)
 
     # Stand in for a crash between the two moves: the array no longer sums to
@@ -493,7 +553,7 @@ def test_a_checkpoint_inconsistent_with_its_sidecar_is_not_resumed(
     tampered[0, 0] += 1
     np.save(path, tampered)
 
-    resumed = np.load(_counts_run(bin_folder, flush_every=1))
+    resumed = np.load(_counts_run(bin_folder))
 
     np.testing.assert_array_equal(resumed, reference)
 
@@ -519,19 +579,37 @@ def test_load_pools_selected_pairs_and_reports_missing(bin_folder):
     assert one_info["missing"] == ["9,9-9,9"]
 
 
-def test_a_code_grid_is_scaled_to_ps_at_load_time(bin_folder):
-    """The ps-per-code assumption must not be baked into the artifact."""
+def test_the_grid_is_stored_in_picoseconds(bin_folder):
+    """Uncalibrated data is converted on the way in, not on the way out.
+
+    A raw-code artifact could never be calibrated afterwards - the LUT is per
+    code and a stored *difference* has lost both operands - so there is nothing
+    to gain from keeping codes, and one less unit to track by not.
+    """
     _counts_run(bin_folder)
 
-    _, default_centres, default_info = dt.load_delta_counts(bin_folder)
-    _, doubled, doubled_info = dt.load_delta_counts(
-        bin_folder, time_unit_s=2 * CODE_S
+    _, centres, info = dt.load_delta_counts(bin_folder)
+
+    assert info["unit"] == "ps"
+    assert info["cell_s"] == pytest.approx(CODE_S)
+    # Uncalibrated, so the cell is one nominal code and the centres are its
+    # integer multiples in ps.
+    np.testing.assert_allclose(
+        np.diff(centres), dt._TS_CODE_PS, rtol=1e-9
     )
 
-    assert default_info["unit"] == "code"
-    assert default_info["cell_s"] == pytest.approx(CODE_S)
-    assert doubled_info["cell_s"] == pytest.approx(2 * CODE_S)
-    np.testing.assert_allclose(doubled, 2 * default_centres)
+
+def test_a_raw_code_artifact_is_refused(bin_folder):
+    """An artifact from before the ps-only rule must not be read as ps."""
+    _counts_run(bin_folder)
+    path = _counts_path(bin_folder)
+    meta = store.read_meta(path)
+    meta["unit"] = "code"
+    with open(store.meta_path(path), "w", encoding="utf-8") as fh:
+        json.dump(meta, fh)
+
+    with pytest.raises(ValueError, match="not picoseconds"):
+        dt.load_delta_counts(bin_folder)
 
 
 def test_plot_driver_returns_counts_centres_and_a_fit(bin_folder):
@@ -551,7 +629,7 @@ def test_plot_driver_returns_counts_centres_and_a_fit(bin_folder):
     assert fit["n"] == int(counts.sum())
     png = os.path.join(
         store.results_dir(bin_folder, "coincidences", create=False),
-        f"{os.path.basename(bin_folder)}_test_delta_counts.png",
+        f"{os.path.basename(bin_folder)}_ort_test_delta_counts.png",
     )
     assert os.path.isfile(png), "the figure must land in results/"
 
@@ -594,10 +672,9 @@ def test_lag_zero_plane_is_the_unsubtracted_histogram(tmp_path):
         for i, blob in enumerate(data):
             (folder / f"ORT_{i}.bin").write_bytes(blob)
 
-    _counts_run(str(plain), support_s=WIDE_S)
+    _counts_run(str(plain))
     _counts_run(
         str(lagged),
-        support_s=WIDE_S,
         subtract_background=True,
         background_lags=(1, 2, 3),
     )
@@ -612,7 +689,7 @@ def test_lag_zero_plane_is_the_unsubtracted_histogram(tmp_path):
 def test_frames_used_is_recorded_per_lag(bin_folder):
     """A lag of k loses the last k frames of every file, and says so."""
     _counts_run(
-        bin_folder, support_s=WIDE_S, subtract_background=True,
+        bin_folder, subtract_background=True,
         background_lags=(1, 4),
     )
     meta = store.read_meta(_counts_path(bin_folder))
@@ -632,7 +709,7 @@ def test_bad_background_lags_are_rejected(bin_folder, lags, match):
 
 def test_a_bare_int_is_taken_as_one_lag(bin_folder):
     _counts_run(
-        bin_folder, support_s=WIDE_S, subtract_background=True,
+        bin_folder, subtract_background=True,
         background_lags=1,
     )
     assert store.read_meta(_counts_path(bin_folder))["lags"] == [0, 1]
@@ -640,7 +717,7 @@ def test_a_bare_int_is_taken_as_one_lag(bin_folder):
 
 def test_load_keeps_the_lag_axis_and_pools_pairs_under_it(bin_folder):
     _counts_run(
-        bin_folder, support_s=WIDE_S, subtract_background=True,
+        bin_folder, subtract_background=True,
         background_lags=(1, 2),
     )
     pooled, centres, info = dt.load_delta_counts(bin_folder)
@@ -661,30 +738,97 @@ def test_subtracting_needs_an_artifact_with_lag_planes(bin_folder):
 
     matplotlib.use("Agg")
 
-    _counts_run(bin_folder, support_s=WIDE_S)
+    _counts_run(bin_folder)
     with pytest.raises(ValueError, match="lag planes"):
         dt.collect_and_plot_delta_counts(
             bin_folder, subtract_background=True, label="test"
         )
 
 
-def test_subtracting_refuses_a_triangle_background(bin_folder):
-    """There is no triangle left to fit once it has been subtracted away."""
+def test_a_lagged_artifact_plots_without_a_subtraction(bin_folder):
+    """Lag planes must not leak into a plain plot.
+
+    The grid keeps its lag axis whether or not the plot asks for a
+    subtraction, and the rebinner ravels what it is given - so handing it the
+    whole artifact flattened the planes into one array twice as long as the
+    cell centres, and the mask caught it as an IndexError. Lag 0 is the
+    signal; anything else here would be the signal plus a copy of the
+    accidentals.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
 
-    _counts_run(
-        bin_folder, support_s=WIDE_S, subtract_background=True,
-        background_lags=(1, 2),
+    _counts_run(bin_folder, subtract_background=True, background_lags=(1, 2))
+    grid, cells, info = dt.load_delta_counts(bin_folder)
+
+    counts, centres, _ = dt.collect_and_plot_delta_counts(
+        bin_folder,
+        bin_width_s=4 * CODE_S,
+        plot_window_s=200 * CODE_S,
+        label="test",
     )
-    with pytest.raises(ValueError, match="no triangle left"):
-        dt.collect_and_plot_delta_counts(
-            bin_folder,
-            subtract_background=True,
-            background="triangle",
-            label="test",
+
+    assert grid.shape[0] == 3
+    assert counts.shape == centres.shape
+    # Every difference inside the window, from lag 0 alone - on the binning the
+    # driver settled on, which snaps onto the grid.
+    width, window = dt._snap_binning(
+        4 * CODE_S, 200 * CODE_S, info["cell_s"]
+    )
+    lag0, _ = dt.rebin_delta_counts(
+        grid[0], cells, bin_width_s=width, plot_window_s=window
+    )
+    np.testing.assert_array_equal(counts, lag0)
+
+
+def test_the_rebinner_names_a_lagged_grid(bin_folder):
+    """Not an IndexError from inside a boolean mask."""
+    _counts_run(bin_folder, subtract_background=True, background_lags=(1, 2))
+    grid, centres, _ = dt.load_delta_counts(bin_folder)
+
+    with pytest.raises(ValueError, match="lagged grid"):
+        dt.rebin_delta_counts(
+            grid, centres, bin_width_s=4 * CODE_S, plot_window_s=200 * CODE_S
         )
+
+
+def test_the_fit_model_follows_the_histogram(bin_folder):
+    """Triangle on raw data, flat on a residual - without being told."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+
+    _counts_run(bin_folder, subtract_background=True, background_lags=(1, 2))
+    kwargs = dict(bin_width_s=4 * CODE_S, plot_window_s=200 * CODE_S,
+                  label="test")
+
+    _, _, raw = dt.collect_and_plot_delta_counts(bin_folder, **kwargs)
+    _, _, residual = dt.collect_and_plot_delta_counts(
+        bin_folder, subtract_background=True, **kwargs
+    )
+
+    # 'half_base' is the triangle's own parameter; the flat model has no such
+    # thing, and would carry 'model_free' from the subtraction instead.
+    assert "half_base" in raw
+    assert "half_base" not in residual
+    assert "model_free" in residual
+
+
+def test_the_wrong_model_cannot_be_asked_for(bin_folder):
+    """A triangle on a residual used to be refused; now it is unsayable.
+
+    The model is not a parameter of either driver - it follows the histogram -
+    so the combination that had to be caught at run time no longer exists in
+    the signature.
+    """
+    import inspect
+
+    for driver in (
+        dt.collect_and_plot_delta_counts,
+        dt.collect_and_plot_timestamp_differences,
+    ):
+        assert "background" not in inspect.signature(driver).parameters
 
 
 def test_the_subtracted_driver_returns_the_residual_and_writes_both_figures(
@@ -696,7 +840,7 @@ def test_the_subtracted_driver_returns_the_residual_and_writes_both_figures(
     matplotlib.use("Agg")
 
     _counts_run(
-        bin_folder, support_s=WIDE_S, subtract_background=True,
+        bin_folder, subtract_background=True,
         background_lags=(1, 2, 3),
     )
     counts, centres, fit = dt.collect_and_plot_delta_counts(
@@ -704,7 +848,7 @@ def test_the_subtracted_driver_returns_the_residual_and_writes_both_figures(
         bin_width_s=4 * CODE_S,
         plot_window_s=200 * CODE_S,
         subtract_background=True,
-        peak_window_s=10 * CODE_S,
+        fit_window_s=10 * CODE_S,
         label="test",
     )
 
@@ -720,10 +864,10 @@ def test_the_subtracted_driver_returns_the_residual_and_writes_both_figures(
     results = store.results_dir(bin_folder, "coincidences", create=False)
     name = os.path.basename(bin_folder)
     assert os.path.isfile(
-        os.path.join(results, f"{name}_test_delta_counts_sub.png")
+        os.path.join(results, f"{name}_ort_test_delta_counts_sub.png")
     ), "the fit figure must be named apart from the unsubtracted one"
     assert os.path.isfile(
-        os.path.join(results, f"{name}_test_background_subtraction.png")
+        os.path.join(results, f"{name}_ort_test_background_subtraction.png")
     ), "the three-panel diagnostic must land in results/ too"
     assert fit["subtraction_png"].endswith("_background_subtraction.png")
 
@@ -754,17 +898,15 @@ def test_both_stage_one_paths_give_the_same_subtracted_residual(bin_folder):
         tag="ORT",
         apply_TDC_calibration=False,
         nframes=NFRAMES,
-        open_shutter_time_s=SHUTTER_S,
         **kwargs,
     )
-    counts_npy = _counts_run(bin_folder, support_s=WIDE_S, **kwargs)
+    counts_npy = _counts_run(bin_folder, **kwargs)
 
     _, _, from_feather = dt.collect_and_plot_timestamp_differences(
         feather_path=feather,
         bin_width_s=width,
         plot_window_s=20 * width,
-        support_s=WIDE_S,
-        peak_window_s=2 * width,
+        fit_window_s=2 * width,
         subtract_background=True,
         label="feather",
     )
@@ -772,9 +914,8 @@ def test_both_stage_one_paths_give_the_same_subtracted_residual(bin_folder):
         counts_path=counts_npy,
         bin_width_s=width,
         plot_window_s=20 * width,
-        peak_window_s=2 * width,
+        fit_window_s=2 * width,
         subtract_background=True,
-        snap_to_grid=False,
         label="counts",
     )
 

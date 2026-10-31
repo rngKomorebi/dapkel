@@ -65,7 +65,7 @@ def frames_in_file(fp: str) -> int:
 
 
 def find_bin_files(
-    folder: str, tag: str, *, require_separator: bool = False
+    path: str, tag: str, *, require_separator: bool = False
 ) -> list[str]:
     """Find and naturally sort the '.bin' files for a readout tag.
 
@@ -74,11 +74,11 @@ def find_bin_files(
 
     Parameters
     ----------
-    folder : str
+    path : str
         Path to the folder with the '.bin' data files.
     tag : str
         Filename fragment selecting the files (e.g. ``'ORT'``, ``'S0C'``,
-        ``'SPAD0_S0'``), or ``''`` to match every '.bin' file in the folder.
+        ``'SPAD0_S0'``), or ``''`` to match every '.bin' file in the path.
     require_separator : bool, optional
         When True the tag must be preceded by an underscore (pattern
         ``'*_<tag>*.bin'`` instead of ``'*<tag>*.bin'``). The DCR quadrant
@@ -94,7 +94,7 @@ def find_bin_files(
     Raises
     ------
     FileNotFoundError
-        Raised when no '.bin' files match the tag in the folder.
+        Raised when no '.bin' files match the tag in the path.
     """
     if tag:
         pattern = f"*_{tag}*.bin" if require_separator else f"*{tag}*.bin"
@@ -102,13 +102,13 @@ def find_bin_files(
         pattern = "*.bin"
 
     files = sorted(
-        glob.glob(os.path.join(folder, pattern)),
+        glob.glob(os.path.join(path, pattern)),
         key=lambda fp: int(
             "".join(filter(str.isdigit, os.path.basename(fp))) or "0"
         ),
     )
     if not files:
         raise FileNotFoundError(
-            f"No .bin files matching '{pattern}' found in:\n  {folder}"
+            f"No .bin files matching '{pattern}' found in:\n  {path}"
         )
     return files

@@ -68,13 +68,13 @@ _DIRECTIONS = {
 
 
 
-def _ct_files(folder: str, kind: str, prefix: str) -> list[str]:
+def _ct_files(path: str, kind: str, prefix: str) -> list[str]:
     """Find the coinc or OR '.bin' files for a cross-talk measurement.
 
     Parameters
     ----------
-    folder : str
-        Path to the folder with the '.bin' data files.
+    path : str
+        Path to the path with the '.bin' data files.
     kind : str
         Either ``'coinc'`` or ``'OR'``.
     prefix : str
@@ -97,7 +97,7 @@ def _ct_files(folder: str, kind: str, prefix: str) -> list[str]:
         raise ValueError(f"kind must be 'coinc' or 'OR', got {kind!r}")
 
     files = []
-    for fp in glob.glob(os.path.join(folder, "*.bin")):
+    for fp in glob.glob(os.path.join(path, "*.bin")):
         base = os.path.basename(fp)
         if not base.startswith(prefix):
             continue
@@ -116,18 +116,18 @@ def _ct_files(folder: str, kind: str, prefix: str) -> list[str]:
 
     if not files:
         raise FileNotFoundError(
-            f"No {prefix}*{kind}* .bin files found in:\n  {folder}"
+            f"No {prefix}*{kind}* .bin files found in:\n  {path}"
         )
     return sorted(files)
 
 
-def _detect_pair(folder: str, prefix: str) -> str:
+def _detect_pair(path: str, prefix: str) -> str:
     """Extract the micropixel-pair tag (e.g. 'S0S1') from the filenames.
 
     Parameters
     ----------
-    folder : str
-        Path to the folder with the '.bin' data files.
+    path : str
+        Path to the path with the '.bin' data files.
     prefix : str
         Filename prefix selecting the measurement batch.
 
@@ -137,7 +137,7 @@ def _detect_pair(folder: str, prefix: str) -> str:
         The pair tag, upper-cased (e.g. ``'S0S1'``), or ``''`` if none of
         the filenames carry a recognisable ``S<d>S<d>`` token.
     """
-    for fp in glob.glob(os.path.join(folder, prefix + "*.bin")):
+    for fp in glob.glob(os.path.join(path, prefix + "*.bin")):
         m = _PAIR_RE.search(os.path.basename(fp))
         if m:
             return m.group(1).upper()
@@ -196,9 +196,9 @@ def _accumulate_counts(
 
 
 def compute_crosstalk(
-    folder: str,
+    path: str,
     nframes: int,
-    file_prefix: str = _DEFAULT_PREFIX,
+    tag: str = _DEFAULT_PREFIX,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
     """Unpack the coinc/OR data and compute the (32, 32) cross-talk map.
 
@@ -207,11 +207,11 @@ def compute_crosstalk(
 
     Parameters
     ----------
-    folder : str
-        Path to the folder with the coinc/OR '.bin' data files.
+    path : str
+        Path to the path with the coinc/OR '.bin' data files.
     nframes : int
         Number of frames stored in each '.bin' file.
-    file_prefix : str, optional
+    tag : str, optional
         Filename prefix selecting the measurement batch. The default is
         ``'CT_'`` (the main 100-file batch), which excludes the smaller
         preliminary ``'CT01_'``-style batches.
@@ -227,10 +227,10 @@ def compute_crosstalk(
     pair : str
         The detected micropixel-pair tag (e.g. ``'S0S1'``), or ``''``.
     """
-    pair = _detect_pair(folder, file_prefix)
+    pair = _detect_pair(path, tag)
 
-    coinc_files = _ct_files(folder, "coinc", file_prefix)
-    or_files = _ct_files(folder, "OR", file_prefix)
+    coinc_files = _ct_files(path, "coinc", tag)
+    or_files = _ct_files(path, "OR", tag)
 
     coinc_sum = _accumulate_counts(
         coinc_files, nframes=nframes, label=f"{pair or 'CT'} coinc"
@@ -311,13 +311,13 @@ def plot_ct_distribution(ct_map: np.ndarray, pair: str = "") -> plt.Figure:
 
 
 def compute_and_save_crosstalk(
-    path: str, nframes: int, file_prefix: str = _DEFAULT_PREFIX
+    path: str, nframes: int, tag: str = _DEFAULT_PREFIX
 ) -> str:
     """Compute the (32, 32) cross-talk map and save it under ``processed/``.
 
     The stage-1 half of the cross-talk analysis: unpack the coinc/OR files
     once, write the array plus a '.meta.json' sidecar, and return the path.
-    'collect_and_plot_crosstalk' can then replot it with ``from_saved=True``
+    'collect_and_plot_crosstalk' can then replot it with ``reuse=True``
     without re-unpacking.
 
     Parameters
@@ -326,7 +326,7 @@ def compute_and_save_crosstalk(
         Path to the folder with the coinc/OR '.bin' data files.
     nframes : int
         Number of frames stored in each '.bin' file.
-    file_prefix : str, optional
+    tag : str, optional
         Filename prefix selecting the measurement batch. The default is
         ``'CT_'``.
 
@@ -336,7 +336,7 @@ def compute_and_save_crosstalk(
         Path to the saved '.npy'.
     """
     ct_map, coinc_sum, or_sum, pair = compute_crosstalk(
-        path, nframes, file_prefix
+        path, nframes, tag
     )
     return store.save_map(
         ct_map,
@@ -345,7 +345,7 @@ def compute_and_save_crosstalk(
         tag=pair,
         meta={
             "pair": pair,
-            "file_prefix": file_prefix,
+            "tag": tag,
             "unit": "ratio",
             "total_coinc": float(np.nansum(coinc_sum)),
             "total_or": float(np.nansum(or_sum)),
@@ -357,10 +357,10 @@ def compute_and_save_crosstalk(
 def collect_and_plot_crosstalk(
     path: str,
     nframes: int,
-    file_prefix: str = _DEFAULT_PREFIX,
+    tag: str = _DEFAULT_PREFIX,
     cmap: str | None = None,
     *,
-    from_saved: bool = False,
+    reuse: bool = False,
 ) -> np.ndarray:
     """Unpack, compute, and plot the (32, 32) cross-talk map for a folder.
 
@@ -373,8 +373,8 @@ def collect_and_plot_crosstalk(
         Path to the folder with the coinc/OR '.bin' data files.
     nframes : int
         Number of frames stored in each '.bin' file. Ignored when
-        ``from_saved=True`` - nothing is unpacked then.
-    file_prefix : str, optional
+        ``reuse=True`` - nothing is unpacked then.
+    tag : str, optional
         Filename prefix selecting the measurement batch. The default is
         ``'CT_'``.
     cmap : str | None, optional
@@ -391,12 +391,12 @@ def collect_and_plot_crosstalk(
         "distribution < < <\n"
     )
 
-    if from_saved:
-        pair = _detect_pair(path, file_prefix)
+    if reuse:
+        pair = _detect_pair(path, tag)
         ct_map, _ = store.load_map(path, kind=_KIND, tag=pair)
     else:
         ct_map, coinc_sum, or_sum, pair = compute_crosstalk(
-            path, nframes, file_prefix
+            path, nframes, tag
         )
         store.save_map(
             ct_map,
@@ -405,7 +405,7 @@ def collect_and_plot_crosstalk(
             tag=pair,
             meta={
                 "pair": pair,
-                "file_prefix": file_prefix,
+                "tag": tag,
                 "unit": "ratio",
                 "total_coinc": float(np.nansum(coinc_sum)),
                 "total_or": float(np.nansum(or_sum)),
@@ -525,7 +525,7 @@ def plot_ct_direction_summary(medians: dict[str, float]) -> plt.Figure:
 def combine_directional_crosstalk(
     parent_path: str,
     nframes: int,
-    file_prefix: str = _DEFAULT_PREFIX,
+    tag: str = _DEFAULT_PREFIX,
     cmap: str | None = None,
 ) -> np.ndarray:
     """Combine the per-direction cross-talk of pixel S0 into a (64, 64) map.
@@ -550,7 +550,7 @@ def combine_directional_crosstalk(
         Number of frames stored in each '.bin' file. The pairings are
         acquired with the same setting, so one value covers every
         sub-folder.
-    file_prefix : str, optional
+    tag : str, optional
         Filename prefix selecting the measurement batch, passed through to
         'compute_crosstalk'. The default is ``'CT_'``.
     cmap : str | None, optional
@@ -578,7 +578,7 @@ def combine_directional_crosstalk(
     for entry in sorted(os.scandir(parent_path), key=lambda e: e.name):
         if not entry.is_dir() or entry.name == "results":
             continue
-        pair = _detect_pair(entry.path, file_prefix)
+        pair = _detect_pair(entry.path, tag)
         if not pair:
             continue
         direction = _direction_of_pair(pair)
@@ -586,7 +586,7 @@ def combine_directional_crosstalk(
             continue
         name, off = direction
 
-        ct_map, _, _, _ = compute_crosstalk(entry.path, nframes, file_prefix)
+        ct_map, _, _, _ = compute_crosstalk(entry.path, nframes, tag)
         maps[name] = ct_map
         offsets[name] = off
         print(

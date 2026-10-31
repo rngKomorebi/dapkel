@@ -19,7 +19,7 @@ within one period of the **reference clock**. The recorded `time_series` value i
 the oscillator *code* on that range, and the timestamp is
 
 ```
-t = code * time_unit_s        with  time_unit_s ≈ 71.6 ps  (core.timing.CODE_S)
+t = code * CODE_S             with  CODE_S ≈ 71.6 ps  (core.timing.CODE_S)
 ```
 
 on average. The ring sets that code width, so it does **not** change with the
@@ -32,24 +32,39 @@ clock — only the number of codes does, as 1/f:
 | 5 MHz | 200 ns | ~2794 |
 | 2 MHz | 500 ns | ~6985 |
 
-That full scale is what every entry point needs, as `open_shutter_time_s` (one
-clock period) or `full_scale_s`. It bounds a difference, so it is also the
-accidental triangle's half-base — see
-[the triangle background](../ort_triangle_background.md).
+That full scale bounds a difference, so it is also the accidental triangle's
+half-base — see [the triangle background](../ort_triangle_background.md).
 
-The exact per-code bin widths come from a density-test LUT — pass it as
-`time_lut` once you have one; see [TDC calibration](tdc_calibration.md). **A LUT
-is specific to its clock**; the loaders check that for you and refuse a
-mismatch, because the silent version of that mistake costs 96 % of the
-coincidences at 2 MHz.
+**No entry point asks you for it.** The largest code a run produced *is* the
+range its TDC swept, so it is measured from the data
+([`core.timing.full_scale_from_max_code`][dapkel.core.timing.full_scale_from_max_code]).
+That replaced three parameters that used to ask for the same number under
+different names — `open_shutter_time_s`, `full_scale_s` and `support_s` — one of
+which was not even the right quantity: the open shutter time is how long the
+SPAD waits for a photon, and an 8 µs shutter on a 10 MHz clock still yields
+~100 ns timestamps, because the free-running oscillator has no cycle counter. It
+belongs to rate normalisation ([DCR](dcr.md), [hitmaps](hitmap.md)) and nothing
+else.
+
+The exact per-code bin widths come from a density-test LUT — see
+[TDC calibration](tdc_calibration.md). **A LUT is specific to its clock**, and
+the loaders check it against the code range the *run* occupies rather than
+against a clock frequency you restate, because the silent version of that
+mistake costs 96 % of the coincidences at 2 MHz.
 
 ### Units
 
-Every time parameter in the package is in **seconds**, with an `_s` suffix:
-`bin_width_s`, `plot_window_s`, `fit_window_s`, `support_s`, `time_unit_s`,
-`delta_window_s`, `open_shutter_time_s`. Histogram bin centres, edges and plot
-axes are in picoseconds — that is the scale the TDC lives on — and the
+Every time parameter in the package is in **seconds**, with an `_s` suffix.
+There are three of them here, and they are all display or fit choices:
+`bin_width_s`, `plot_window_s`, `fit_window_s`. Histogram bin centres, edges and
+plot axes are in picoseconds — that is the scale the TDC lives on — and the
 conversion happens on entry.
+
+Differences are stored in **picoseconds** whether or not a LUT was applied; an
+uncalibrated run is converted with the nominal `CODE_S` on the way out. There is
+no raw-code artifact, because there would be nothing to do with one: a LUT maps
+a *code* to a time, and a stored difference has lost both of its codes, so it
+could never be calibrated after the fact.
 
 There is one timestamp per photon, per window, per macropixel.
 
@@ -67,8 +82,16 @@ Two models are provided:
 
 | model | fit | when to use |
 |---|---|---|
-| `gaussian` / `fit_gaussian_peak` | Gaussian on flat background | valid only on a **narrow** window around the peak |
+| `gaussian` / `fit_gaussian_peak` | Gaussian on flat background | valid only on a **narrow** window around the peak, or on a subtracted residual |
 | `gaussian_plus_triangle` / `fit_gaussian_on_triangle` | Gaussian on triangular background | the correct model for ORT delta-t over a wide window |
+
+**The plotting drivers pick between them for you, and take no `background`
+argument.** The pedestal is either still in the histogram, and then it is the
+triangle, or `subtract_background=True` has measured it away and the residual is
+flat about zero — one decision, not two. A third model,
+`fit_two_gaussians_on_triangle` (narrow core on broad tails), is a statement
+about the *peak* rather than the pedestal; fit it on the `counts` and `centers`
+the driver returns.
 
 The full derivation, with the demonstration that the triangle is intrinsic
 rather than an artefact, is in
@@ -147,26 +170,29 @@ processed/
   <dataset>_delta_hist.meta.json   <- binning, source fingerprint, statistics
 ```
 
-The sidecar records `bin_width_s`, `plot_window_s`, `time_unit_s`, `pairs`
-and a fingerprint of the source files. A saved histogram is reused only when
-all of it matches, so changing the binning or rewriting the feather re-streams
-automatically; pass `reuse=False` (or `reuse_histogram=False` to the plot
-driver) to force the full pass. Re-fitting, switching between the flat and
-triangular background, or redrawing therefore costs a small load rather than
-another read of the feather.
+The histogram spans the **whole physical support** of a difference
+(`timing.MAX_DELTA_S`, ~586 ns) — at one code per bin that is ~16 k bins, i.e.
+~131 kB, so there is no window to choose and nothing can fall off the end. Every
+plot window is then a *slice* of one cached histogram, and the largest difference
+actually present is measured on the way past and reported as `support_s`: the
+run's own TDC full scale, and the triangle's half-base.
+
+The sidecar records `bin_width_s`, `pairs` and a fingerprint of the source
+files. A saved histogram is reused only when all of it matches, so changing the
+binning or rewriting the feather re-streams automatically; pass `reuse=False` to
+force the full pass. Re-fitting, changing the window or redrawing therefore
+costs a small load rather than another read of the feather.
 
 `collect_and_plot_timestamp_differences` goes through this, and returns
 `(counts, centers, fit)` — enough to re-fit by hand without touching disk:
 
 ```python
 counts, centers, fit = dt.collect_and_plot_timestamp_differences(
-    path,
-    background="triangle",
-    open_shutter_time_s=100e-9,
-    plot_window_s=100e-9,
-)
+    path,          # a raw histogram is fitted on the triangle, over the
+)                  # measured full scale — both settled, neither stated
 narrow = np.abs(centers) < 1000
 dt.fit_gaussian_peak(centers[narrow], counts[narrow])
+dt.fit_two_gaussians_on_triangle(centers, counts, half_base=fit["half_base"])
 ```
 
 The `.meta.json` also reports `padding_fraction`: the share of the cells read
@@ -207,8 +233,8 @@ finds them, keeping only the counts. It writes no feather at all:
 
 ```
 processed/
-  <dataset>_delta_counts.npy         <- (n_pairs, n_cells) int64
-  <dataset>_delta_counts.meta.json   <- grid, pair labels, totals, progress
+  <dataset>_<tag>_delta_counts.npy   <- (n_pairs, n_cells) int64, tag lower-cased
+  <dataset>_<tag>_delta_counts.meta.json <- grid, pair labels, totals, progress
 ```
 
 The size is set by the **grid**, not by the data. A 256-pair run on the default
@@ -219,19 +245,20 @@ columns you could afford to stream.
 
 ### Choosing the grid
 
-Two arguments, `grid_s` (cell width) and `support_s` (half-range):
+One argument, `bin_width_s` (cell width):
 
 | data | default cell | why |
 |---|---|---|
-| raw codes (`apply_TDC_calibration=False`) | one code, ~71.6 ps | `delta_code` is an **integer**, so counts-per-code is a re-encoding, not a summary — exactly lossless |
-| calibrated (`unit='ps'`) | 1/10 code, ~7.2 ps | the per-pixel LUT smears the code lattice; 7.2 ps is ~5× finer than the jitter |
+| uncalibrated (`apply_TDC_calibration=False`) | one code, ~71.6 ps | the codes are **integers**, so counts-per-code is a re-encoding, not a summary — exactly lossless |
+| calibrated | 1/10 code, ~7.2 ps | the per-pixel LUT smears the code lattice; 7.2 ps is ~5× finer than the jitter |
 
-`support_s` defaults to **twice the TDC full scale** — read off the LUT when
-there is one, else from `open_shutter_time_s`. A difference cannot exceed the
-full scale, so that covers the whole physical support at any clock; a fixed
-200 ns was 10× too wide at 50 MHz and 2.5× too narrow at 2 MHz. Anything landing
-outside is reported as `n_outside` rather than dropped silently; if that is not
-~0, widen it.
+The half-range is not a parameter. It is the run's own TDC full scale — the
+largest code in the first file — with a 20 % margin for the extreme-value bias
+of reading that off one file. A difference cannot exceed the full scale, so that
+covers the whole physical support at any clock without being told the clock; a
+fixed 200 ns was 10× too wide at 50 MHz and 2.5× too narrow at 2 MHz. Anything
+landing outside is reported as `n_outside` rather than dropped silently, so an
+under-sized grid announces itself instead of quietly clipping the triangle.
 
 ### Re-binning is free, and exact
 
@@ -242,13 +269,11 @@ dt.collect_and_plot_delta_counts(
     path,
     pairs=["6,10-21,22"],
     bin_width_s=71e-12,
-    plot_window_s=10e-9,
-    background="triangle",
-    full_scale_s=500e-9,        # or leave it to open_shutter_time_s
+    plot_window_s=10e-9,        # omit for the whole measured support
 )
 ```
 
-By default the binning is **snapped** onto the grid, and the snap is not
+The binning is always **snapped** onto the grid, and the snap is not
 cosmetic:
 
 - the width goes to a whole number of cells, or bins hold 9 then 10 then 9
@@ -258,31 +283,31 @@ cosmetic:
   *boundaries*, even puts them through cell *centres*, splitting a cell at
   every boundary. Measured on a real 3.22 GB run: **exactly zero** difference
   from the feather path at 9, 11 and 13 cells per bin, ~1% at 8, 10 and 12;
-- the window goes to a whole number of bins, so zero is a bin centre.
+- the window goes to a whole number of bins.
 
-So with snapping on, this is not an approximation of the feather histogram —
-it is the same histogram. Pass `snap_to_grid=False` to take your numbers
-literally, and you will be warned about the sawtooth you are asking for.
-
-The one honest disagreement is the outermost bin at each end. The feather path
-cuts data at `abs(delta) <= plot_window_s` but draws edges half a bin beyond
-it, so its first and last bins can only ever be part filled; the counts path
-fills them. That, not the method, is why fitted `sigma` differs by ~1%.
+So this is not an approximation of the feather histogram — it is the same
+histogram, in every bin. Both paths now build their edges the same way, with
+**zero at a bin centre whatever the window is**; the feather path used to draw
+edges half a bin past its window while cutting the data at
+`abs(delta) <= plot_window_s`, which left its first and last bins permanently
+part-filled and made zero a bin centre only when the window happened to be a
+whole number of bins. That mattered more once the histogram covered the whole
+support and every window became a slice of it.
 
 ### What you give up
 
-No per-event data survives, so there is no re-calibrating with a different LUT,
-no re-cutting `delta_window`, and nothing that needs individual differences —
-time ordering, splitting by acquisition, higher-order correlations. It also
-does not make stage 1 meaningfully faster: unpacking dominates either way. The
-win is artifact size and replot latency. Keep the feather until you are sure
-you want none of that back.
+No per-event data survives, so there is nothing that needs individual
+differences — time ordering, splitting by acquisition, higher-order
+correlations. It also does not make stage 1 meaningfully faster: unpacking
+dominates either way. The win is artifact size and replot latency. Keep the
+feather until you are sure you want none of that back.
 
 ### Crash insurance without a part folder
 
-The grid is rewritten every `flush_every` files (default 50), so a run that
-dies leaves a valid artifact covering everything up to its last checkpoint, and
-the next call resumes from it. There is only ever one file, so two runs cannot
+The grid is rewritten every 50 files (the module constant `_FLUSH_EVERY`, not
+a parameter — checkpoint cadence cannot change the numbers), so a run that dies
+leaves a valid artifact covering everything up to its last checkpoint, and the
+next call resumes from it. There is only ever one file, so two runs cannot
 interleave — the failure mode `combine_delta_t_parts` exists to guard against
 simply does not arise here.
 
@@ -304,7 +329,7 @@ than fitted. Both stage-1 paths take it, and both give the same residual — see
 dt.calculate_and_save_delta_counts(path, [signal, idler], nframes=10_000,
                                    subtract_background=True)
 counts, centers, fit = dt.collect_and_plot_delta_counts(
-    path, subtract_background=True, peak_window_s=2e-9)
+    path, subtract_background=True, fit_window_s=2e-9)
 
 # feather path: same call, but the lags cost one column set each - so ~9x the
 # feather at the default eight lags. Use fewer, or use the counts path.
@@ -312,7 +337,7 @@ dt.calculate_and_save_timestamp_differences(path, [signal, idler], nframes=10_00
                                             subtract_background=True,
                                             background_lags=(1, 2, 3, 4))
 counts, centers, fit = dt.collect_and_plot_timestamp_differences(
-    path, subtract_background=True, peak_window_s=2e-9)
+    path, subtract_background=True, fit_window_s=2e-9)
 ```
 
 The feather's lag columns are named `<pair>@lag<k>`; lag 0 keeps the bare pair

@@ -50,12 +50,15 @@ Two versions, selected with `firmware_version`
 
 | `firmware_version` | cycle | notes |
 |---|---|---|
-| `"short_exposure"` (default) | always **9 µs** | the photon-sensitive exposure inside the cycle is 50–500 ns, typically 100 ns |
+| `"short_exposure"` (default) | always **9 µs** | the photon-sensitive exposure sits inside the cycle and does not extend it, so it can be anything from ~50 ns to the full 9 µs |
 | `"long_exposure"` | **`exp_time_s` + 9 µs** | you set X, the firmware adds 9 µs. `exp_time_s` is required |
 
-`"short_window"` / `"full_window"` are accepted as aliases of the two, since
-that is what [`resolve_live_time`][dapkel.core.timing.resolve_live_time] and
-[DCR](dcr.md) call them.
+These two names are the whole vocabulary — the same strings
+[`resolve_live_time`][dapkel.core.timing.resolve_live_time] and [DCR](dcr.md)
+take, listed in `core.timing.FIRMWARE_VERSIONS`. The older `"short_window"` /
+`"full_window"` spellings are gone rather than aliased: two names for one setting
+is how a caller ends up passing the pair that only one of two functions
+accepts.
 
 !!! warning "`frame_rate_cnt.txt` is not used, on purpose"
     The acquisition exe writes a `frame_rate_cnt.txt` beside the data. Nothing

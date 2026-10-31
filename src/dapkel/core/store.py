@@ -57,12 +57,12 @@ RESULTS_DIR = "results"
 REWRITE_DELAY_S = 5.0
 
 
-def processed_dir(folder: str, *, create: bool = True) -> str:
+def processed_dir(path: str, *, create: bool = True) -> str:
     """Return (and by default create) the ``processed/`` folder of a dataset.
 
     Parameters
     ----------
-    folder : str
+    path : str
         The data folder holding the '.bin' files.
     create : bool, optional
         Create the folder if missing. The default is True.
@@ -72,18 +72,18 @@ def processed_dir(folder: str, *, create: bool = True) -> str:
     str
         Path to ``<folder>/processed``.
     """
-    out = os.path.join(folder, PROCESSED_DIR)
+    out = os.path.join(path, PROCESSED_DIR)
     if create:
         os.makedirs(out, exist_ok=True)
     return out
 
 
-def results_dir(folder: str, kind: str, *, create: bool = True) -> str:
+def results_dir(path: str, kind: str, *, create: bool = True) -> str:
     """Return (and by default create) the figure folder for one analysis.
 
     Parameters
     ----------
-    folder : str
+    path : str
         The data folder holding the '.bin' files.
     kind : str
         Analysis name, used as the sub-folder (e.g. ``'dcr'``, ``'hitmap'``).
@@ -95,7 +95,7 @@ def results_dir(folder: str, kind: str, *, create: bool = True) -> str:
     str
         Path to ``<folder>/results/<kind>``.
     """
-    out = os.path.join(folder, RESULTS_DIR, kind)
+    out = os.path.join(path, RESULTS_DIR, kind)
     if create:
         os.makedirs(out, exist_ok=True)
     return out
@@ -155,7 +155,7 @@ def read_meta(npy_path: str) -> dict:
 
 def save_map(
     data: np.ndarray,
-    folder: str,
+    path: str,
     *,
     kind: str,
     tag: str = "",
@@ -169,8 +169,8 @@ def save_map(
     ----------
     data : np.ndarray
         The array to save.
-    folder : str
-        The data folder; the array lands in its ``processed/`` sub-folder.
+    path : str
+        The data folder; the array lands in its ``processed/`` sub-path.
     kind : str
         Analysis name (e.g. ``'dcr'``), used in the file name.
     tag : str, optional
@@ -190,8 +190,8 @@ def save_map(
     str
         Path the array was saved to.
     """
-    out_dir = processed_dir(folder)
-    dataset = os.path.basename(os.path.normpath(folder))
+    out_dir = processed_dir(path)
+    dataset = os.path.basename(os.path.normpath(path))
     name = file_name or map_file_name(dataset, kind, tag)
     out_path = os.path.join(out_dir, name)
 
@@ -205,7 +205,7 @@ def save_map(
 
 
 def load_map(
-    folder: str | None = None,
+    path: str | None = None,
     *,
     kind: str = "",
     tag: str = "",
@@ -216,7 +216,7 @@ def load_map(
 
     Parameters
     ----------
-    folder : str | None, optional
+    path : str | None, optional
         The data folder to look under. May be None when ``npy_path`` is
         given. The default is None.
     kind : str, optional
@@ -242,11 +242,11 @@ def load_map(
         Raised when the '.npy' does not exist, with the path that was tried.
     """
     if npy_path is None:
-        if folder is None:
-            raise ValueError("give either 'folder' or 'npy_path'")
-        dataset = os.path.basename(os.path.normpath(folder))
+        if path is None:
+            raise ValueError("give either 'path' or 'npy_path'")
+        dataset = os.path.basename(os.path.normpath(path))
         name = file_name or map_file_name(dataset, kind, tag)
-        npy_path = os.path.join(folder, PROCESSED_DIR, name)
+        npy_path = os.path.join(path, PROCESSED_DIR, name)
 
     if not os.path.isfile(npy_path):
         raise FileNotFoundError(
@@ -257,7 +257,7 @@ def load_map(
 
 
 def save_figure(fig: plt.Figure, results_dir: str, file_name: str) -> str:
-    """Save a figure into the results folder.
+    """Save a figure into the results path.
 
     Parameters
     ----------
