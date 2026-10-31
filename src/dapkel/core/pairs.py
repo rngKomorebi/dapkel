@@ -4,25 +4,38 @@ Every coincidence analysis starts by turning two detector groups into an
 ordered list of pairs and a label per pair. That enumeration decides the row
 order of every stage-1 artifact, so two analyses are only comparable if they
 build it the *same* way - which is why it lives here rather than in each of
-them. 'delta_t' had it twice: once inline in the feather path, once as a
-private helper for the counts path.
+them.
 
-The label format ``"ra,ca-rb,cb"`` is a stored contract: it is the key
-'calc_diff.calculate_differences' returns, the column name in the delta-t
-feather, and the ``labels`` entry in every counts sidecar. Do not reformat it.
+The label format ``"ra,ca-rb,cb"`` is a stored contract: it is the row name in
+every delta-t counts sidecar (``labels``). Do not reformat it.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
-from dapkel.functions.calc_diff import Pixel, as_pixel_list
+import numpy as np
 
 __all__ = [
+    "Pixel",
+    "as_pixel_list",
     "pair_label",
     "pair_list",
-    "pair_labels",
 ]
+
+#: One pixel, as ``(row, col)`` on the (32, 32) array.
+Pixel = tuple[int, int]
+
+
+def as_pixel_list(group: Pixel | Sequence[Pixel]) -> list[Pixel]:
+    """Normalise a detector spec - one ``(row, col)`` or a sequence - to a list."""
+    if (
+        len(group) == 2
+        and isinstance(group[0], (int, np.integer))
+        and isinstance(group[1], (int, np.integer))
+    ):
+        return [(int(group[0]), int(group[1]))]
+    return [(int(r), int(c)) for r, c in group]
 
 
 def pair_label(a: Pixel, b: Pixel) -> str:
@@ -67,38 +80,3 @@ def pair_list(
             )
         return list(zip(group_a, group_b, strict=True))
     return [(a, b) for a in group_a for b in group_b]
-
-
-def pair_labels(
-    pixels: Sequence[Sequence[Pixel]], mode: str = "all_pairs"
-) -> tuple[list[str], list[Pixel]]:
-    """Pair labels and the de-duplicated pixels they mention.
-
-    The two things a stage-1 loop needs: what to call each output row, and
-    which pixels to decode out of the frames.
-
-    Parameters
-    ----------
-    pixels : Sequence[Sequence[tuple[int, int]]]
-        Two groups ``[group_a, group_b]``.
-    mode : str, optional
-        ``'all_pairs'`` (default) or ``'1v1'``.
-
-    Returns
-    -------
-    labels : list[str]
-        ``"ra,ca-rb,cb"`` per pair, in 'pair_list' order.
-    all_pixels : list[tuple[int, int]]
-        Every pixel mentioned, de-duplicated, first-seen order.
-
-    Raises
-    ------
-    ValueError
-        Raised on an unknown ``mode``, or unequal groups under ``'1v1'``.
-    """
-    pl = pair_list(pixels, mode)
-    labels = [pair_label(a, b) for a, b in pl]
-    all_pixels = list(
-        dict.fromkeys(as_pixel_list(pixels[0]) + as_pixel_list(pixels[1]))
-    )
-    return labels, all_pixels

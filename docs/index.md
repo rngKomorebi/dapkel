@@ -23,6 +23,26 @@ The rule that keeps this honest: **`processed/` holds data, `results/` holds
 pictures, and stage 2 never re-unpacks `.bin` files.** Retrying a colormap costs
 a load, not a full re-read of the raw data.
 
+So every analysis module has exactly two public functions:
+
+| call | does | returns |
+|---|---|---|
+| `process_<x>(path, nframes, ...)` | unpack the `.bin` files, reduce, **always save** to `processed/` | the saved path |
+| `plot_<x>(path, tag, ...)` | load that artifact, write figures to `results/<kind>/` | the data it plotted |
+
+| module | process | plot |
+|---|---|---|
+| `data_quality` | `process_time_codes` | `plot_time_codes` |
+| `hitmap_analysis` | `process_hitmap` | `plot_hitmap` |
+| `dcr_analysis` | `process_dcr` | `plot_dcr` |
+| `crosstalk_analysis` | `process_crosstalk` | `plot_crosstalk` |
+| `tdc_calibration` | `process_tdc_calibration` | `plot_tdc_calibration` |
+| `delta_t` | `process_delta_t` | `plot_delta_t` |
+
+Shared code lives in [`dapkel.core`](api/core.md); retired code (the feather
+delta-t path, the dense per-clock TDC LUTs, the two-Gaussian fit, ...) is kept,
+unmaintained, in the repository's `archive/` folder.
+
 ## Start here
 
 **On a fresh acquisition, run [the data-quality check](guide/data_quality.md)
@@ -39,6 +59,7 @@ every other analysis in this package.
 - [Coincidences](guide/coincidences.md) — delta-t and timing jitter
 - [Background subtraction](guide/background_subtraction.md) — measure the
   accidental background by shifting frames instead of fitting it
+  (`subtract_background=True` in `delta_t`)
 - [Data quality](guide/data_quality.md) — check the run before trusting it
 
 ## Reference
@@ -60,7 +81,7 @@ import komorebi_mpl
 from dapkel.functions import hitmap_analysis
 
 komorebi_mpl.use("night_wave")    # or any registered style, or "default"
-hitmap_analysis.collect_and_plot_hitmap(path)   # stage 2: reads the saved map
+hitmap_analysis.plot_hitmap(path)   # stage 2: reads the saved map
 ```
 
 The plotting functions never touch `rcParams` themselves, so whatever style is

@@ -1,16 +1,26 @@
-"""Per-window timestamp differences for pairs of pixels.
+"""ARCHIVED from dapkel.functions.calc_diff (branch modules-restructure, 2026-10-31).
 
-The low-level, daplis-style counterpart of ``daplis.functions.calc_diff``: it
-takes an already-structured mapping of per-pixel, per-frame timestamps and
-returns the differences for the requested pixel pairs. Unpacking, structuring
-and saving are handled one level up in 'dapkel.functions.delta_t'.
+The whole module. Within-frame differencing is now the lag-0 case of
+delta_t's frame-shifted differencing, and the pixel helpers moved to
+'dapkel.core.pairs'.
 
-A coincidence is a *within-window* event: in a frame where both pixels of a pair
-hold a valid TDC code, the difference of their codes is one entry of the delta-t
-distribution. Correlated pairs (e.g. SPDC signal/idler) pile up at delta = 0.
-
-See ``docs/guide/coincidences.md``.
+Reference only: not packaged, not tested, not maintained. Copied verbatim
+from commit 6b49a4b; the original module docstring follows.
 """
+
+# """Per-window timestamp differences for pairs of pixels.
+# 
+# The low-level, daplis-style counterpart of ``daplis.functions.calc_diff``: it
+# takes an already-structured mapping of per-pixel, per-frame timestamps and
+# returns the differences for the requested pixel pairs. Unpacking, structuring
+# and saving are handled one level up in 'dapkel.functions.delta_t'.
+# 
+# A coincidence is a *within-window* event: in a frame where both pixels of a pair
+# hold a valid TDC code, the difference of their codes is one entry of the delta-t
+# distribution. Correlated pairs (e.g. SPDC signal/idler) pile up at delta = 0.
+# 
+# See ``docs/guide/coincidences.md``.
+# """
 
 from __future__ import annotations
 

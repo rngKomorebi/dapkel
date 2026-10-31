@@ -1,16 +1,22 @@
 """Structural guards on the package's public API.
 
 These tests do not check any physics - they check that the *shape* of the
-package holds as it grows. Two failure modes are guarded:
+package holds as it grows. Four failure modes are guarded:
 
-    1. A public function gets added (or renamed) without being declared in the
-       module's ``__all__``, so the declared surface silently drifts from the
-       real one.
+    1. An analysis module grows past its two public functions,
+       ``process_<x>`` (raw data in, saved artifact out) and ``plot_<x>``
+       (saved artifact in, figures out). Anything else a caller could reach
+       for is a second way to do the same job - which is how the package
+       ended up with compute_hitmap beside compute_and_save_hitmap, and two
+       parallel delta-t pipelines.
 
-    2. The same helper gets copy-pasted into a second analysis module instead
-       of being lifted into the shared core. This is how the package ended up
-       with four copies of '_frames_in_file' and three copies of the heatmap
-       plotting skeleton; the test makes the regression loud.
+    2. A module sprouts private helpers by the dozen instead of combining them.
+
+    3. A public function gets added (or renamed) without being declared in the
+       module's ``__all__``, so the declared surface silently drifts.
+
+    4. The same helper gets copy-pasted into a second analysis module instead
+       of being lifted into the shared core.
 
 See 'docs/adding_an_analysis.md' for the contract these enforce.
 """
@@ -26,18 +32,21 @@ FUNCTIONS_DIR = (
     pathlib.Path(__file__).resolve().parents[1] / "src" / "dapkel" / "functions"
 )
 
-# The analysis modules, in stage order. 'unpack' is stage 0 and shared by all
-# of them, so it is excluded from the duplicate-name check below.
+# The analysis modules. 'unpack' is stage 0 and shared by all of them, so it is
+# excluded from the checks that only make sense for an analysis.
 ANALYSIS_MODULES = [
-    "calc_diff",
     "data_quality",
+    "hitmap_analysis",
     "dcr_analysis",
     "crosstalk_analysis",
-    "hitmap_analysis",
     "tdc_calibration",
-    "background_subtraction",
     "delta_t",
 ]
+
+# Private top-level functions an analysis may define. Enough for delta_t, the
+# largest; a module that needs more is doing several jobs, or has helpers that
+# should be combined or lifted into 'dapkel.core'.
+MAX_PRIVATE_FUNCTIONS = 10
 
 ALL_MODULES = ["unpack", *ANALYSIS_MODULES]
 
@@ -80,6 +89,29 @@ def _defined_public(tree: ast.Module) -> set[str]:
 
 def _top_level_functions(tree: ast.Module) -> set[str]:
     return {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+
+@pytest.mark.parametrize("module", ANALYSIS_MODULES)
+def test_an_analysis_is_exactly_process_and_plot(module: str) -> None:
+    """``__all__`` is ``['process_<x>', 'plot_<x>']``, for one and the same x."""
+    declared = _declared(_parse(module))
+    assert len(declared) == 2, (
+        f"{module} declares {declared}: an analysis has exactly two public "
+        "functions, process_<x> and plot_<x>. Make the rest private, or move "
+        "retired code to archive/."
+    )
+    process, plot = declared
+    assert process.startswith("process_") and plot.startswith("plot_"), declared
+    assert process.removeprefix("process_") == plot.removeprefix("plot_"), declared
+
+
+@pytest.mark.parametrize("module", ANALYSIS_MODULES)
+def test_private_helpers_stay_few(module: str) -> None:
+    private = sorted(n for n in _top_level_functions(_parse(module)) if n.startswith("_"))
+    assert len(private) <= MAX_PRIVATE_FUNCTIONS, (
+        f"{module} defines {len(private)} private functions ({private}); combine "
+        f"them, or lift shared ones into dapkel.core (limit {MAX_PRIVATE_FUNCTIONS})."
+    )
 
 
 @pytest.mark.parametrize("module", ALL_MODULES)

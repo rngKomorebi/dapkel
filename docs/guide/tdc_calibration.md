@@ -4,7 +4,7 @@ The Kelpie ring-oscillator TDC does not have uniform bin widths. The raw
 `time_series` code produced by [`unpack`](unpack.md) advances in steps whose
 true duration varies code-to-code (differential non-linearity, DNL). A flat
 `code * 71.6 ps` conversion is therefore only an *average*; timing-jitter and
-coincidence work needs the exact per-code bin widths.
+coincidence work needs the actual bin widths.
 
 Those come from a **statistical code density test**.
 
@@ -16,26 +16,22 @@ period. The probability of landing in a given code bin is then proportional to
 that bin's width. So, for every pixel independently:
 
 1. Histogram the valid TDC codes over all frames of all files →
-   `counts[pixel, code]`.
+   `counts[pixel, code]`
+   ([`core.reduce.code_histogram`][dapkel.core.reduce.code_histogram]).
 2. The width of code `k` is `full_scale * counts[k] / total`.
 3. The calibrated time of code `k` is the running integral up to the **centre**
-   of its bin:
-
-   ```
-   LUT[k] = full_scale * (cumsum(counts)[k] - counts[k]/2) / total
-   ```
-
-   which is the minimum-quantisation-error estimator of the true time a code
+   of its bin — the minimum-quantisation-error estimator of the true time a code
    represents.
 
-That `LUT` is exactly the `time_lut` (code → ps map) that
-[the coincidence pipeline](coincidences.md) and `calc_diff` accept.
+But the hardware does not have one width per code: it has **eight**, repeating
+every lap of the ring. So the eight are what is estimated, each averaged over
+every lap the run swept — see [the 8 ring taps](#the-8-ring-taps) below.
 
 ## Absolute scale
 
 The density test supplies only the *relative* per-code widths. The absolute
-scale is fixed by `clock_period_s` — one period of the reference clock — onto
-which the full populated code range is mapped.
+scale is fixed by `clock_period_s` — one period of the reference clock the test
+ran at — onto which each pixel's populated code range is mapped.
 
 **This is the only time parameter the package cannot derive from the data**, and
 this module is the only place it appears. Everything downstream measures the full
@@ -43,9 +39,9 @@ scale from the largest code a run produced
 ([`core.timing.full_scale_from_max_code`][dapkel.core.timing.full_scale_from_max_code])
 or leans on `CODE_S`, which was itself measured against known clocks.
 
-**A LUT belongs to one clock.** The ring oscillator sets the code width
-(~71.6 ps, `core.timing.CODE_S`) and the reference clock sets the full scale, so
-the number of codes scales as 1/f:
+The ring oscillator sets the code width (~71.6 ps, `core.timing.CODE_S`) and the
+reference clock sets the full scale, so the number of codes a run occupies
+scales as 1/f:
 
 | clock | full scale | codes (measured) |
 |---|---|---|
@@ -54,60 +50,11 @@ the number of codes scales as 1/f:
 | 5 MHz | 200 ns | 2761 |
 | 2 MHz | 500 ns | 6914 |
 
-Calibrate once per clock. The loaders take `min_codes` — how many codes the data
-being calibrated actually occupies — and check the LUT against *that*: a table is
-self-describing, its largest entry *is* the scale it was built for
-(`lut_full_scale_s`), so comparing the two raises rather than silently
-mis-converting. Callers read `min_codes` off the run, so nothing has to be
-restated; that is the check that matters, because it compares the table to the
-data it is about to be applied to rather than to a remembered frequency.
-`collect_and_save_luts` tags the file name with the clock *frequency*
-(`TDC_LUT_S0T_2MHz.npy`) so per-clock tables coexist in one folder.
+The clock only decides how many laps are swept, not what a lap is, so **one
+calibration serves every clock**. A slow clock sweeps more laps per frame and so
+measures the ring period best; the tap shape comes out the same at any clock.
 
-Covering the run is necessary but not sufficient: a 2 MHz table covers a 10 MHz
-run five times over, so coverage alone leaves several tables in the running. The
-loaders keep the *tightest* covering one — the calibration whose full scale the
-run's own code range points at.
-
-The penalty for getting this wrong is smaller than it looks, though, because the
-code width barely moves with the clock: mean LSB comes out at 72.3 / 71.9 /
-70.4 ps at 2 / 10 / 50 MHz, so cross-applying a table mis-scales by well under a
-percent rather than by the ratio of full scales. Selecting by clock is hygiene,
-not a rescue from a factor of five.
-
-## Choosing between calibrations: `clock`
-
-Coverage cannot separate two calibrations of the **same** clock, because they
-cover identically. That is what `clock` is for — on `load_lut`, `load_board_lut`,
-and as `lut_clock` on both `delta_t` entry points:
-
-```python
-dt.calculate_and_save_timestamp_differences(
-    path, pixels, nframes=8_000,
-    daughterboard_number="D0", motherboard_number="M0",
-    lut_clock="2MHz",
-)
-```
-
-The tag is whatever follows the SPAD fragment in the file name. An **exact**
-match wins, so a plain `clock="10MHz"` keeps selecting the table named exactly
-that even once a qualified one like `10MHz_2026-08-13` sits beside it; failing
-an exact match the tag may be given in part, and resolves when exactly one
-calibration answers to it. Naming a clock that is not installed raises and lists
-the ones that are.
-
-**One calibration per clock is installed, so `lut_clock` is not normally
-needed** — the run's own code range picks the table. Ask for one by name when a
-second calibration of a clock is added; the loader raises and names both rather
-than blending them.
-
-!!! tip "Prefer the compact form"
-    The dense per-clock table is kept for comparison, but on real data the
-    [compact 8-tap calibration](#the-compact-form-8-ring-taps) below is better on
-    every axis — 2× narrower coincidence peak, 550× smaller, and no per-clock
-    table to select. Pass `tdc_model="compact"`.
-
-## The compact form: 8 ring taps
+## The 8 ring taps
 
 The density test measures one width per code, but the hardware has only
 **eight** distinct widths. The designers' account of it: the TDC is 13 bits — a
@@ -116,20 +63,30 @@ interpolator, which `unpack` folds together as
 `ts = (coarse - 1) * 8 + (8 - fine)`. The coarse counter counts whole laps of the
 ring oscillator and contributes no non-linearity; *all* of it is in the eight
 taps, and they repeat every lap for as long as the counter runs. So code `k` is
-always tap `k % 8`.
+always tap `k % 8` (`core.calibration.TAPS_PER_LAP`).
 
 ```
-t(code) = (code // 8) * ring_period + sum(taps[:code % 8]) + taps[code % 8] / 2
+t(k) = (k // 8) * lap + sum(taps[:k % 8]) + taps[k % 8] / 2,   lap = sum(taps)
 ```
 
-Nine numbers per pixel — eight tap widths, whose sum *is* the ring period —
-instead of one per code. `histogram_to_compact` reduces the same histogram to
-them, and `compact_to_lut` expands it onto whatever code range a run occupies:
+Eight numbers per pixel — whose sum *is* the ring period — instead of one per
+code: the whole calibration is a `(32, 32, 8)` table per SPAD.
+[`process_tdc_calibration`][dapkel.functions.tdc_calibration.process_tdc_calibration]
+histograms the density-test files and reduces them to the taps;
+[`core.calibration.codes_to_ps`][dapkel.core.calibration.codes_to_ps] applies
+the formula above directly, to any code at any clock, so there is no code range
+for a table to fall short of.
 
 ```python
-tc.collect_and_save_compact(path, nframes=8192, clock_period_s=500e-9,
-                            tags=("S0T", "S1T", "S2T", "S3T"))
+from dapkel.functions import tdc_calibration as tc
+
+tc.process_tdc_calibration(path, 8192, clock_period_s=500e-9)   # 2 MHz test
+tables = tc.plot_tdc_calibration(path, pixel=(16, 16))          # QA figures
 ```
+
+Each pixel is normalised over **its own** populated code range, not the
+array-wide one, so its time-base gain survives: a pixel whose ring runs fast
+reaches more codes in one clock period and gets narrower taps.
 
 **Measured on this chip** (100 files/SPAD, 2026-08-13): ring period
 **599.7 ps** — an LSB of 75.0 ps, matching the designers' nominal figure — with
@@ -139,7 +96,10 @@ period (per-pixel r = 0.98) and r = 0.992 on the tap shape, which is the
 clock-independence claim measured rather than argued. The four SPADs agree to
 0.014 %.
 
-Why this is not merely smaller:
+### Why 8 taps and not a per-code table
+
+The package used to calibrate with a dense per-code, per-clock lookup table; it
+is retired to the repository's `archive/` folder. The comparison is why:
 
 - **The per-code detail was noise.** The density test estimates each code from
   an empirical CDF, so its uncertainty is `0.5/sqrt(N) x full_scale` — **569 ps
@@ -147,7 +107,7 @@ Why this is not merely smaller:
   once two pixels are differenced. Averaging each tap over the ~865 laps a
   2 MHz run sweeps cuts that by `sqrt(n_codes/8)` ≈ 29.
 - **No per-clock table.** The taps belong to the ring, so one calibration serves
-  every clock and `clock` / `lut_clock` stop mattering.
+  every clock and there is no table to select.
 - **No flat tail.** A dense LUT is a cumulative count, so above the last code a
   pixel ever produced it is pinned at the full scale — a flat region covering
   ~4 % of the table (up to 33 ns) where a code that *did* arrive reads as the
@@ -159,7 +119,7 @@ pixel pairs, pooled crosstalk peak:
 | calibration | size/SPAD | FWHM | peak height |
 |---|---|---|---|
 | none (flat 71.58 ps/code) | – | 6300 ps | 160 |
-| dense per-clock LUT | 27 MB | 2550 ps | 592 |
+| dense per-clock LUT (archived) | 27 MB | 2550 ps | 592 |
 | **compact 8-tap** | **64 KB** | **1250 ps** | **937** |
 
 (pairs whose time bases differ by more than 1 %; over all 54 pairs it is
@@ -175,64 +135,63 @@ pixel pairs, pooled crosstalk peak:
     achieves. Session-to-session drift is not the limitation; the dense table's
     counting noise was.
 
-`dapkel/params/calibration_data` ships **50, 10 and 2 MHz** tables as `float32`,
-four SPADs each, one calibration per clock. Superseded calibrations sit in a
-subfolder beside them; the loader only reads `.npy` files at the top level, and
-`pyproject.toml` packages `calibration_data/*.npy` non-recursively, so they stay
-in the repo without shipping in a wheel. Which calibration a file came from is
-recorded by the commit that added it, not by its name.
-
-Using a 10 MHz LUT on a 2 MHz run would discard every code past 100 ns: 79 % of
-the singles, and since a coincidence needs both arms, 96 % of the coincidences.
-That used to be silent; it now raises at load time — `delta_t` reads the run's
-code range off its first file and hands it to the loader — and
-`_structure_pixel_timestamps` warns with the discarded fraction if a LUT ever
-gets that far.
-
 Note that the reference clock cannot go arbitrarily low. `unpack` builds the code
 as `(coarse - 1) * 8 + (8 - fine)` from a 10-bit coarse field, so it saturates at
 8184 codes ≈ 586 ns: below ~1.7 MHz the counter wraps and the timestamps are
 meaningless. 2 MHz already uses 85 % of it.
 
-## Per-SPAD LUTs
+## Per-SPAD tables
 
-The calibration data are recorded per micropixel — one `SPADn / Sn` tag per SPAD
-of the 2×2 macropixel — so a separate `(32, 32, n_codes)` LUT is produced for
-each of the four SPADs.
+The calibration data are recorded per micropixel — one `SPADn_Sn` tag per SPAD
+of the 2×2 macropixel, the default `tags` of `process_tdc_calibration` — so a
+separate `(32, 32, 8)` table is produced for each of the four SPADs.
 
 Because ORT does not record *which* of the four micropixels fired, the average of
 the four is the only honest table for an `ORT` run — while an `S0T`...`S3T` run
-reads one micropixel per macropixel and gets that SPAD's own LUT.
+reads one micropixel per macropixel and gets that SPAD's own table.
 
-The delta-t stage-1 functions therefore take no `spad` argument: the acquisition
-program writes the tag into the file name, so the `tag` that selected the files
-already answers the question (`delta_t._spad_from_tag`). Only
-`load_board_lut`/`load_board_compact`, which know nothing about a run, still ask.
+The delta-t functions therefore take no `spad` argument: the acquisition program
+writes the tag into the file name, so the `tag` that selected the files already
+answers the question.
+[`core.calibration.board_taps`][dapkel.core.calibration.board_taps] reads it —
+a single-SPAD tag gets that SPAD's table (or the mean of the four, with a note,
+if that table is missing), anything else the mean.
 
 ## Code range
 
-The code axis takes no sizing at all. `compute_code_histogram` allocates the
-widest range the frame format can express (`core.timing.MAX_TS_CODE`, ~67 MB) and
-trims it to what the data populated, so the code count comes out of the run.
+The code axis takes no sizing at all. `core.reduce.code_histogram` allocates the
+widest range the frame format can express (`core.timing.MAX_TS_CODE`) and trims
+it to what the data populated, so the code count comes out of the run.
 
 Nothing can overflow it, which removes a whole failure mode: there is no
-dropped-codes warning to heed, and no way to lose 79 % of a calibration run to a
-mis-stated frequency. The two parameters that used to size the axis —
-`open_shutter_time_s` and `n_codes` — are gone.
+dropped-codes warning to heed, and no way to lose most of a calibration run to a
+mis-stated frequency. The clock the test was measured at is recorded in the
+sidecar (`measured_at_clock_period_s`), not in the file name: the table belongs
+to the ring, not to the clock.
 
-Pixels with no counts (dead in the calibration run) fall back to a nominal
-*linear* ramp over the same range, so downstream indexing never breaks.
+Pixels with no counts (dead in the calibration run) fall back to a flat nominal
+lap, so downstream conversion never breaks.
 
-## Where the LUTs live
+## Where the tables live
 
-`collect_and_save_luts` writes `TDC_LUT_<tag>.npy` into `processed/` (stage-1
-data) with the QA plots going to `results/tdc_calibration/`. `load_lut` accepts
-either the folder holding the LUTs directly or a data folder whose `processed/`
-holds them.
+`process_tdc_calibration` writes `TDC_COMPACT_<tag>.npy` (with a `.meta.json`
+sidecar) into `processed/` — stage-1 data — and returns the saved paths.
+`plot_tdc_calibration` reads them back and saves one QA figure per SPAD to
+`results/tdc_calibration/`: the chosen pixel's tap DNL against the array's
+median and 5–95 % band, and the ring period across all pixels — the per-pixel
+time-base gain the table carries.
 
-`load_board_lut` instead reads the LUTs **shipped with the package** in
-`dapkel/params/calibration_data`, selected by daughterboard / motherboard
-number and resolved via `importlib.resources` so it works from a pip install.
+To ship a calibration, copy the tables into `dapkel/params/calibration_data` as
+`<daughterboard>_<motherboard>_TDC_COMPACT_<spad>.npy` — currently
+`D0_M0_TDC_COMPACT_SPAD{n}_S{n}.npy`, n = 0..3.
+[`board_taps`][dapkel.core.calibration.board_taps] reads them by daughterboard /
+motherboard number, resolved via `importlib.resources` so it works from a pip
+install, and [the coincidence pipeline](coincidences.md) applies them with
+`apply_TDC_calibration=True`.
+
+!!! warning "Recalibrate after the restructure"
+    The packaged tables predate the current `process_tdc_calibration`. The
+    board is due to be recalibrated with it, and the tables above replaced.
 
 ## API
 

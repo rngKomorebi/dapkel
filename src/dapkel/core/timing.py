@@ -26,9 +26,9 @@ never taken from the shutter.** It is measured from the data - the largest code
 present *is* the range the TDC swept - which is why no analysis entry point in
 this package asks for it. See 'full_scale_from_max_code'.
 
-The one place a clock period is genuinely irreducible is building a calibration
-LUT ('dapkel.functions.tdc_calibration'): the density test fixes only the
-*relative* per-code widths, so an externally known duration has to set the
+The one place a clock period is genuinely irreducible is building the TDC
+calibration ('dapkel.functions.tdc_calibration'): the density test fixes only
+the *relative* tap widths, so an externally known duration has to set the
 absolute scale. That parameter is called ``clock_period_s`` and it appears
 nowhere else. Everything downstream leans on 'CODE_S' instead, which was itself
 measured against known clocks.
@@ -39,23 +39,16 @@ from __future__ import annotations
 import warnings
 
 __all__ = [
-    "CLK_PERIOD",
     "CODE_S",
     "COARSE_BITS",
     "FIRMWARE_VERSIONS",
     "FREE_RUNNING_US",
-    "MAX_DELTA_S",
     "MAX_TS_CODE",
     "full_scale_from_max_code",
-    "resolve_cycle_time",
-    "resolve_frame_time",
     "resolve_live_time",
     "to_ps",
     "to_s",
 ]
-
-#: Board clock period: 200 MHz.
-CLK_PERIOD = 5e-9
 
 #: Base frame period when ``exp_time_s=0`` is sent to the acquisition exe, in
 #: µs. The firmware adds this to whatever exposure is requested, so it is both
@@ -76,8 +69,8 @@ FREE_RUNNING_US = 9.0
 #:      2 MHz      500 ns        6913        5.017   (ideal 5)
 #:
 #: Only ever a *nominal average*: the ring has strong DNL, which is the whole
-#: reason for the per-code LUT in 'dapkel.functions.tdc_calibration'. Use it for
-#: sizing code axes and for uncalibrated raw-code data, never in place of a LUT.
+#: reason for the tap calibration in 'dapkel.core.calibration'. Use it for sizing
+#: code axes and for uncalibrated raw-code data, never in place of a calibration.
 CODE_S = 71.58e-12
 
 #: Width of the coarse counter field decoded in 'dapkel.functions.unpack'.
@@ -91,15 +84,6 @@ COARSE_BITS = 10
 #: that the coarse counter wraps and the timestamps are meaningless. 2 MHz
 #: (500 ns) already uses 85 % of the counter.
 MAX_TS_CODE = (2**COARSE_BITS - 2) * 8 + 8
-
-#: Largest ``abs(delta)`` two timestamps in one frame can produce, in seconds.
-#:
-#: Both timestamps are codes on the same range, so their difference is bounded by
-#: the widest range the frame format can express - 'MAX_TS_CODE' codes, ~586 ns.
-#: This is the *physical support* of a delta-t histogram at any clock, which is
-#: why 'dapkel.functions.delta_t' histograms over all of it and needs no window
-#: parameter: at one code per bin that is ~16 k bins, i.e. ~131 kB.
-MAX_DELTA_S = MAX_TS_CODE * CODE_S
 
 #: Firmware versions, by how they set the length of one acquisition cycle:
 #:
@@ -116,9 +100,8 @@ MAX_DELTA_S = MAX_TS_CODE * CODE_S
 #:       it.
 #:
 #: One vocabulary, used by every function that takes a ``firmware_version``:
-#: 'resolve_cycle_time', 'resolve_live_time', 'dcr_analysis' and
-#: 'hitmap_analysis'. The older ``'short_window'`` / ``'full_window'`` spellings
-#: are gone rather than aliased - two names for one setting is how a caller ends
+#: 'resolve_live_time', 'dcr_analysis' and 'hitmap_analysis'. The older
+#: ``'short_window'`` / ``'full_window'`` spellings are gone rather than aliased - two names for one setting is how a caller ends
 #: up passing the pair that only one of two functions accepts.
 FIRMWARE_VERSIONS = ("short_exposure", "long_exposure")
 
@@ -206,170 +189,62 @@ def full_scale_from_max_code(max_code: int, *, code_s: float = CODE_S) -> float:
     return float(max_code) * code_s
 
 
-def resolve_cycle_time(
-    firmware_version: str, exp_time_s: float | None = None
-) -> tuple[float, str]:
-    """Return the length of one acquisition cycle and where it came from.
-
-    This is the wall-clock repetition period of a frame, which is what a
-    photon *rate* divides by: ``nframes * n_files * cycle`` is the elapsed
-    time of a run.
-
-    Computed from the firmware setting, and **never** from the
-    ``frame_rate_cnt.txt`` the acquisition exe writes beside the data: that exe
-    is not ours, so no analysis here is allowed to depend on its output. The
-    cycle length is a property of the firmware and the requested exposure, and
-    ``Kelpie_run.m`` states it directly: ``exp_time_s = 0 -> 9 us``,
-    ``1e-6 -> 10 us``, ``2e-6 -> 11 us``.
-
-    For the record, the counter *is* self-consistent where it exists - it is a
-    200 MHz tick count over the whole run, latched by the firmware, and across
-    every sample folder it fits ``ticks = nframes * N + 138 + window/5ns``
-    exactly. What it says is that the real cycle is **9.685-9.770 µs**, i.e.
-    685-770 ns per frame longer than the nominal 9 µs used here, and that the
-    exposure window sits *inside* the cycle rather than extending it.
-    So a rate normalised by the nominal 9 µs runs ~7.8% high. Whether to prefer
-    the nominal or a measured cycle is a decision for the experiment, not for
-    this function to make silently off a file it happens to find on disk.
-
-    Parameters
-    ----------
-    firmware_version : str
-        ``'short_exposure'`` (the cycle is always 9 µs) or ``'long_exposure'``
-        (the cycle is ``exp_time_s`` + 9 µs).
-    exp_time_s : float | None, optional
-        The exposure X requested of long-exposure firmware, in seconds. The
-        firmware adds 9 µs to it. Required for ``'long_exposure'``, ignored for
-        ``'short_exposure'``. The default is None.
-
-    Returns
-    -------
-    tuple[float, str]
-        The cycle length in seconds and a human-readable source string.
-
-    Raises
-    ------
-    ValueError
-        Raised on an unknown ``firmware_version``, or when
-        ``'long_exposure'`` is given without ``exp_time_s``.
-    """
-    if firmware_version not in FIRMWARE_VERSIONS:
-        raise ValueError(
-            "firmware_version must be one of "
-            f"{FIRMWARE_VERSIONS}, got {firmware_version!r}"
-        )
-
-    base = FREE_RUNNING_US * 1e-6
-    if firmware_version == "short_exposure":
-        return base, f"short_exposure: {FREE_RUNNING_US:.0f} µs cycle"
-    if exp_time_s is None:
-        raise ValueError(
-            "firmware_version='long_exposure' needs exp_time_s (the exposure X "
-            "requested, in seconds; the firmware adds "
-            f"{FREE_RUNNING_US:.0f} µs to it)."
-        )
-    return (
-        exp_time_s + base,
-        f"long_exposure: {exp_time_s * 1e6:.3f} µs + "
-        f"{FREE_RUNNING_US:.0f} µs = {(exp_time_s + base) * 1e6:.3f} µs cycle",
-    )
-
-
-def resolve_frame_time(
-    explicit_s: float | None, nframes: int | None = None
-) -> tuple[float, str]:
-    """Return the per-frame period and a description of where it came from.
-
-    1. explicit ``exp_time_s`` supplied -> ``exp_time_s`` + 9 µs overhead
-    2. fallback                         -> 9 µs free-running base
-
-    The acquisition exe also writes a ``frame_rate_cnt.txt`` beside the data -
-    a 200 MHz tick count for the whole run, latched by the firmware. **It is
-    deliberately not read here.** It is written by an exe we do not control, so
-    nothing in the analysis path is allowed to depend on it; the period comes
-    from the settings the run was started with. See 'resolve_cycle_time' for
-    what the counter does contain, and for the measured-vs-nominal gap.
-
-    Parameters
-    ----------
-    explicit_s : float | None
-        Explicit exposure time in seconds, or None for the free-running base.
-    nframes : int | None, optional
-        Unused. Kept so existing callers do not break; it was only ever needed
-        to turn the counter's tick count into a period. The default is None.
-
-    Returns
-    -------
-    tuple[float, str]
-        The frame period in seconds and a human-readable source string.
-    """
-    if explicit_s is not None:
-        ft = explicit_s + FREE_RUNNING_US * 1e-6
-        return (
-            ft,
-            f"exp_time_s={explicit_s * 1e6:.1f} µs + "
-            f"{FREE_RUNNING_US:.0f} µs overhead",
-        )
-
-    ft = FREE_RUNNING_US * 1e-6
-    return ft, f"free-running base ({FREE_RUNNING_US} µs)"
-
-
 def resolve_live_time(
     firmware_version: str,
-    nframes: int,
     *,
     open_shutter_time_s: float | None = None,
     exp_time_s: float | None = None,
-) -> tuple[float | None, str]:
-    """Return the live seconds per frame for the rate normalisation.
+) -> tuple[float, str]:
+    """Return the live (photon-sensitive) seconds per frame, and their source.
 
-    The photon rate is ``counts / (nframes * n_files * live_per_frame)``. How
-    much of each frame is photon-sensitive depends on the firmware:
+    A photon rate is ``counts / (nframes * n_files * live_per_frame)``. How much
+    of each frame is live depends on the firmware:
 
     * ``'short_exposure'`` - the current firmware: each ~9 µs frame is mostly
-      readout and only the open shutter window (``open_shutter_time_s``) is
-      live. That window is settable over more than two decades - ~50 ns to the
-      full 9 µs - so it is asked for rather than assumed. Returns ``(None, ...)`` when
-      ``open_shutter_time_s`` is not supplied, so the caller can decide whether
-      that is an error (DCR) or just "no rate available" (hitmap).
+      readout and only the open shutter window ``open_shutter_time_s`` is live.
+      It is settable from ~50 ns to the full 9 µs, so it is asked for, never
+      assumed.
+    * ``'long_exposure'`` - the legacy firmware: the whole ``exp_time_s + 9 µs``
+      cycle is live (``exp_time_s=None`` is the free-running 9 µs).
 
-    * ``'long_exposure'`` - the legacy firmware: the whole frame is live, so the
-      per-frame time comes from 'resolve_frame_time'.
+    The cycle is never read from the ``frame_rate_cnt.txt`` the acquisition exe
+    writes: that exe is not ours, so no analysis may depend on its output.
 
     Parameters
     ----------
     firmware_version : str
         One of 'FIRMWARE_VERSIONS'.
-    nframes : int
-        Frames per file (used by the ``'long_exposure'`` resolution).
     open_shutter_time_s : float | None, optional
-        Photon-sensitive window per frame, in seconds (``'short_exposure'``
-        only). The default is None.
+        Photon-sensitive window per frame, in seconds. Required for
+        ``'short_exposure'``. The default is None.
     exp_time_s : float | None, optional
-        Legacy exposure time, in seconds (``'long_exposure'`` only). The default
-        is None.
+        Exposure requested of ``'long_exposure'`` firmware, in seconds; the
+        firmware adds 9 µs. The default is None.
 
     Returns
     -------
-    tuple[float | None, str]
-        The live seconds per frame (None if unresolved) and a human-readable
-        source string.
+    tuple[float, str]
+        The live seconds per frame and a human-readable source string.
 
     Raises
     ------
     ValueError
-        Raised when ``firmware_version`` is not one of 'FIRMWARE_VERSIONS'.
+        Raised on an unknown ``firmware_version``, or ``'short_exposure'``
+        without ``open_shutter_time_s``.
     """
     if firmware_version == "short_exposure":
         if open_shutter_time_s is None:
-            return None, "short_exposure (no open_shutter_time_s given)"
+            raise ValueError(
+                "firmware_version='short_exposure' needs open_shutter_time_s "
+                "(the photon-sensitive window per frame, in seconds, e.g. 500e-9)."
+            )
         return (
             open_shutter_time_s,
             f"short_exposure: {open_shutter_time_s * 1e9:.1f} ns window",
         )
     if firmware_version == "long_exposure":
-        return resolve_frame_time(exp_time_s, nframes)
+        live = (exp_time_s or 0.0) + FREE_RUNNING_US * 1e-6
+        return live, f"long_exposure: {live * 1e6:.3f} µs cycle"
     raise ValueError(
         f"firmware_version must be one of {FIRMWARE_VERSIONS}, got "
         f"{firmware_version!r}"

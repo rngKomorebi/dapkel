@@ -65,6 +65,11 @@ costs a load, not a re-read of the raw data.
 
 ## Quick start
 
+Every analysis is two calls: `process_<x>(path, nframes, ...)` unpacks the raw
+`.bin` files, **always saves** the result under `processed/` and returns the
+saved path; `plot_<x>(path, ...)` loads that and writes the figures to
+`results/<kind>/`.
+
 > On a fresh acquisition, run the data-quality check first. A TDC that never
 > stopped produces data that looks completely normal to every other analysis in
 > this package.
@@ -75,43 +80,35 @@ from dapkel.functions import data_quality, dcr_analysis
 # 0. Did the TDC actually record timing? Codes should spread over the whole
 #    range for the clock in use (~1397 codes at 10 MHz, ~6985 at 2 MHz),
 #    not collapse onto a handful of values.
-data_quality.plot_time_code_histogram(
-    "path/to/data", pixel=(16, 16), nframes=10_000
+data_quality.process_time_codes("path/to/data", nframes=10_000, max_files=5)
+data_quality.plot_time_codes("path/to/data", pixel=(16, 16))
+
+# 1. Compute the full-sensor DCR map and save it to processed/.
+#    'open_shutter_time_s' is the photon-sensitive part of each frame, in
+#    SECONDS. It sets the rate normalisation and nothing else - it is not
+#    the TDC full scale, which every analysis measures from the data.
+dcr_analysis.process_dcr(
+    "path/to/data", 1000, "S*C", open_shutter_time_s=100e-9
 )
 
-# 1 + 2. Compute the full-sensor DCR map and save both figures.
-#        'open_shutter_time_s' is the photon-sensitive part of each frame, in
-#        SECONDS. It sets the rate normalisation and nothing else - it is not
-#        the TDC full scale, which every analysis measures from the data.
-dcr_analysis.collect_and_plot_dcr_64(
-    "path/to/data", nframes=1000, open_shutter_time_s=100e-9
-)
+# 2. Load it and save the heatmap and sorted distribution to results/dcr/.
+dcr = dcr_analysis.plot_dcr("path/to/data", "S*C")
 ```
 
-Stages 1 and 2 are also separable, so a saved map can be re-plotted without
-re-reading the raw files:
+Stage 2 only ever reads what stage 1 saved, so re-plotting - another colormap,
+another bin width - never re-reads the raw files. The saved array is also
+reachable directly:
 
 ```python
 from dapkel.core import store
-from dapkel.functions import dcr_analysis
 
-dcr_analysis.compute_and_save_dcr_64(
-    "path/to/data", 1000, open_shutter_time_s=100e-9
-)
-
-dcr, meta = store.load_map("path/to/data", kind="dcr", tag="64")
-fig = dcr_analysis.plot_heatmap(dcr)
+dcr, meta = store.load_map("path/to/data", kind="dcr", tag="S*C")
 ```
-
-Each driver can also skip straight to stage 2 from what is already in
-`processed/`: `dcr_analysis` and `crosstalk_analysis` take `reuse=True`,
-`hitmap_analysis` takes `npy_path=`, `delta_t` takes `feather_path=`, and TDC
-lookup tables come back through `tdc_calibration.load_lut`.
 
 ## What's in the package
 
-`dapkel.functions` holds one module per measurement. Each declares its public
-surface in `__all__` - read that list to see what you can call.
+`dapkel.functions` holds one module per measurement. Each has exactly two
+public functions, `process_<x>` and `plot_<x>`, declared in its `__all__`.
 
 | module | what it measures |
 |---|---|
@@ -120,14 +117,14 @@ surface in `__all__` - read that list to see what you can call.
 | [`dcr_analysis`](https://rngkomorebi.github.io/dapkel/guide/dcr/) | per-pixel dark count rate, in cps |
 | [`crosstalk_analysis`](https://rngkomorebi.github.io/dapkel/guide/crosstalk/) | optical cross-talk, per direction and combined |
 | [`hitmap_analysis`](https://rngkomorebi.github.io/dapkel/guide/hitmap/) | occupancy and photon rate |
-| [`tdc_calibration`](https://rngkomorebi.github.io/dapkel/guide/tdc_calibration/) | per-pixel TDC LUTs from the code density test |
-| [`calc_diff`, `delta_t`](https://rngkomorebi.github.io/dapkel/guide/coincidences/) | timestamp differences, coincidences and jitter |
-| [`background_subtraction`](https://rngkomorebi.github.io/dapkel/guide/background_subtraction/) | removes the accidental background by shifting frames |
+| [`tdc_calibration`](https://rngkomorebi.github.io/dapkel/guide/tdc_calibration/) | per-pixel 8-tap TDC calibration from the code density test |
+| [`delta_t`](https://rngkomorebi.github.io/dapkel/guide/coincidences/) | timestamp differences, coincidences and jitter, with optional [frame-shift background subtraction](https://rngkomorebi.github.io/dapkel/guide/background_subtraction/) |
 
 Anything shared between two analyses lives in
 [`dapkel.core`](https://rngkomorebi.github.io/dapkel/api/core/) rather than
 being copied - a test fails if a function name is defined in two analysis
-modules.
+modules. Retired code (the feather delta-t path, the dense per-clock TDC LUTs,
+...) is kept for reference, unmaintained, in [`archive/`](archive/).
 
 A standalone app for starting acquisitions and plotting the hitmap in real
 time is at [dapkel-rtp](https://github.com/rngKomorebi/dapkel-rtp).

@@ -1,16 +1,34 @@
 # Coincidences and timing jitter (delta-t)
 
 A daplis-style pipeline for coincidence / timing-jitter analysis of the Kelpie
-`ORT` (timestamp) program, built on three layers:
+`ORT` (timestamp) program, in two calls like every analysis:
 
 1. [`unpack`](unpack.md) decodes each `.bin` file into the per-frame, per-pixel
    TDC code (`time_series`, the MATLAB `time_mat`).
-2. [`calc_diff.calculate_differences`][dapkel.functions.calc_diff.calculate_differences]
-   turns structured per-pixel timestamps into per-window differences for pixel
-   pairs.
-3. `delta_t` drives those two over a folder of files, pools the differences and
-   saves them to a `.feather` table, then histograms, fits and plots the
-   coincidence peak.
+2. [`process_delta_t`][dapkel.functions.delta_t.process_delta_t] converts the
+   codes of the chosen pixels to picoseconds, differences every pixel pair frame
+   by frame, and bins the differences onto a fixed native grid as it finds them,
+   saving only the counts to `processed/`.
+3. [`plot_delta_t`][dapkel.functions.delta_t.plot_delta_t] rebins that grid in
+   memory, fits the coincidence peak and saves the figure to
+   `results/coincidences/`.
+
+```python
+from dapkel.functions import delta_t as dt
+
+signal = [(6, 10), (6, 11), (7, 10)]     # blobs read off the hitmap
+idler = [(21, 22), (21, 23), (22, 22)]
+
+dt.process_delta_t(path, 10_000, [signal, idler],
+                   daughterboard_number="D0", motherboard_number="M0")
+counts, centers, fit = dt.plot_delta_t(path)
+```
+
+`pixels` is two groups `[group_a, group_b]`; a bare `(row, col)` is a one-pixel
+group. With `mode="all_pairs"` (the default) every A × B combination is a pair —
+use it when it is not known which pixel of a blob catches the photon; `"1v1"`
+zips the groups element-wise. Each pair is one row of the saved grid, labelled
+`"ra,ca-rb,cb"`.
 
 ## Timing model
 
@@ -46,11 +64,15 @@ SPAD waits for a photon, and an 8 µs shutter on a 10 MHz clock still yields
 belongs to rate normalisation ([DCR](dcr.md), [hitmaps](hitmap.md)) and nothing
 else.
 
-The exact per-code bin widths come from a density-test LUT — see
-[TDC calibration](tdc_calibration.md). **A LUT is specific to its clock**, and
-the loaders check it against the code range the *run* occupies rather than
-against a clock frequency you restate, because the silent version of that
-mistake costs 96 % of the coincidences at 2 MHz.
+The actual bin widths come from the board's 8-tap calibration — see
+[TDC calibration](tdc_calibration.md). With `apply_TDC_calibration=True` (the
+default, which needs `daughterboard_number` and `motherboard_number`) every code
+is converted with
+[`core.calibration.codes_to_ps`][dapkel.core.calibration.codes_to_ps] before
+differencing. The taps belong to the ring, not the clock, so the same table
+serves a run at any clock and there is nothing to select: an `S0T`...`S3T` tag
+gets that SPAD's table, `ORT` the mean of the four. `apply_TDC_calibration=False`
+uses the nominal `CODE_S`.
 
 ### Units
 
@@ -60,11 +82,11 @@ There are three of them here, and they are all display or fit choices:
 plot axes are in picoseconds — that is the scale the TDC lives on — and the
 conversion happens on entry.
 
-Differences are stored in **picoseconds** whether or not a LUT was applied; an
-uncalibrated run is converted with the nominal `CODE_S` on the way out. There is
-no raw-code artifact, because there would be nothing to do with one: a LUT maps
-a *code* to a time, and a stored difference has lost both of its codes, so it
-could never be calibrated after the fact.
+Differences are binned in **picoseconds** whether or not a calibration was
+applied; uncalibrated codes are converted with the nominal `CODE_S` on the way
+in. There is no raw-code artifact, because there would be nothing to do with
+one: a calibration maps a *code* to a time, and a stored difference has lost
+both of its codes, so it could never be calibrated after the fact.
 
 There is one timestamp per photon, per window, per macropixel.
 
@@ -78,20 +100,27 @@ counter. Fitting a Gaussian on a *flat* background over a wide window therefore
 inflates the fitted sigma — you measure the background's slope as if it were
 jitter.
 
-Two models are provided:
-
-| model | fit | when to use |
-|---|---|---|
-| `gaussian` / `fit_gaussian_peak` | Gaussian on flat background | valid only on a **narrow** window around the peak, or on a subtracted residual |
-| `gaussian_plus_triangle` / `fit_gaussian_on_triangle` | Gaussian on triangular background | the correct model for ORT delta-t over a wide window |
-
-**The plotting drivers pick between them for you, and take no `background`
+**`plot_delta_t` picks the model for you, and takes no `background`
 argument.** The pedestal is either still in the histogram, and then it is the
 triangle, or `subtract_background=True` has measured it away and the residual is
-flat about zero — one decision, not two. A third model,
-`fit_two_gaussians_on_triangle` (narrow core on broad tails), is a statement
-about the *peak* rather than the pedestal; fit it on the `counts` and `centers`
-the driver returns.
+flat about zero — one decision, not two:
+
+| histogram | model | fitted over |
+|---|---|---|
+| raw (default) | Gaussian on a triangular background, the measured full scale seeding the half-base | the whole plotted window |
+| lag-subtracted residual | Gaussian on a constant | `fit_window_s` (default 1 ns) around the peak |
+
+A fit that fails — including one whose sigma the covariance cannot tell from
+zero, which a wrong background model produces — comes back with `fit["ok"]`
+False and a `RuntimeWarning`, so a plot without a curve always says why.
+
+`plot_delta_t` returns `(counts, centers, fit)`: the fitted histogram, the bin
+centres in picoseconds and a dict of `amp`, `mu`, `sigma`, `fwhm`,
+`jitter_per_detector` (sigma / √2), each with its `_err`, the background level
+`bkg`, `car` (peak-to-background, raw histogram only), `n` and `ok` — enough to
+re-fit by hand with any model without touching disk. The fit models themselves
+are private, and the two-Gaussian (narrow core on broad tails) model is retired
+to the repository's `archive/` folder.
 
 The full derivation, with the demonstration that the triangle is intrinsic
 rather than an artefact, is in
@@ -99,149 +128,30 @@ rather than an artefact, is in
 
 ## Before you analyse: check the data
 
-Run [`data_quality.plot_time_code_histogram`][dapkel.functions.data_quality.plot_time_code_histogram]
-on a pixel or two first. When the TDC never stops, `unpack` still returns a full
+Run [`data_quality.process_time_codes`][dapkel.functions.data_quality.process_time_codes]
+and [`plot_time_codes`][dapkel.functions.data_quality.plot_time_codes] on a
+pixel or two first. When the TDC never stops, `unpack` still returns a full
 array of plausible integers and this whole pipeline still produces a
 peak-shaped histogram — it is simply meaningless. See
 [Data quality](data_quality.md).
 
-## Large runs: the differences are streamed, not accumulated
+## Stage 1: histogram straight off the `.bin`
 
-`calculate_and_save_timestamp_differences` writes as it goes. Whenever the
-buffered differences would exceed the 64 MB part cap they are flushed to a part
-file, and the parts are concatenated into the final feather one Arrow record
-batch at a time:
+`process_delta_t` bins the differences onto a fixed native grid as it finds
+them and keeps only the counts:
 
 ```
 processed/
-  <dataset>_delta_t_parts/
-    <dataset>_delta_t_0.feather      <- flushed during the run
-    <dataset>_delta_t_1.feather
-    ...
-  <dataset>_delta_t.feather          <- the combined result
-```
-
-This matters at scale. Holding a whole 10 000-file run in memory and writing it
-once fails twice over: the buffers exhaust RAM, and the single write then asks
-pyarrow for a multi-GB contiguous allocation on top of what is already held.
-Streaming makes the loop's memory ceiling *one part plus one unpacked file*,
-whatever the file count.
-
-Two consequences worth knowing:
-
-- **A crashed run is recoverable.** Every part flushed before the crash is a
-  complete, readable feather. Assemble them with
-  [`combine_delta_t_parts`][dapkel.functions.delta_t.combine_delta_t_parts],
-  or plot a single part directly via `feather_path`.
-- **The parts are always kept.** They cost disk rather than memory, they are
-  the crash insurance, and — see [below](#plotting-without-the-combined-file) —
-  the read side streams them just as happily as the combined file, so there is
-  nothing to gain from deleting them automatically. Remove the folder by hand
-  once you have checked the combined feather.
-
-Why 64 MB and not 10: `unpack` already holds a `(32, 32, nframes)` float64
-array — about 82 MB at 10 000 frames — so below that the part buffer is not the
-binding constraint, and a smaller cap only multiplies the number of part files.
-The cap is the module constant `_PART_MB`, not a parameter: sharding is a
-memory strategy and cannot change the numbers, so no call site needs to tune
-it.
-
-## Reading it back: the histogram is streamed, not loaded
-
-The write side streams, and so must the read side. A 10 000-file run's combined
-feather reaches ~135 GB; loading it into a DataFrame and pooling the columns
-needs it resident several times over, which simply does not happen.
-
-[`compute_and_save_delta_histogram`][dapkel.functions.delta_t.compute_and_save_delta_histogram]
-reads it one Arrow record batch at a time instead. A histogram over fixed edges
-is **additive**, so the counts can be summed batch by batch with one batch
-resident — and the result is bin-for-bin what histogramming the whole pooled
-array at once would have given. This is the exact baseline: no sampling, no
-re-binning, no rounding.
-
-Nothing downstream ever needed the raw differences. Both fit models take
-`(bin_centers, counts)`, and so does the plot; the pooled array was a pure
-intermediate. So the counts are saved as a stage-1 artifact:
-
-```
-processed/
-  <dataset>_delta_t.feather        <- ~135 GB, read once
-  <dataset>_delta_hist.npy         <- the counts, a few MB
-  <dataset>_delta_hist.meta.json   <- binning, source fingerprint, statistics
-```
-
-The histogram spans the **whole physical support** of a difference
-(`timing.MAX_DELTA_S`, ~586 ns) — at one code per bin that is ~16 k bins, i.e.
-~131 kB, so there is no window to choose and nothing can fall off the end. Every
-plot window is then a *slice* of one cached histogram, and the largest difference
-actually present is measured on the way past and reported as `support_s`: the
-run's own TDC full scale, and the triangle's half-base.
-
-The sidecar records `bin_width_s`, `pairs` and a fingerprint of the source
-files. A saved histogram is reused only when all of it matches, so changing the
-binning or rewriting the feather re-streams automatically; pass `reuse=False` to
-force the full pass. Re-fitting, changing the window or redrawing therefore
-costs a small load rather than another read of the feather.
-
-`collect_and_plot_timestamp_differences` goes through this, and returns
-`(counts, centers, fit)` — enough to re-fit by hand without touching disk:
-
-```python
-counts, centers, fit = dt.collect_and_plot_timestamp_differences(
-    path,          # a raw histogram is fitted on the triangle, over the
-)                  # measured full scale — both settled, neither stated
-narrow = np.abs(centers) < 1000
-dt.fit_gaussian_peak(centers[narrow], counts[narrow])
-dt.fit_two_gaussians_on_triangle(centers, counts, half_base=fit["half_base"])
-```
-
-The `.meta.json` also reports `padding_fraction`: the share of the cells read
-that were padding rather than data. The parts are written wide and padded to
-the longest pair column, so an unbalanced blob pair inflates the feather —
-that number says how much of the 135 GB is real.
-
-### Plotting without the combined file
-
-`feather_path` accepts a `*_delta_t_parts` folder as well as a `.feather`, and
-a run whose combined feather is missing falls back to its parts on its own. The
-parts are complete feathers, so the combine step is optional for plotting:
-
-```python
-dt.collect_and_plot_timestamp_differences(
-    feather_path=".../processed/SPDC_delta_t_parts"
-)
-```
-
-Parts or combined file is not a numerical choice — the histogram is a sum over
-record batches either way, and a sum does not care which file a batch came out
-of, so the counts are identical. It is only an I/O choice, and the parts win it:
-histogramming them skips the combine pass, which reads and rewrites every byte
-of the run to produce a second copy of it. Working from the parts is the reason
-they are always kept. Keep the combined feather when you want one portable file
-per run, or when the data set is small enough to read whole into a DataFrame.
-
-## The other stage 1: histogram straight off the `.bin`
-
-Everything above keeps every difference and histograms it later. That is the
-baseline — nothing is thrown away — but the artifact grows with the run, and
-the binning is still chosen at plot time, so every change of mind costs another
-pass over hundreds of GB.
-
-[`calculate_and_save_delta_counts`][dapkel.functions.delta_t.calculate_and_save_delta_counts]
-runs the same loop and bins the differences onto a fixed native grid as it
-finds them, keeping only the counts. It writes no feather at all:
-
-```
-processed/
-  <dataset>_<tag>_delta_counts.npy   <- (n_pairs, n_cells) int64, tag lower-cased
+  <dataset>_<tag>_delta_counts.npy       <- (n_pairs, n_cells) int64, tag lower-cased
   <dataset>_<tag>_delta_counts.meta.json <- grid, pair labels, totals, progress
 ```
 
 The size is set by the **grid**, not by the data. A 256-pair run on the default
-grid is 106 MB whether it came from 100 files or 10 000 — measured against a
-3.22 GB feather for the same run, and the same 106 MB for one that reaches
-135 GB. That is what makes every pair plottable at once instead of whichever
-columns you could afford to stream.
+grid is 106 MB whether it came from 100 files or 10 000 — where keeping every
+difference took 3.22 GB for the same run, and 135 GB for a larger one. That is
+what makes every pair plottable at once. The tag is in the name, so several
+programs (`ORT`, `S0T`, ...) recorded into one folder keep their own artifact
+and their own figures.
 
 ### Choosing the grid
 
@@ -250,7 +160,7 @@ One argument, `bin_width_s` (cell width):
 | data | default cell | why |
 |---|---|---|
 | uncalibrated (`apply_TDC_calibration=False`) | one code, ~71.6 ps | the codes are **integers**, so counts-per-code is a re-encoding, not a summary — exactly lossless |
-| calibrated | 1/10 code, ~7.2 ps | the per-pixel LUT smears the code lattice; 7.2 ps is ~5× finer than the jitter |
+| calibrated | 1/10 code, ~7.2 ps | the per-pixel calibration smears the code lattice; 7.2 ps is ~5× finer than the jitter |
 
 The half-range is not a parameter. It is the run's own TDC full scale — the
 largest code in the first file — with a 20 % margin for the extreme-value bias
@@ -262,10 +172,11 @@ under-sized grid announces itself instead of quietly clipping the triangle.
 
 ### Re-binning is free, and exact
 
-`plot_window_s` becomes a slice and `bin_width_s` a reduce, both in memory:
+`plot_window_s` becomes a slice and `bin_width_s` a reduce, both in memory —
+nothing is read but the one saved array:
 
 ```python
-dt.collect_and_plot_delta_counts(
+dt.plot_delta_t(
     path,
     pairs=["6,10-21,22"],
     bin_width_s=71e-12,
@@ -282,34 +193,34 @@ cosmetic:
   half-integer multiples of the width — odd puts those edges on cell
   *boundaries*, even puts them through cell *centres*, splitting a cell at
   every boundary. Measured on a real 3.22 GB run: **exactly zero** difference
-  from the feather path at 9, 11 and 13 cells per bin, ~1% at 8, 10 and 12;
-- the window goes to a whole number of bins.
+  from histogramming every stored difference at 9, 11 and 13 cells per bin,
+  ~1% at 8, 10 and 12;
+- the window goes to a whole number of bins, so **zero is a bin centre whatever
+  the window is**.
 
-So this is not an approximation of the feather histogram — it is the same
-histogram, in every bin. Both paths now build their edges the same way, with
-**zero at a bin centre whatever the window is**; the feather path used to draw
-edges half a bin past its window while cutting the data at
-`abs(delta) <= plot_window_s`, which left its first and last bins permanently
-part-filled and made zero a bin centre only when the window happened to be a
-whole number of bins. That mattered more once the histogram covered the whole
-support and every window became a slice of it.
+So this is not an approximation of a histogram of the raw differences — it is
+the same histogram, in every bin.
+
+The figure is `results/coincidences/<dataset>_<tag>_<label>_delta_counts.png`,
+`label` (default `"spdc"`) also heading the title.
 
 ### What you give up
 
 No per-event data survives, so there is nothing that needs individual
 differences — time ordering, splitting by acquisition, higher-order
 correlations. It also does not make stage 1 meaningfully faster: unpacking
-dominates either way. The win is artifact size and replot latency. Keep the
-feather until you are sure you want none of that back.
+dominates either way. The win is artifact size and replot latency. The retired
+per-event (feather) path is in the repository's `archive/` folder.
 
-### Crash insurance without a part folder
+### Crash insurance, and resuming
 
 The grid is rewritten every 50 files (the module constant `_FLUSH_EVERY`, not
 a parameter — checkpoint cadence cannot change the numbers), so a run that dies
 leaves a valid artifact covering everything up to its last checkpoint, and the
-next call resumes from it. There is only ever one file, so two runs cannot
-interleave — the failure mode `combine_delta_t_parts` exists to guard against
-simply does not arise here.
+next call resumes from it (`resume=True`, the default) when it was computed from
+the same inputs — files, pairs, mode, grid, calibration and lags. There is only
+ever one file, so two runs cannot interleave. `plot_delta_t` on an incomplete
+artifact plots what is there and says how many files it covers.
 
 The sidecar records `files_done` and `total_in_grid`. The array is moved into
 place before the sidecar, so a crash between the two moves could pair a newer
@@ -317,35 +228,28 @@ array with an older sidecar; resuming on that would re-count files and inflate
 the total. The resume path checks the array against `total_in_grid` and starts
 over rather than continue from something inconsistent.
 
+A *complete* artifact, or one computed from different inputs, is never touched
+without `rewrite=True` — `process_delta_t` raises `FileExistsError` instead.
+
 ### Measuring the background instead of fitting it
 
 `subtract_background=True` histograms the *frame-shifted* pixel pairs alongside
-the real ones, so the accidental triangle can be subtracted bin-for-bin rather
-than fitted. Both stage-1 paths take it, and both give the same residual — see
+the real ones, one grid plane per lag, so the accidental triangle can be
+subtracted bin-for-bin rather than fitted — see
 [Removing the accidental background by shifting frames](background_subtraction.md).
 
 ```python
-# counts path: the lags cost one small grid plane each
-dt.calculate_and_save_delta_counts(path, [signal, idler], nframes=10_000,
-                                   subtract_background=True)
-counts, centers, fit = dt.collect_and_plot_delta_counts(
-    path, subtract_background=True, fit_window_s=2e-9)
-
-# feather path: same call, but the lags cost one column set each - so ~9x the
-# feather at the default eight lags. Use fewer, or use the counts path.
-dt.calculate_and_save_timestamp_differences(path, [signal, idler], nframes=10_000,
-                                            subtract_background=True,
-                                            background_lags=(1, 2, 3, 4))
-counts, centers, fit = dt.collect_and_plot_timestamp_differences(
+# the lags cost one small grid plane each; the .bin decoding is paid once
+dt.process_delta_t(path, 10_000, [signal, idler],
+                   daughterboard_number="D0", motherboard_number="M0",
+                   subtract_background=True)
+counts, centers, fit = dt.plot_delta_t(
     path, subtract_background=True, fit_window_s=2e-9)
 ```
 
-The feather's lag columns are named `<pair>@lag<k>`; lag 0 keeps the bare pair
-name, and pooling "every pair column" never picks up the shifted ones.
-
 ## Overwriting: the five-second countdown
 
-Every `rewrite=True` in this module routes through
+`rewrite=True` routes through
 [`store.confirm_rewrite`][dapkel.core.store.confirm_rewrite]. On a fresh run it
 does nothing at all. When something really is about to be destroyed it names
 each target with its size and timestamp, then counts down five seconds before
@@ -353,8 +257,7 @@ proceeding:
 
 ```
 !!  rewrite=True - the following data WILL BE OVERWRITTEN:
-!!    .../processed/SPDC_delta_t.feather  (1.4 GB, written 2026-07-30 02:11)
-!!    .../processed/SPDC_delta_t_parts/  (23 file(s), 1.4 GB)
+!!    .../processed/SPDC_ort_delta_counts.npy  (106.0 MB, written 2026-07-30 02:11)
 !!  Press Ctrl-C within 5 s to abort and copy it somewhere safe.
 ```
 
@@ -364,23 +267,6 @@ a `rewrite=True` left in the script from the previous acquisition, silently
 eating an overnight run. Set `store.REWRITE_DELAY_S = 0` in an unattended
 pipeline that has its own guard.
 
-Note the part folder is named in the warning as well — a rewrite clears the
-previous run's parts, otherwise they would be pooled into the new output.
-
-## Pooling runs
-
-`combine_delta_t_feathers` pools the per-run delta-t feathers under a parent
-folder (many acquisitions of the same measurement) into one combined `.feather`
-in a `combined` sub-folder of `processed/`. It never folds a previous combined
-output back into itself, and it streams batch-by-batch just as the part
-combiner does, so pooling a hundred runs costs one batch of memory rather than
-the whole pooled data set.
-
-Part files are not picked up by the search: they end in `_<i>.feather`, which
-the `*_delta_t.feather` glob does not match, so nothing is ever counted twice.
-
 ## API
 
 ::: dapkel.functions.delta_t
-
-::: dapkel.functions.calc_diff

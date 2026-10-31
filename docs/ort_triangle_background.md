@@ -220,5 +220,6 @@ Only recovering absolute time, or shrinking the fold:
 The triangle explains the background **shape** and the **contrast**, but not the
 peak **width** (~500 ps measured vs ~100 ps expected). That is a timing‑
 resolution question — code→time calibration (the flat ~71.6 ps/code is only an
-average; the density‑test LUT gives per‑code widths) and detector jitter — and
-is independent of everything in this document.
+average; the density‑test [tap calibration](guide/tdc_calibration.md) gives the
+ring's actual tap widths) and detector jitter — and is independent of everything
+in this document.

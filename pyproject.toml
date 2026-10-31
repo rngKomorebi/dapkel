@@ -73,7 +73,7 @@ namespaces = false
 exclude = ["dapkel.functions._old*"]
 
 [tool.setuptools.package-data]
-# Ship the packaged TDC calibration LUTs with the wheel/sdist.
+# Ship the packaged TDC calibration tables with the wheel/sdist.
 "dapkel.params" = ["calibration_data/*.npy"]
 # Mark the package as type-annotated (PEP 561).
 "dapkel" = ["py.typed"]
@@ -92,7 +92,8 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 88
 src = ["src", "tests"]
-extend-exclude = ["src/dapkel/functions/_old"]
+# 'archive/' is retired code kept verbatim for reference, not maintained.
+extend-exclude = ["src/dapkel/functions/_old", "archive"]
 
 [tool.ruff.lint]
 select = [

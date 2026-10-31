@@ -112,7 +112,8 @@ def map_file_name(dataset: str, kind: str, tag: str = "") -> str:
         Analysis name (e.g. ``'dcr'``, ``'hitmap'``, ``'crosstalk'``).
     tag : str, optional
         Readout/quadrant tag distinguishing artifacts of the same kind. The
-        default is "".
+        default is "". Lower-cased, with the quadrant wildcard ``*`` written as
+        ``x`` (``'S*C'`` -> ``'sxc'``) since no file system takes a ``*``.
 
     Returns
     -------
@@ -120,7 +121,8 @@ def map_file_name(dataset: str, kind: str, tag: str = "") -> str:
         ``'<dataset>_<tag>_<kind>.npy'``, or ``'<dataset>_<kind>.npy'`` when
         no tag is given.
     """
-    parts = [dataset, tag.lower(), kind] if tag else [dataset, kind]
+    tag = tag.lower().replace("*", "x").strip("_")
+    parts = [dataset, tag, kind] if tag else [dataset, kind]
     return "_".join(parts) + ".npy"
 
 
@@ -180,7 +182,7 @@ def save_map(
         is None (an empty sidecar is still written, recording kind and tag).
     file_name : str | None, optional
         Explicit '.npy' file name, overriding the derived one. Used where a
-        naming scheme is already established (the TDC LUTs). The default is
+        naming scheme is already established (the TDC tap tables). The default is
         None.
     quiet : bool, optional
         Suppress the "saved to" printout. The default is False.
@@ -251,7 +253,7 @@ def load_map(
     if not os.path.isfile(npy_path):
         raise FileNotFoundError(
             f"No saved '{kind or 'array'}' found at:\n  {npy_path}\n"
-            f"Run the matching compute_and_save_* first."
+            f"Run the matching process_* first."
         )
     return np.load(npy_path), read_meta(npy_path)
 

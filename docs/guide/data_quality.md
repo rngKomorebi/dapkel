@@ -23,17 +23,29 @@ full scale. A
 broken run collapses onto a handful of values — often a single code repeated
 across every frame.
 
+[`process_time_codes`][dapkel.functions.data_quality.process_time_codes]
+histograms every pixel's codes over all frames and saves the
+`(32, 32, n_codes)` per-pixel code histogram to
+`processed/<name>_<tag>_time_codes.npy` — a few tens of MB at the slowest
+clock, so any pixel can then be inspected without re-reading the run.
+[`plot_time_codes`][dapkel.functions.data_quality.plot_time_codes] plots one
+pixel from it to `results/data_quality/` and returns that pixel's counts per
+code:
+
 ```python
+import numpy as np
 from dapkel.functions import data_quality
 
-fig, codes = data_quality.plot_time_code_histogram(
-    folder, pixel=(16, 16), nframes=10_000
-)
-print(codes.size, "valid codes,", len(set(codes)), "unique")
+# a handful of files is enough to see whether the timing is populated
+data_quality.process_time_codes(path, nframes=10_000, max_files=5)
+
+hist = data_quality.plot_time_codes(path, pixel=(16, 16))
+print(hist.sum(), "valid codes,", np.count_nonzero(hist), "unique")
 ```
 
-A few unique values out of thousands of frames means the run is unusable. This
-mirrors the timestamp inspection in `Kelpie_run.m`.
+The title gives the span of the codes as a full scale in ns. A few unique
+values out of thousands of frames means the run is unusable. This mirrors the
+timestamp inspection in `Kelpie_run.m`.
 
 Run it on a pixel or two before spending time on
 [coincidences](coincidences.md).

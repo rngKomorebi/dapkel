@@ -29,6 +29,10 @@ _old/
 # examples live in examples/ and are tracked.
 testing_ideas/
 
+# Retired calibration tables kept beside the archived code for reference. Large
+# binaries, and superseded, so they stay on disk but never enter git.
+archive/calibration_data/
+
 # OS cruft
 .DS_Store
 Thumbs.db

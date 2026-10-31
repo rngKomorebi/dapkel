@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: every analysis is two functions, `process_<x>` and `plot_<x>`.**
+  `process_<x>(path, nframes, ...)` unpacks the raw '.bin' files and *always*
+  saves its artifact under `processed/`; `plot_<x>(path, tag, ...)` loads it and
+  writes the figures. Everything else is private, and code no pipeline used is
+  moved, verbatim, to `archive/` at the repository root (reference only, not
+  packaged or tested). `tests/test_api_surface.py` now enforces the pair, and
+  caps each module at ten private functions. Entries further down this section
+  describe the pre-restructure API.
+
+  | module | was | is |
+  | --- | --- | --- |
+  | `hitmap_analysis` | `compute_hitmap(_64)`, `compute_and_save_hitmap(_64)`, `collect_and_plot_hitmap`, `plot_hitmap(array)` | `process_hitmap`, `plot_hitmap(path, tag)` |
+  | `dcr_analysis` | `compute_dcr_32/64`, `compute_and_save_dcr_32/64`, `collect_and_plot_dcr_32/64`, `plot_heatmap`, `plot_distribution` | `process_dcr`, `plot_dcr` |
+  | `crosstalk_analysis` | `compute_crosstalk`, `compute_and_save_crosstalk`, `collect_and_plot_crosstalk`, `combine_directional_crosstalk`, 4 × `plot_ct_*` | `process_crosstalk`, `plot_crosstalk` |
+  | `data_quality` | `collect_time_mat`, `plot_time_code_histogram` | `process_time_codes`, `plot_time_codes` |
+  | `tdc_calibration` | 12 functions over two calibration models | `process_tdc_calibration`, `plot_tdc_calibration` |
+  | `delta_t` | 15 functions over two stage-1 paths | `process_delta_t`, `plot_delta_t` |
+
+  Details worth knowing when porting a script:
+
+  - **The tag decides what a count is** (`core.reduce.readout_mode`): `...T`
+    programs count frames carrying a timestamp, `...C` programs sum the photon
+    counter. The `mode` parameter is gone, and with it the tag/mode mismatch that
+    inflated a timestamp-mode DCR ~50x. A tag ending in neither letter raises.
+  - **32 or 64 is the tag, not a second function**: `'S*C'` / `'S*T'` assemble
+    the four quadrants into the (64, 64) map (saved as `..._sxc_...`). The
+    quadrants are cut to a common file count, so all pixels share one exposure,
+    and a missing quadrant is NaN rather than zero.
+  - **`process_delta_t(path, nframes, pixels, ...)`** - `nframes` is now the
+    second positional argument, as in every `process_*`. `plot_delta_t(path,
+    tag)` finds the grid from the tag; `counts_path`, `npy_path` and `reuse`
+    are gone. Verified on 30 files of the 2026.09.14 SPDC run: the new grid is
+    bin-for-bin identical to `calculate_and_save_delta_counts` (5 lag planes x
+    81 pairs, raw and calibrated), and the fits and model-free count match to
+    every printed digit.
+  - **`plot_hitmap` returns the rate map** (Hz) rather than the counts.
+  - **`process_crosstalk` on a parent folder** processes each pairing
+    sub-folder and saves the combined (64, 64) directional map; `plot_crosstalk`
+    draws whichever was saved. The artifact is named by the batch prefix
+    (`<name>_ct_crosstalk.npy`), the pairing goes in the sidecar.
+  - **`data_quality` saves** the (32, 32, n_codes) per-pixel code histogram,
+    so any pixel can be inspected without re-reading the run.
+  - **Background subtraction is unchanged in behaviour** but no longer a
+    module: it is private to `delta_t`, still driven by `subtract_background`.
+- **BREAKING: the TDC calibration is the compact 8-tap form only.** One
+  (32, 32, 8) table per SPAD serves every clock, and is applied by the new
+  `core.calibration.codes_to_ps` straight from the tap widths - there is no LUT
+  to expand, so no code range to cover, no per-clock file to pick and no
+  overflow warning. `lut_clock` and `tdc_model` are gone. `plot_tdc_calibration`
+  draws each SPAD's tap DNL against the array and its ring-period spread. The
+  packaged tables are to be rebuilt after this restructure.
+- `core.timing.resolve_live_time(firmware_version, *, open_shutter_time_s,
+  exp_time_s)` drops its unused `nframes` and raises when `short_exposure` has no
+  shutter time, instead of returning None for every caller to check.
+
+### Removed
+
+Moved to `archive/` (code and its tests, verbatim from commit 6b49a4b):
+
+- the delta-t **feather path** - `calculate_and_save_timestamp_differences`,
+  `combine_delta_t_parts`, `combine_delta_t_feathers`,
+  `compute_and_save_delta_histogram`, `collect_and_plot_timestamp_differences`
+  and their part-file machinery. The binned-counts path gives the same
+  histogram without the 3-135 GB intermediate; per-event analyses are the one
+  thing it cannot do.
+- the **dense per-clock LUT** - `histogram_to_lut`, `compute_tdc_lut`,
+  `collect_and_save_luts`, `load_lut`, `load_board_lut`, `lut_full_scale_s` and
+  the clock-tag selection. The packaged per-clock tables move to the untracked
+  `archive/calibration_data/`.
+- the **two-Gaussian peak model** (`two_gaussians_on_triangle`,
+  `fit_two_gaussians_on_triangle`), which no pipeline called.
+- `calc_diff` (within-frame differencing is the lag-0 case of `delta_t`'s
+  frame-shifted differencing), `core.timing.resolve_cycle_time`,
+  `resolve_frame_time`, `CLK_PERIOD`, `MAX_DELTA_S`, `core.pairs.pair_labels`
+  and `core.io.frames_in_file`.
+
 ### Added
 
 - **`clip_colorbar_to` sets the sensor-map colour-scale ceiling** — on

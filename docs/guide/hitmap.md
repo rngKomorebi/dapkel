@@ -7,7 +7,12 @@ Kelpie program wrote the data, so there are two modes, matched to what
 
 ## The two modes
 
-### `mode="timestamp"` — the ORT program
+There is no `mode` argument: the mode follows from the **last letter of the
+tag** ([`core.reduce.readout_mode`][dapkel.core.reduce.readout_mode]), so the
+program that wrote the files decides what a count is and the two can never
+disagree. A tag that ends in neither `T` nor `C` is a `ValueError`.
+
+### Timestamp mode — `...T` tags (`ORT`, `S0T`)
 
 Every frame, each macropixel reports the timestamp of the *first* photon it saw
 (from one of its four micropixels); the later photons are not read out. This is
@@ -25,37 +30,46 @@ decoding and is not a tunable.
     the low bits of the coarse timestamp (see [`unpack`](unpack.md)). Validity
     must come from `time_series`, never from `photon_counts`.
 
-### `mode="count"` — the `S*C` / `ORC` programs
+### Count mode — `...C` tags (`ORC`, `S0C`)
 
 No timestamp is recorded; the data holds per-pixel photon counts, and the
 hitmap sums those over every frame. This is the same quantity
 [DCR](dcr.md) accumulates before dividing by the acquisition time.
 
+### The full sensor
+
+A `*` in place of the SPAD index — `tag="S*C"` or `tag="S*T"` — asks for all
+four micropixel quadrants, interleaved onto the full (64, 64) sensor by
+[`core.reduce.count_map`][dapkel.core.reduce.count_map]. The four quadrants are
+cut to the same number of files, so every pixel shares one exposure and one rate
+normalisation; a missing quadrant is left as `NaN`. No file system takes a `*`,
+so the saved file name writes it as `x`: `<name>_sxc_hitmap.npy`.
+
 ## Photon rate
 
-The raw map is counts (or occupancy). The rate is that divided by the wall-clock
-duration of the acquisition, the same way in both modes:
+The raw map is counts (or occupancy). The rate is that divided by the total
+**live** (shutter-open) time of the acquisition, the same way in both modes:
 
 ```
-hits / (nframes * n_files * cycle)
+hits / (nframes * n_files * live_per_frame)
 ```
 
-in Hz — photons per second of experiment. Every frame is one acquisition cycle,
-so `nframes * n_files * cycle` *is* the elapsed time of the run.
+in Hz. Only the open shutter is photon-sensitive, so this is the flux actually
+seen during the exposure. Normalising by the whole ~9 µs frame instead would
+dilute the rate by the frame/window ratio — 90× for 9 µs / 100 ns.
 
-### The cycle depends on the firmware
+### The live time depends on the firmware
 
 Two versions, selected with `firmware_version`
-([`core.timing.resolve_cycle_time`][dapkel.core.timing.resolve_cycle_time]):
+([`core.timing.resolve_live_time`][dapkel.core.timing.resolve_live_time]):
 
-| `firmware_version` | cycle | notes |
+| `firmware_version` | live per frame | notes |
 |---|---|---|
-| `"short_exposure"` (default) | always **9 µs** | the photon-sensitive exposure sits inside the cycle and does not extend it, so it can be anything from ~50 ns to the full 9 µs |
-| `"long_exposure"` | **`exp_time_s` + 9 µs** | you set X, the firmware adds 9 µs. `exp_time_s` is required |
+| `"short_exposure"` (default) | **`open_shutter_time_s`** | the cycle is always 9 µs; the photon-sensitive window sits inside it without extending it, and is settable from ~50 ns to the full 9 µs. Nothing in the data reveals it, so it is asked for (default `500e-9`); `resolve_live_time` raises without it |
+| `"long_exposure"` | **`exp_time_s` + 9 µs** | you set X, the firmware adds 9 µs, and essentially the whole cycle is live |
 
-These two names are the whole vocabulary — the same strings
-[`resolve_live_time`][dapkel.core.timing.resolve_live_time] and [DCR](dcr.md)
-take, listed in `core.timing.FIRMWARE_VERSIONS`. The older `"short_window"` /
+These two names are the whole vocabulary — the same strings [DCR](dcr.md)
+takes, listed in `core.timing.FIRMWARE_VERSIONS`. The older `"short_window"` /
 `"full_window"` spellings are gone rather than aliased: two names for one setting
 is how a caller ends up passing the pair that only one of two functions
 accepts.
@@ -68,7 +82,8 @@ accepts.
     directly: `exp_time_s = 0 → 9 µs`, `1e-6 → 10 µs`, `2e-6 → 11 µs`.
 
     It is worth knowing what the counter says, though, because it disagrees
-    with the nominal figure. It is a 200 MHz tick count over the whole run,
+    with the nominal figure — which matters wherever the cycle is the live time,
+    i.e. under `long_exposure`. It is a 200 MHz tick count over the whole run,
     latched by the firmware after the acquisition reports done, and across every
     sample folder on disk it fits
 
@@ -87,16 +102,10 @@ accepts.
 
 ### What the number means
 
-Under `timestamp` mode only the *first* photon of a cycle is timestamped, so
-the map saturates at one firing per cycle — 111 kHz at a 9 µs cycle — and
-under-reports as it approaches that. It is a firing rate, not a corrected
+In timestamp mode only the *first* photon of a frame is timestamped, so the map
+saturates at one firing per `open_shutter_time_s` — 2 MHz at a 500 ns window —
+and under-reports as it approaches that. It is a firing rate, not a corrected
 photon flux.
-
-`exposure_window` is recorded and reported as a duty cycle but does **not**
-enter the rate. Dividing by it instead would give the rate *during* the
-exposure, which is this figure times `cycle / exposure` — 90× for 9 µs / 100 ns.
-Both are defensible quantities; this one is per second of experiment, which is
-what the printed line and the colorbar say.
 
 ### `nframes` is yours to supply, not the file's
 
@@ -104,8 +113,8 @@ The rate is proportional to `1 / nframes`, and the frame count **cannot** be
 trusted to the file. Every sample `.bin` is a whole power-of-two number of
 frames — 32 MiB (16 384) or 16 MiB (8 192) — which is not what a 10 000-frame
 acquisition should produce, so the relation between the number you enter and
-the file you get is **not established**; see
-[`io.frames_in_file`][dapkel.core.io.frames_in_file].
+the file you get is **not established** (the exe dumps a fixed DDR3 region larger
+than the acquisition; see [`core.io`][dapkel.core.io]).
 
 Both this package's `unpack` and the reference `kelpie_data_ddr3.m` read only
 the first `nframes` frames, so passing the number you acquired with gives
@@ -115,31 +124,35 @@ the rate is only right if it matches what the camera actually recorded.
 
 ## Compute once, plot many times
 
-Analysis and plotting are decoupled. `compute_and_save_hitmap` writes the array
-to `processed/` with a `.meta.json` sidecar recording the frame count, the
-firmware version and the resolved cycle; `collect_and_plot_hitmap` reads that
-back and never re-unpacks the binary data. Retrying a colormap costs a load, not
-a full re-read of the raw files. See
+Analysis and plotting are decoupled.
+[`process_hitmap`][dapkel.functions.hitmap_analysis.process_hitmap] writes the
+array to `processed/<name>_<tag>_hitmap.npy` with a `.meta.json` sidecar
+recording the frame count, the firmware version and the resolved live time;
+[`plot_hitmap`][dapkel.functions.hitmap_analysis.plot_hitmap] reads that back,
+never re-unpacks the binary data, saves the counts map and the photon-rate map
+to `results/hitmap/`, and returns the **rate map in Hz**. Retrying a colormap
+costs a load, not a full re-read of the raw files. See
 [Adding an analysis](../adding_an_analysis.md) for the stage rules.
 
 ```python
 from dapkel.functions import hitmap_analysis as hm
 
-# short-exposure firmware: 9 µs cycle, 100 ns exposure inside it
-hm.compute_and_save_hitmap(path, 10_000, "timestamp", "ORT",
-                           exposure_window=100e-9)
+# short-exposure firmware: 9 µs cycle, 100 ns open shutter inside it
+hm.process_hitmap(path, 10_000, "ORT", open_shutter_time_s=100e-9)
 
 # long-exposure firmware: you set X, the firmware adds 9 µs
-hm.compute_and_save_hitmap(path, 10_000, "timestamp", "ORT",
-                           firmware_version="long_exposure", exp_time_s=91e-6)
+hm.process_hitmap(path, 10_000, "ORT",
+                  firmware_version="long_exposure", exp_time_s=91e-6)
 
-hm.collect_and_plot_hitmap(path, "timestamp", "ORT")   # counts + rate figures
+# the full 64x64 sensor from the four counting quadrants
+hm.process_hitmap(path, 10_000, "S*C", open_shutter_time_s=100e-9)
+
+rate = hm.plot_hitmap(path, "ORT")   # counts + rate figures; returns Hz
 ```
 
-Because the sidecar stores the frame count and the cycle, a saved hitmap can
+Because the sidecar stores the frame count and the live time, a saved hitmap can
 still be turned into a rate months later without remembering the original call
-arguments. A hitmap saved before the sidecar carried them gets the counts
-figure and a note instead of a rate.
+arguments.
 
 ## API
 

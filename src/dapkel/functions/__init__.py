@@ -1,28 +1,37 @@
 """Analysis functions for Kelpie v2 SPAD-camera data.
 
-Each module decodes the raw '.bin' files with 'unpack' and does one kind of
-reduction/plot; shared code lives in 'dapkel.core'. Every module declares its
-public surface in ``__all__`` - read that list to see what you can call.
+Every analysis module has exactly two public functions:
 
-Naming convention:
+    * ``process_<x>(path, nframes, ...)`` - unpack the raw '.bin' files, reduce
+      them and **always save** the result under ``<path>/processed/``; returns
+      the saved path.
+    * ``plot_<x>(path, ...)`` - load that saved result and write the figures to
+      ``<path>/results/<x>/``; returns the data it plotted.
 
-    * ``compute_*``     raw '.bin' files (or an array) in, array out - no I/O
-    * ``plot_*``        an already computed array in, a Figure out - no I/O
-    * ``collect_and_*`` driver: walks a folder and writes figures to disk
-    * ``load_*``        read a saved artifact back
+So a measurement is always two calls, and replotting never re-reads raw data:
+
+    =====================  ==========================  =======================
+    module                 process                     plot
+    =====================  ==========================  =======================
+    data_quality           process_time_codes          plot_time_codes
+    hitmap_analysis        process_hitmap              plot_hitmap
+    dcr_analysis           process_dcr                 plot_dcr
+    crosstalk_analysis     process_crosstalk           plot_crosstalk
+    tdc_calibration        process_tdc_calibration     plot_tdc_calibration
+    delta_t                process_delta_t             plot_delta_t
+    =====================  ==========================  =======================
+
+'unpack' (stage 0) decodes one '.bin' file and is used by all of them. Shared
+code lives in 'dapkel.core'; retired code in the repository's ``archive/``.
 
 Modules are re-exported here rather than their functions, so call sites stay
-qualified (``dcr_analysis.plot_heatmap``): the package has ``plot_heatmap``,
-``plot_hitmap`` and ``plot_ct_heatmap``, only unambiguous when the module is
-named.
+qualified (``hitmap_analysis.plot_hitmap``).
 
 Full documentation: ``docs/index.md``. Adding a measurement:
 ``docs/adding_an_analysis.md``.
 """
 
 from dapkel.functions import (
-    background_subtraction,
-    calc_diff,
     crosstalk_analysis,
     data_quality,
     dcr_analysis,
@@ -37,12 +46,10 @@ __all__ = [
     "unpack",
     # check the data before analysing it
     "data_quality",
-    # stage 1/2 - per-measurement analyses
+    # per-measurement analyses
+    "hitmap_analysis",
     "dcr_analysis",
     "crosstalk_analysis",
-    "hitmap_analysis",
     "tdc_calibration",
-    "calc_diff",
-    "background_subtraction",
     "delta_t",
 ]
