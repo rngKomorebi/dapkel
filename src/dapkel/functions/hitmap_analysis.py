@@ -1,12 +1,12 @@
 """Per-pixel sensor occupancy (hitmaps), in counts and in photon rate.
 
     process_hitmap   raw '.bin' -> processed/<name>_<tag>_hitmap.npy
-    plot_hitmap      that array -> results/hitmap/ counts and rate maps
+    plot_hitmap      that array -> results/hitmap/ the counts map and the rate map
 
 The tag says what a count is ('core.reduce'): ``...T`` programs (``ORT``,
 ``S0T``) count frames carrying a valid first-photon timestamp - at most one per
 pixel per frame - and ``...C`` programs (``ORC``, ``S0C``) sum the photon
-counter. ``'S*C'`` / ``'S*T'`` assemble the four quadrants into (64, 64).
+counter.
 
 The rate divides by the total *live* (shutter-open) time of the acquisition,
 ``nframes * n_files * open_shutter_time_s`` - not the full ~9 us frame period.
@@ -54,8 +54,8 @@ def process_hitmap(
         denominator, ``nframes * n_files * open_shutter_time_s``. Do not infer
         it from the file size - the exe dumps a fixed, larger DDR3 region.
     tag : str, optional
-        File tag: ``'ORT'``, ``'ORC'``, ``'S0C'``... or ``'S*C'`` / ``'S*T'``
-        for the full (64, 64) sensor. The default is ``'ORT'``.
+        File tag: ``'ORT'``, ``'ORC'``, ``'S0C'``, ``'S2T'``... The default is
+        ``'ORT'``.
     firmware_version : str, optional
         ``'short_exposure'`` (default, only ``open_shutter_time_s`` of each
         frame is live) or ``'long_exposure'`` (the whole ``exp_time_s + 9 µs``
@@ -67,7 +67,7 @@ def process_hitmap(
         Exposure requested of ``'long_exposure'`` firmware, in seconds. The
         default is None.
     max_files : int | None, optional
-        Use at most this many files (per quadrant). The default is None (all).
+        Use at most this many files. The default is None (all).
 
     Returns
     -------
@@ -116,7 +116,7 @@ def plot_hitmap(
     *,
     cmap: str | None = None,
     clip_colorbar_to: float | None = 99.0,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """Load a saved hitmap and save its counts and photon-rate maps.
 
     Writes two figures to ``results/hitmap``: the counts (frames fired) map and
@@ -143,8 +143,11 @@ def plot_hitmap(
 
     Returns
     -------
-    np.ndarray
-        The photon-rate map, in Hz.
+    counts : np.ndarray
+        The (32, 32) counts map - frames fired for a ``...T`` tag, photon
+        counts for a ``...C`` one.
+    rate : np.ndarray
+        The (32, 32) photon-rate map, in Hz.
 
     Raises
     ------
@@ -175,12 +178,11 @@ def plot_hitmap(
             clip_colorbar_to=clip_colorbar_to,
         )
         store.save_figure(fig, results_dir, f"{name}{suffix}.png")
-        if not suffix:
-            plt.close(fig)  # the rate map stays open, for interactive use
+        plt.close(fig)
 
     print(
         f"  {meta['total_frames']} frames x {meta['frame_live_s'] * 1e9:.0f} ns "
         f"live = {meta['live_time_s'] * 1e3:.3f} ms;  rate median "
         f"{np.nanmedian(rate):.3g}  max {np.nanmax(rate):.3g} Hz"
     )
-    return rate
+    return hitmap, rate

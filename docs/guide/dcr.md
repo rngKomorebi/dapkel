@@ -21,11 +21,11 @@ from dapkel.functions import dcr_analysis
 dcr_analysis.process_dcr(path, 1000, "S0C", open_shutter_time_s=100e-9)
 dcr = dcr_analysis.plot_dcr(path, "S0C")
 
-# the full (64, 64) sensor, timestamping mode, Poisson-corrected
+# timestamping mode, Poisson-corrected
 dcr_analysis.process_dcr(
-    path, 1000, "S*T", open_shutter_time_s=8e-6, pileup_correct=True
+    path, 1000, "S0T", open_shutter_time_s=8e-6, pileup_correct=True
 )
-dcr_analysis.plot_dcr(path, "S*T")
+dcr_analysis.plot_dcr(path, "S0T")
 ```
 
 ## Counting mode vs timestamping mode
@@ -91,25 +91,18 @@ firmware — see [`core.timing.resolve_live_time`][dapkel.core.timing.resolve_li
 Under the legacy firmware the exposure argument passed to `Kelpie_v2.exe` maps
 to an actual frame period with 9 µs of overhead: `0 → 9 µs`, `10 µs → 19 µs`.
 
-## Quadrants and the full sensor
+## Quadrants
 
-A single SPAD quadrant tag — `S0C`...`S3C` in counting mode, `S0T`...`S3T` in
-timestamping mode — gives a (32, 32) map. `tag="S*C"` or `"S*T"` unpacks all
-four and interleaves them onto the full (64, 64) sensor — each tag reads one
-micropixel per 2×2 macropixel, so the quadrant maps interleave rather than tile.
-The quadrants are cut to the same number of files so every pixel shares one
-exposure, and a missing quadrant stays `NaN`. The saved file writes the `*` as
-`x` (`<name>_sxc_dcr.npy`).
+Every program gives a (32, 32) map: a SPAD quadrant tag — `S0C`...`S3C` in
+counting mode, `S0T`...`S3T` in timestamping mode — reads one micropixel per 2×2
+macropixel, `ORC` / `ORT` all four at once. Interleaving the four quadrant maps
+onto the (64, 64) micropixel grid is archived (`archive/core/reduce.py`), since
+no current measurement needs it.
 
 The SPAD indices run **clockwise** (`S0 S1 / S3 S2`), not row-major; the layout
 is documented under [cross-talk](crosstalk.md#spad-geometry-the-indices-run-clockwise)
 and enforced by `tests/test_spad_geometry.py`.
 
-!!! note "Quadrant tags are matched with a leading underscore"
-    The full-sensor tags glob `*_S0C*.bin`, not `*S0C*.bin`, so a tag cannot match a filename
-    that merely happens to contain those characters. This is the
-    `require_separator=True` argument to
-    [`core.io.find_bin_files`][dapkel.core.io.find_bin_files].
 
 ## Pixel masking
 

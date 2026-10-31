@@ -36,14 +36,8 @@ No timestamp is recorded; the data holds per-pixel photon counts, and the
 hitmap sums those over every frame. This is the same quantity
 [DCR](dcr.md) accumulates before dividing by the acquisition time.
 
-### The full sensor
-
-A `*` in place of the SPAD index — `tag="S*C"` or `tag="S*T"` — asks for all
-four micropixel quadrants, interleaved onto the full (64, 64) sensor by
-[`core.reduce.count_map`][dapkel.core.reduce.count_map]. The four quadrants are
-cut to the same number of files, so every pixel shares one exposure and one rate
-normalisation; a missing quadrant is left as `NaN`. No file system takes a `*`,
-so the saved file name writes it as `x`: `<name>_sxc_hitmap.npy`.
+Every program gives a (32, 32) map. Interleaving four `S<n>` quadrant maps onto
+the (64, 64) micropixel grid is archived (`archive/core/reduce.py`).
 
 ## Photon rate
 
@@ -130,7 +124,7 @@ array to `processed/<name>_<tag>_hitmap.npy` with a `.meta.json` sidecar
 recording the frame count, the firmware version and the resolved live time;
 [`plot_hitmap`][dapkel.functions.hitmap_analysis.plot_hitmap] reads that back,
 never re-unpacks the binary data, saves the counts map and the photon-rate map
-to `results/hitmap/`, and returns the **rate map in Hz**. Retrying a colormap
+to `results/hitmap/`, and returns both, `(counts, rate)` - the rate in Hz. Retrying a colormap
 costs a load, not a full re-read of the raw files. See
 [Adding an analysis](../adding_an_analysis.md) for the stage rules.
 
@@ -144,10 +138,8 @@ hm.process_hitmap(path, 10_000, "ORT", open_shutter_time_s=100e-9)
 hm.process_hitmap(path, 10_000, "ORT",
                   firmware_version="long_exposure", exp_time_s=91e-6)
 
-# the full 64x64 sensor from the four counting quadrants
-hm.process_hitmap(path, 10_000, "S*C", open_shutter_time_s=100e-9)
-
-rate = hm.plot_hitmap(path, "ORT")   # counts + rate figures; returns Hz
+# two figures, <name>_ort_hitmap.png (counts) and <name>_ort_hitmap_rate.png
+counts, rate = hm.plot_hitmap(path, "ORT")   # rate in Hz
 ```
 
 Because the sidecar stores the frame count and the live time, a saved hitmap can

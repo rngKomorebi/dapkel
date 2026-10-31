@@ -5,8 +5,7 @@ Under the ``S*T``/``ORT`` timestamping programs there is no photon counter -
 as if it were a count inflates the DCR by ~40-50x, and the resulting map still
 looks plausible, so nothing downstream catches it. The count mode is therefore
 not a parameter at all: it is read off the tag ('core.reduce.readout_mode').
-These tests pin that, the (64, 64) quadrant assembly, and the pile-up inversion
-being the exact inverse of the one-hit-per-frame censoring.
+These tests pin that, and the pile-up inversion being the exact inverse of the one-hit-per-frame censoring.
 """
 
 from __future__ import annotations
@@ -22,12 +21,12 @@ from dapkel.functions import dcr_analysis
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("tag", ["S0T", "S3T", "ORT", "s0t", "S*T", "ORT_2"])
+@pytest.mark.parametrize("tag", ["S0T", "S3T", "ORT", "s0t", "ORT_2"])
 def test_timestamping_tags_count_frames(tag):
     assert reduce.readout_mode(tag) == "timestamp"
 
 
-@pytest.mark.parametrize("tag", ["S0C", "S3C", "ORC", "S*C"])
+@pytest.mark.parametrize("tag", ["S0C", "S3C", "ORC"])
 def test_counting_tags_sum_the_counter(tag):
     assert reduce.readout_mode(tag) == "count"
 
@@ -126,58 +125,3 @@ def test_short_exposure_without_a_shutter_time_is_refused(tmp_path):
     (tmp_path / "run_S0C_0.bin").write_bytes(b"")
     with pytest.raises(ValueError, match="open_shutter_time_s"):
         dcr_analysis.process_dcr(str(tmp_path), NFRAMES, "S0C", open_shutter_time_s=None)
-
-
-# --------------------------------------------------------------------------
-# the full sensor: four quadrants, one exposure
-# --------------------------------------------------------------------------
-
-
-def test_the_quadrants_interleave_onto_the_full_sensor(tmp_path, monkeypatch):
-    """Each SPAD's map lands on its own cell of every 2x2 macropixel."""
-
-    def by_quadrant(fp, n, compute_time_series=True):
-        spad = int(fp.split("_S")[1][0])
-        return None, np.full((32, 32, n), float(spad + 1))
-
-    monkeypatch.setattr("dapkel.core.reduce.unpack", by_quadrant)
-    for spad in range(4):
-        (tmp_path / f"run_S{spad}C_0.bin").write_bytes(b"")
-
-    full, n_files = reduce.count_map(str(tmp_path), "S*C", nframes=NFRAMES)
-
-    assert full.shape == (64, 64) and n_files == 1
-    for spad, (drow, dcol) in reduce.SPAD_LAYOUT.items():
-        assert (full[drow::2, dcol::2] == (spad + 1) * NFRAMES).all()
-
-
-def test_a_missing_quadrant_is_nan_not_zero(tmp_path, monkeypatch):
-    """Zero would read as a perfectly dark SPAD; NaN reads as no data."""
-    monkeypatch.setattr(
-        "dapkel.core.reduce.unpack",
-        lambda fp, n, compute_time_series=True: (None, np.ones((32, 32, n))),
-    )
-    for spad in (0, 1, 2):
-        (tmp_path / f"run_S{spad}C_0.bin").write_bytes(b"")
-
-    full, _ = reduce.count_map(str(tmp_path), "S*C", nframes=NFRAMES)
-
-    drow, dcol = reduce.SPAD_LAYOUT[3]
-    assert np.isnan(full[drow::2, dcol::2]).all()
-    assert np.isfinite(full[0::2, 0::2]).all()
-
-
-def test_quadrants_are_cut_to_a_shared_exposure(tmp_path, monkeypatch):
-    """A quadrant with more files must not get a longer exposure than the rest."""
-    monkeypatch.setattr(
-        "dapkel.core.reduce.unpack",
-        lambda fp, n, compute_time_series=True: (None, np.ones((32, 32, n))),
-    )
-    for spad in range(4):
-        for i in range(3 if spad == 0 else 2):
-            (tmp_path / f"run_S{spad}C_{i}.bin").write_bytes(b"")
-
-    full, n_files = reduce.count_map(str(tmp_path), "S*C", nframes=NFRAMES)
-
-    assert n_files == 2
-    assert np.unique(full).tolist() == [2.0 * NFRAMES]

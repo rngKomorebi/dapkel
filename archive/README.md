@@ -10,10 +10,11 @@ The layout mirrors the package:
 
 | path | what | superseded by |
 | --- | --- | --- |
-| `functions/delta_t.py` | the feather stage-1 path (every difference to a `.feather`, streamed into a histogram, part files and manifests), the two-Gaussian peak model, the dense-table calibration branch | `delta_t.process_delta_t` / `plot_delta_t` (binned counts) |
+| `functions/delta_t.py` (now `coincidences`) | the feather stage-1 path (every difference to a `.feather`, streamed into a histogram, part files and manifests), the two-Gaussian peak model, the dense-table calibration branch | `coincidences.process_coincidences` / `plot_coincidences` (binned counts) |
 | `functions/tdc_calibration.py` | the dense per-clock code→ps LUT and its selection by clock tag and code coverage | the compact 8-tap calibration, `core.calibration` |
-| `functions/calc_diff.py` | within-frame differencing (whole module) | lag 0 of `delta_t`'s frame-shifted differencing |
+| `functions/calc_diff.py` | within-frame differencing (whole module) | lag 0 of `coincidences`' frame-shifted differencing |
 | `functions/hitmap_analysis.py`, `dcr_analysis.py`, `crosstalk_analysis.py`, `data_quality.py` | compute-only (no save) entry points and the separate 32/64 variants | each module's `process_*` / `plot_*` |
+| `core/reduce.py` | `count_map_64`: the four `S<n>C` / `S<n>T` quadrants interleaved onto the (64, 64) micropixel grid (was the `'S*C'` wildcard, commit f0f2a03) | — (every program is 32 x 32) |
 | `core/timing.py`, `core/pairs.py`, `core/io.py` | `resolve_cycle_time`, `resolve_frame_time`, `CLK_PERIOD`, `MAX_DELTA_S`, `pair_labels`, `frames_in_file` | — (unused) |
 | `tests/` | the tests of the above, including the counts-vs-feather bin-for-bin comparison and the dense-vs-compact calibration comparison | — |
 | `calibration_data/` | the packaged per-clock dense LUTs (~160 MB). **Untracked** (`.gitignore`), on disk only | the compact tables in `src/dapkel/params/calibration_data` |

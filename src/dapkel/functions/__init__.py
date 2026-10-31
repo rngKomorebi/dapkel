@@ -18,7 +18,7 @@ So a measurement is always two calls, and replotting never re-reads raw data:
     dcr_analysis           process_dcr                 plot_dcr
     crosstalk_analysis     process_crosstalk           plot_crosstalk
     tdc_calibration        process_tdc_calibration     plot_tdc_calibration
-    delta_t                process_delta_t             plot_delta_t
+    coincidences           process_coincidences        plot_coincidences
     =====================  ==========================  =======================
 
 'unpack' (stage 0) decodes one '.bin' file and is used by all of them. Shared
@@ -32,10 +32,10 @@ Full documentation: ``docs/index.md``. Adding a measurement:
 """
 
 from dapkel.functions import (
+    coincidences,
     crosstalk_analysis,
     data_quality,
     dcr_analysis,
-    delta_t,
     hitmap_analysis,
     tdc_calibration,
     unpack,
@@ -51,5 +51,5 @@ __all__ = [
     "dcr_analysis",
     "crosstalk_analysis",
     "tdc_calibration",
-    "delta_t",
+    "coincidences",
 ]

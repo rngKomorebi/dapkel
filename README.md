@@ -83,16 +83,16 @@ from dapkel.functions import data_quality, dcr_analysis
 data_quality.process_time_codes("path/to/data", nframes=10_000, max_files=5)
 data_quality.plot_time_codes("path/to/data", pixel=(16, 16))
 
-# 1. Compute the full-sensor DCR map and save it to processed/.
+# 1. Compute the DCR map of one SPAD quadrant and save it to processed/.
 #    'open_shutter_time_s' is the photon-sensitive part of each frame, in
 #    SECONDS. It sets the rate normalisation and nothing else - it is not
 #    the TDC full scale, which every analysis measures from the data.
 dcr_analysis.process_dcr(
-    "path/to/data", 1000, "S*C", open_shutter_time_s=100e-9
+    "path/to/data", 1000, "S0C", open_shutter_time_s=100e-9
 )
 
 # 2. Load it and save the heatmap and sorted distribution to results/dcr/.
-dcr = dcr_analysis.plot_dcr("path/to/data", "S*C")
+dcr = dcr_analysis.plot_dcr("path/to/data", "S0C")
 ```
 
 Stage 2 only ever reads what stage 1 saved, so re-plotting - another colormap,
@@ -102,12 +102,12 @@ reachable directly:
 ```python
 from dapkel.core import store
 
-dcr, meta = store.load_map("path/to/data", kind="dcr", tag="S*C")
+dcr, meta = store.load_map("path/to/data", kind="dcr", tag="S0C")
 ```
 
 ## What's in the package
 
-`dapkel.functions` holds one module per measurement. Each has exactly two
+`dapkel.functions` holds one module per measurement. Each has two
 public functions, `process_<x>` and `plot_<x>`, declared in its `__all__`.
 
 | module | what it measures |
@@ -118,7 +118,7 @@ public functions, `process_<x>` and `plot_<x>`, declared in its `__all__`.
 | [`crosstalk_analysis`](https://rngkomorebi.github.io/dapkel/guide/crosstalk/) | optical cross-talk, per direction and combined |
 | [`hitmap_analysis`](https://rngkomorebi.github.io/dapkel/guide/hitmap/) | occupancy and photon rate |
 | [`tdc_calibration`](https://rngkomorebi.github.io/dapkel/guide/tdc_calibration/) | per-pixel 8-tap TDC calibration from the code density test |
-| [`delta_t`](https://rngkomorebi.github.io/dapkel/guide/coincidences/) | timestamp differences, coincidences and jitter, with optional [frame-shift background subtraction](https://rngkomorebi.github.io/dapkel/guide/background_subtraction/) |
+| [`coincidences`](https://rngkomorebi.github.io/dapkel/guide/coincidences/) | timestamp differences, coincidences and jitter, with optional [frame-shift background subtraction](https://rngkomorebi.github.io/dapkel/guide/background_subtraction/) |
 
 Anything shared between two analyses lives in
 [`dapkel.core`](https://rngkomorebi.github.io/dapkel/api/core/) rather than

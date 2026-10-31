@@ -1,7 +1,7 @@
 """Coincidence / timing-jitter (delta-t) analysis for the timestamping programs.
 
-    process_delta_t   raw '.bin' -> processed/<name>_<tag>_delta_counts.npy
-    plot_delta_t      that grid  -> results/coincidences/ the fitted peak
+    process_coincidences   raw '.bin' -> processed/<name>_<tag>_coincidences.npy
+    plot_coincidences      that grid  -> results/coincidences/ the fitted peak
 
 In every frame where both pixels of a pair hold a timestamp, ``t_b - t_a`` is
 one entry of the delta-t distribution; correlated pairs (SPDC signal/idler) pile
@@ -16,7 +16,7 @@ below the detector jitter.
 The ORT accidental background is a TRIANGLE, not flat: the free-running
 oscillator has no cycle counter, so two uncorrelated phases difference into a
 triangle that is zero at +/- one TDC full scale - 20 ns at 50 MHz, 100 ns at
-10 MHz, 500 ns at 2 MHz. 'plot_delta_t' fits ``Gaussian + triangle`` on the raw
+10 MHz, 500 ns at 2 MHz. 'plot_coincidences' fits ``Gaussian + triangle`` on the raw
 histogram, or measures the triangle away entirely with ``subtract_background``
 (below) and fits ``Gaussian + constant`` on the residual - the model follows
 from the data, it is not a choice. See ``docs/ort_triangle_background.md``.
@@ -59,12 +59,12 @@ from tqdm import tqdm
 
 from dapkel.core import calibration, io, store, timing
 
-# 'core.pairs' is aliased because 'plot_delta_t' takes a 'pairs' argument.
+# 'core.pairs' is aliased because 'plot_coincidences' takes a 'pairs' argument.
 from dapkel.core import pairs as pixel_pairs
 from dapkel.core.pairs import Pixel
 from dapkel.functions.unpack import unpack
 
-__all__ = ["process_delta_t", "plot_delta_t"]
+__all__ = ["process_coincidences", "plot_coincidences"]
 
 #: Analysis name: the results sub-folder for the figures.
 _KIND = "coincidences"
@@ -104,7 +104,7 @@ _WIDE_REBIN = 25
 
 
 def _counts_file(path: str, tag: str, *, create: bool = True) -> str:
-    """Return ``processed/<name>_<tag>_delta_counts.npy`` for a data folder.
+    """Return ``processed/<name>_<tag>_coincidences.npy`` for a data folder.
 
     The tag is in the name so several programs (ORT, S0T, ...) recorded into one
     folder keep their own artifact - and, since figure names derive from it,
@@ -113,7 +113,7 @@ def _counts_file(path: str, tag: str, *, create: bool = True) -> str:
     name = os.path.basename(os.path.normpath(path))
     return os.path.join(
         store.processed_dir(path, create=create),
-        store.map_file_name(name, "delta_counts", tag),
+        store.map_file_name(name, "coincidences", tag),
     )
 
 
@@ -145,7 +145,7 @@ def _pixel_timestamps(
     return out
 
 
-def process_delta_t(
+def process_coincidences(
     path: str,
     nframes: int,
     pixels: Sequence[Sequence[Pixel]],
@@ -164,7 +164,7 @@ def process_delta_t(
 ) -> str:
     """Unpack the timestamps, histogram every pair's delta-t and save the grid.
 
-    Writes ``processed/<name>_<tag>_delta_counts.npy``: ``(n_pairs, n_cells)``
+    Writes ``processed/<name>_<tag>_coincidences.npy``: ``(n_pairs, n_cells)``
     int64 counts on a native grid centred on zero (zero is a cell centre by
     construction) spanning the run's measured full scale, plus a sidecar with
     the grid, the pair labels and progress. With ``subtract_background`` a
@@ -205,7 +205,7 @@ def process_delta_t(
         Motherboard id, e.g. ``'M0'``. The default is None.
     subtract_background : bool, optional
         Also histogram frame-shifted pairs (``background_lags``), one grid plane
-        each, so 'plot_delta_t' can measure and subtract the accidentals. Costs
+        each, so 'plot_coincidences' can measure and subtract the accidentals. Costs
         one differencing pass and one plane of grid per lag; the '.bin'
         decoding, which dominates, is paid once. The default is False.
     background_lags : int | Sequence[int], optional
@@ -802,7 +802,7 @@ def _pm(value: float, err: float, sep: str = " ± ") -> str:
     return f"{value:.0f}{sep}{err:.0f} ps"
 
 
-def plot_delta_t(
+def plot_coincidences(
     path: str,
     tag: str = "ORT",
     *,
@@ -829,7 +829,7 @@ def plot_delta_t(
     Parameters
     ----------
     path : str
-        Data folder that 'process_delta_t' was run on.
+        Data folder that 'process_coincidences' was run on.
     tag : str, optional
         The tag it was run with. The default is ``'ORT'``.
     bin_width_s : float, optional
@@ -896,7 +896,7 @@ def plot_delta_t(
     cell_ps = float(meta["grid_ps"])
     grid_centers = (np.arange(grid.shape[-1]) - int(meta["zero_index"])) * cell_ps
 
-    name = os.path.basename(counts_path).removesuffix("_delta_counts.npy")
+    name = os.path.basename(counts_path).removesuffix("_coincidences.npy")
     results_dir = store.results_dir(path, _KIND)
     # The grid was sized from the run's own largest code, so this is the
     # measured full scale - the triangle's half-base, with no clock stated.
@@ -912,7 +912,7 @@ def plot_delta_t(
         if grid.ndim != 2:
             raise ValueError(
                 "subtract_background=True needs lag planes. Reprocess with "
-                "process_delta_t(..., subtract_background=True)."
+                "process_coincidences(..., subtract_background=True)."
             )
         # One binning over the whole support for the fit and the diagnostic, so
         # the panels cannot disagree about a bin edge.
@@ -986,7 +986,7 @@ def plot_delta_t(
     ax.set_title(title or f"{label.upper()} coincidence peak  ({name})")
     ax.grid(True, linewidth=0.5, alpha=0.6)
     ax.legend()
-    stem = "delta_counts_sub" if subtract_background else "delta_counts"
+    stem = "coincidences_sub" if subtract_background else "coincidences"
     store.save_figure(fig, results_dir, f"{name}_{label}_{stem}.png")
 
     if fit["ok"]:

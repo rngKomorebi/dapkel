@@ -57,26 +57,17 @@ def test_hitmap_round_trip(tmp_path):
     path = _write(tmp_path, [f"ORT_{i}.bin" for i in range(3)])
 
     saved = hitmap_analysis.process_hitmap(path, NFRAMES, "ORT")
-    rate = hitmap_analysis.plot_hitmap(path, "ORT")
+    counts, rate = hitmap_analysis.plot_hitmap(path, "ORT")
 
-    counts, meta = store.load_map(npy_path=saved)
+    saved_counts, meta = store.load_map(npy_path=saved)
     assert meta["total_frames"] == 3 * NFRAMES
+    np.testing.assert_array_equal(counts, saved_counts)
     np.testing.assert_allclose(rate, counts / (3 * NFRAMES * 500e-9))
     name = os.path.basename(path)
     assert _figures(path, "hitmap") == [
         f"{name}_ort_hitmap.png",
         f"{name}_ort_hitmap_rate.png",
     ]
-
-
-def test_full_sensor_hitmap_from_the_quadrant_wildcard(tmp_path):
-    path = _write(tmp_path, [f"run_S{s}C_0.bin" for s in range(4)])
-
-    saved = hitmap_analysis.process_hitmap(path, NFRAMES, "S*C")
-    rate = hitmap_analysis.plot_hitmap(path, "S*C")
-
-    assert os.path.basename(saved).endswith("_sxc_hitmap.npy")
-    assert rate.shape == (64, 64)
 
 
 def test_dcr_round_trip(tmp_path):

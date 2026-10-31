@@ -12,8 +12,10 @@ summed. In timestamp mode that counter field does not exist - 'unpack' returns
 low bits of the coarse timestamp there - so reading a ``T`` tag as counts would
 overstate the rate ~50x. Deriving the mode from the tag makes that impossible.
 
-A ``*`` in place of the SPAD index (``'S*C'``, ``'S*T'``) asks for all four
-micropixel quadrants, interleaved onto the full (64, 64) sensor.
+Every program reads a (32, 32) array: ``ORT``/``ORC`` all four micropixels of a
+macropixel at once, ``S<n>T``/``S<n>C`` one of them. (Assembling four ``S<n>``
+quadrants into the (64, 64) micropixel grid is archived:
+``archive/core/reduce.py``.)
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ __all__ = [
 #:     S3 (1,0)   S2 (1,1)
 #:
 #: so S1 is S0's horizontal neighbour, S3 its vertical one and S2 its diagonal.
-#: The (64, 64) assembly and the cross-talk directions both read this.
+#: The cross-talk directions read this.
 SPAD_LAYOUT = {0: (0, 0), 1: (0, 1), 2: (1, 1), 3: (1, 0)}
 
 #: An extraction: given one file's ``(time_series, photon_counts)`` arrays,
@@ -111,84 +113,42 @@ def accumulate_frames(
 def count_map(
     path: str, tag: str, *, nframes: int, max_files: int | None = None
 ) -> tuple[np.ndarray, int]:
-    """Accumulate the per-pixel count map of one tag, or of all four quadrants.
+    """Accumulate the (32, 32) per-pixel count map of one program's files.
 
     Parameters
     ----------
     path : str
         Folder with the '.bin' files.
     tag : str
-        File tag, e.g. ``'ORT'``, ``'S0C'`` - or ``'S*C'`` / ``'S*T'`` for the
-        full (64, 64) sensor. Its last letter decides what a count is (see the
-        module docstring).
+        File tag, e.g. ``'ORT'``, ``'ORC'``, ``'S0C'``, ``'S2T'``. Its last
+        letter decides what a count is (see the module docstring).
     nframes : int
         Frames per file.
     max_files : int | None, optional
-        Use at most this many files (per quadrant). The default is None (all).
+        Use at most this many files. The default is None (all).
 
     Returns
     -------
     counts : np.ndarray
-        (32, 32), or (64, 64) for a ``*`` tag - NaN over a missing quadrant.
+        The (32, 32) map, float64.
     n_files : int
-        Files accumulated per pixel, so ``nframes * n_files`` frames each. The
-        four quadrants are cut to the same number of files, so every pixel of
-        a (64, 64) map shares one exposure and one rate normalisation.
+        Files accumulated, so ``nframes * n_files`` frames per pixel.
 
     Raises
     ------
     FileNotFoundError
-        Raised when no file (no quadrant, for a ``*`` tag) matches.
+        Raised when no file matches ``tag``.
     """
     timestamp = readout_mode(tag) == "timestamp"
     if timestamp:
         extract = lambda ts, pc: (ts > 0).sum(axis=2)  # noqa: E731
     else:
         extract = lambda ts, pc: pc.sum(axis=2)  # noqa: E731
-
-    def _fold(files: list[str], label: str) -> np.ndarray:
-        return accumulate_frames(
-            files,
-            extract,
-            nframes=nframes,
-            need_time_series=timestamp,
-            label=label,
-        )
-
-    if "*" not in tag:
-        files = io.find_bin_files(path, tag)[:max_files]
-        return _fold(files, tag), len(files)
-
-    # Quadrant tags need the separator, or 'S0C' would also match any name that
-    # merely contains those characters.
-    quadrants: dict[int, list[str]] = {}
-    for spad in SPAD_LAYOUT:
-        try:
-            quadrants[spad] = io.find_bin_files(
-                path, tag.replace("*", str(spad)), require_separator=True
-            )
-        except FileNotFoundError:
-            print(f"  (no '{tag.replace('*', str(spad))}' files - left as NaN)")
-    if not quadrants:
-        raise FileNotFoundError(f"No '{tag}' quadrant files in:\n  {path}")
-
-    n_files = min(len(f) for f in quadrants.values())
-    if max_files is not None:
-        n_files = min(n_files, max_files)
-    if any(len(f) != n_files for f in quadrants.values()) and max_files is None:
-        print(
-            f"  quadrants hold {sorted({len(f) for f in quadrants.values()})} "
-            f"file(s); using the first {n_files} of each so all share one "
-            "exposure."
-        )
-
-    full = np.full((64, 64), np.nan)
-    for spad, files in quadrants.items():
-        drow, dcol = SPAD_LAYOUT[spad]
-        full[drow::2, dcol::2] = _fold(
-            files[:n_files], tag.replace("*", str(spad))
-        )
-    return full, n_files
+    files = io.find_bin_files(path, tag)[:max_files]
+    counts = accumulate_frames(
+        files, extract, nframes=nframes, need_time_series=timestamp, label=tag
+    )
+    return counts, len(files)
 
 
 def code_histogram(

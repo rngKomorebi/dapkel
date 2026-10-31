@@ -68,8 +68,8 @@ fail `tests/test_api_surface.py`:
 - file discovery → `core.io.find_bin_files` (the frame count is never read off
   a file's size — it is the caller's `nframes`)
 - the accumulate-over-frames loop → `core.reduce.accumulate_frames`
-- a per-pixel count map of one tag, or of the four `S*C` / `S*T` quadrants
-  assembled into (64, 64) → `core.reduce.count_map`; what a count *is* for a tag
+- the (32, 32) per-pixel count map of one tag → `core.reduce.count_map`; what
+  a count *is* for a tag
   → `core.reduce.readout_mode`; the SPAD offsets inside a macropixel →
   `core.reduce.SPAD_LAYOUT`
 - the per-pixel TDC-code histogram → `core.reduce.code_histogram`
@@ -100,8 +100,8 @@ sizes and two different NaN policies.
 
 ## Two public functions, always save
 
-An analysis module has **exactly two public functions**, and its `__all__` is
-exactly those two:
+An analysis module has **two public functions**, and its `__all__` lists
+them:
 
 | function | signature | I/O |
 |---|---|---|
@@ -158,9 +158,8 @@ the two halves stay side by side for readers.
 
 ## Checklist
 
-- [ ] Exactly two public functions, `process_<x>` and `plot_<x>`, for the same `<x>`
-- [ ] `__all__` is exactly `["process_<x>", "plot_<x>"]`
-- [ ] At most ten private top-level functions
+- [ ] Two public functions, `process_<x>` and `plot_<x>`, for the same `<x>`, in `__all__`
+- [ ] Private helpers combined where they can be, not one per step
 - [ ] Module added to `ANALYSIS_MODULES` in `tests/test_api_surface.py`
 - [ ] Module added to `dapkel/functions/__init__.py` and to its `__all__`
 - [ ] No file discovery, accumulate loop, or figure skeleton reimplemented
@@ -269,14 +268,12 @@ def plot_afterpulsing(
 `tests/test_api_surface.py` enforces the rules most likely to be broken under
 time pressure:
 
-- an analysis module's `__all__` is exactly `process_<x>` and `plot_<x>`
-- it defines at most ten private top-level functions
 - `__all__` matches the module's actual public names
 - no function name is defined in two analysis modules
 - no module imports another dapkel module's `_private` names
 - artifact paths come from `core.store`, never hand-built `os.path.join`s
 
-The fourth is the anti-copy-paste guard. Together they are the reason this
+The second is the anti-copy-paste guard. Together they are the reason this
 contract is more than a suggestion — a checklist CI checks is a different object
 from a style note. They only apply to a module listed in `ANALYSIS_MODULES` in
 that test, so add yours there.

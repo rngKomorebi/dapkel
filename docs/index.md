@@ -23,7 +23,7 @@ The rule that keeps this honest: **`processed/` holds data, `results/` holds
 pictures, and stage 2 never re-unpacks `.bin` files.** Retrying a colormap costs
 a load, not a full re-read of the raw data.
 
-So every analysis module has exactly two public functions:
+So every analysis module has two public functions:
 
 | call | does | returns |
 |---|---|---|
@@ -37,7 +37,7 @@ So every analysis module has exactly two public functions:
 | `dcr_analysis` | `process_dcr` | `plot_dcr` |
 | `crosstalk_analysis` | `process_crosstalk` | `plot_crosstalk` |
 | `tdc_calibration` | `process_tdc_calibration` | `plot_tdc_calibration` |
-| `delta_t` | `process_delta_t` | `plot_delta_t` |
+| `coincidences` | `process_coincidences` | `plot_coincidences` |
 
 Shared code lives in [`dapkel.core`](api/core.md); retired code (the feather
 delta-t path, the dense per-clock TDC LUTs, the two-Gaussian fit, ...) is kept,
@@ -59,7 +59,7 @@ every other analysis in this package.
 - [Coincidences](guide/coincidences.md) — delta-t and timing jitter
 - [Background subtraction](guide/background_subtraction.md) — measure the
   accidental background by shifting frames instead of fitting it
-  (`subtract_background=True` in `delta_t`)
+  (`subtract_background=True` in `coincidences`)
 - [Data quality](guide/data_quality.md) — check the run before trusting it
 
 ## Reference

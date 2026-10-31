@@ -1,4 +1,4 @@
-"""The delta-t pipeline: 'process_delta_t' bins, 'plot_delta_t' fits.
+"""The delta-t pipeline: 'process_coincidences' bins, 'plot_coincidences' fits.
 
 Stage 1 bins every pair's differences onto a fixed native grid inside the
 acquisition loop and keeps only the counts. That is only worth having if the
@@ -27,7 +27,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 from dapkel.core import io, store, timing  # noqa: E402
-from dapkel.functions import delta_t as dt  # noqa: E402
+from dapkel.functions import coincidences as co  # noqa: E402
 
 # Two pixels per group, so 'all_pairs' gives four pair rows.
 PIXELS = [[(0, 0), (0, 1)], [(1, 0), (1, 1)]]
@@ -57,13 +57,13 @@ def bin_folder(tmp_path):
 def _run(path, **kwargs):
     """Run stage 1 uncalibrated, with the arguments these tests share."""
     kwargs.setdefault("apply_TDC_calibration", False)
-    return dt.process_delta_t(path, NFRAMES, PIXELS, **kwargs)
+    return co.process_coincidences(path, NFRAMES, PIXELS, **kwargs)
 
 
 def _counts_path(path, tag="ort"):
     return os.path.join(
         store.processed_dir(path, create=False),
-        f"{os.path.basename(path)}_{tag}_delta_counts.npy",
+        f"{os.path.basename(path)}_{tag}_coincidences.npy",
     )
 
 
@@ -84,7 +84,7 @@ def test_the_grid_is_exactly_the_histogram_of_the_code_differences(bin_folder):
 
     want = np.zeros_like(counts)
     for fp in io.find_bin_files(bin_folder, "ORT"):
-        ts, _ = dt.unpack(fp, NFRAMES, compute_time_series=True)
+        ts, _ = co.unpack(fp, NFRAMES, compute_time_series=True)
         for row, label in enumerate(LABELS):
             (ra, ca), (rb, cb) = (
                 tuple(int(v) for v in p.split(",")) for p in label.split("-")
@@ -129,7 +129,7 @@ def test_a_calibrated_run_uses_the_board_taps_on_a_finer_grid(bin_folder):
         )
     )
     assert meta["calibration"] == "D0_M0"
-    assert meta["grid_ps"] == pytest.approx(CODE_PS / dt._GRID_SUBDIV)
+    assert meta["grid_ps"] == pytest.approx(CODE_PS / co._GRID_SUBDIV)
     assert meta["n_outside"] == 0
 
 
@@ -158,7 +158,7 @@ def test_a_complete_artifact_is_not_silently_overwritten(bin_folder):
 def test_different_inputs_will_not_overwrite_without_rewrite(bin_folder):
     _run(bin_folder)
     with pytest.raises(FileExistsError, match="different inputs"):
-        dt.process_delta_t(
+        co.process_coincidences(
             bin_folder, NFRAMES, [[(2, 2)], [(3, 3)]], apply_TDC_calibration=False
         )
 
@@ -174,14 +174,14 @@ def test_two_programs_in_one_folder_keep_separate_artifacts(bin_folder):
     s0t = _run(bin_folder, tag="S0T")
 
     assert ort != s0t
-    assert os.path.basename(s0t).endswith("_s0t_delta_counts.npy")
+    assert os.path.basename(s0t).endswith("_s0t_coincidences.npy")
     assert store.read_meta(ort)["n_files"] == 6
     assert store.read_meta(s0t)["n_files"] == 3
 
 
 def _die_after(monkeypatch, n_files):
     """Make 'unpack' raise once it has decoded ``n_files`` files."""
-    real = dt.unpack
+    real = co.unpack
     calls = {"n": 0}
 
     def dying(*args, **kwargs):
@@ -190,14 +190,14 @@ def _die_after(monkeypatch, n_files):
             raise KeyboardInterrupt("simulated dead run")
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(dt, "unpack", dying)
+    monkeypatch.setattr(co, "unpack", dying)
     return real
 
 
 def test_an_interrupted_run_resumes_without_double_counting(
     bin_folder, monkeypatch
 ):
-    monkeypatch.setattr(dt, "_FLUSH_EVERY", 1)
+    monkeypatch.setattr(co, "_FLUSH_EVERY", 1)
     reference = np.load(_run(bin_folder))
     reference_total = store.read_meta(_counts_path(bin_folder))["total"]
 
@@ -211,7 +211,7 @@ def test_an_interrupted_run_resumes_without_double_counting(
     assert partial["complete"] is False
     assert partial["files_done"] == 3
 
-    monkeypatch.setattr(dt, "unpack", real)
+    monkeypatch.setattr(co, "unpack", real)
     resumed_path = _run(bin_folder)
     np.testing.assert_array_equal(np.load(resumed_path), reference)
     assert store.read_meta(resumed_path)["total"] == reference_total
@@ -222,13 +222,13 @@ def test_a_checkpoint_inconsistent_with_its_sidecar_is_not_resumed(
     bin_folder, monkeypatch
 ):
     """Resuming a newer array against an older sidecar would count files twice."""
-    monkeypatch.setattr(dt, "_FLUSH_EVERY", 1)
+    monkeypatch.setattr(co, "_FLUSH_EVERY", 1)
     reference = np.load(_run(bin_folder))
 
     real = _die_after(monkeypatch, 4)
     with pytest.raises(KeyboardInterrupt):
         _run(bin_folder, rewrite=True)
-    monkeypatch.setattr(dt, "unpack", real)
+    monkeypatch.setattr(co, "unpack", real)
 
     path = _counts_path(bin_folder)
     tampered = np.load(path)
@@ -275,11 +275,11 @@ def test_a_lag_shifts_group_b_by_whole_frames(tmp_path, monkeypatch):
     ts = np.zeros((32, 32, 4))
     ts[0, 0] = [10, 0, 30, 40]  # pixel A; 0 = did not fire
     ts[1, 0] = [0, 100, 200, 300]  # pixel B
-    monkeypatch.setattr(dt, "unpack", lambda fp, n, compute_time_series=True: (ts, None))
+    monkeypatch.setattr(co, "unpack", lambda fp, n, compute_time_series=True: (ts, None))
     (tmp_path / "ORT_0.bin").write_bytes(b"")
 
     counts = np.load(
-        dt.process_delta_t(
+        co.process_coincidences(
             str(tmp_path),
             4,
             [(0, 0), (1, 0)],
@@ -326,7 +326,7 @@ def test_rebinning_conserves_every_count_inside_the_window():
     grid = np.arange(-100, 101) * 10.0
     counts = np.arange(grid.size, dtype=np.int64)
 
-    binned, centres = dt._rebin(counts, grid, 50.0e-12, 500.0e-12)
+    binned, centres = co._rebin(counts, grid, 50.0e-12, 500.0e-12)
 
     inside = np.abs(grid) < centres.max() + 25.0
     assert binned.sum() == counts[inside].sum()
@@ -336,7 +336,7 @@ def test_rebinning_conserves_every_count_inside_the_window():
 def test_rebinning_onto_a_multiple_of_the_grid_is_a_plain_regrouping():
     """A 50 ps bin over a 10 ps grid is the sum of each run of five."""
     grid = np.arange(-50, 51) * 10.0
-    binned, _ = dt._rebin(np.ones(grid.size, dtype=np.int64), grid, 50e-12, 250e-12)
+    binned, _ = co._rebin(np.ones(grid.size, dtype=np.int64), grid, 50e-12, 250e-12)
 
     assert set(np.unique(binned[1:-1])) == {5}
 
@@ -346,7 +346,7 @@ def test_lag_planes_rebin_onto_shared_bins():
     grid = np.arange(-50, 51) * 10.0
     planes = np.vstack([np.ones(grid.size), 2 * np.ones(grid.size)])
 
-    binned, centres = dt._rebin(planes, grid, 50e-12, 250e-12)
+    binned, centres = co._rebin(planes, grid, 50e-12, 250e-12)
 
     assert binned.shape == (2, centres.size)
     np.testing.assert_array_equal(binned[1], 2 * binned[0])
@@ -363,11 +363,11 @@ def _continuous_grid(deltas, cell):
 def test_an_odd_number_of_cells_per_bin_rebins_exactly(cells):
     """Odd cells per bin puts the bin edges between cells, so nothing splits."""
     deltas = np.random.default_rng(3).normal(scale=400.0, size=50_000)
-    cell = CODE_PS / dt._GRID_SUBDIV
+    cell = CODE_PS / co._GRID_SUBDIV
     counts, centres = _continuous_grid(deltas, cell)
 
     width = cells * cell
-    got, bins = dt._rebin(counts, centres, width * 1e-12, 60 * width * 1e-12)
+    got, bins = co._rebin(counts, centres, width * 1e-12, 60 * width * 1e-12)
     edges = np.r_[bins - width / 2, bins[-1] + width / 2]
 
     np.testing.assert_array_equal(got, np.histogram(deltas, bins=edges)[0])
@@ -376,11 +376,11 @@ def test_an_odd_number_of_cells_per_bin_rebins_exactly(cells):
 def test_an_even_number_of_cells_per_bin_does_not():
     """The counterexample, pinned so the odd-cell rule is not lore."""
     deltas = np.random.default_rng(3).normal(scale=400.0, size=50_000)
-    cell = CODE_PS / dt._GRID_SUBDIV
+    cell = CODE_PS / co._GRID_SUBDIV
     counts, centres = _continuous_grid(deltas, cell)
 
     width = 10 * cell
-    got, bins = dt._rebin(counts, centres, width * 1e-12, 60 * width * 1e-12)
+    got, bins = co._rebin(counts, centres, width * 1e-12, 60 * width * 1e-12)
     want = np.histogram(deltas, bins=np.r_[bins - width / 2, bins[-1] + width / 2])[0]
 
     assert got.sum() == want.sum(), "counts are still conserved"
@@ -388,9 +388,9 @@ def test_an_even_number_of_cells_per_bin_does_not():
 
 
 def test_snapping_picks_an_odd_cell_count_and_a_whole_window(capsys):
-    cell = CODE_PS / dt._GRID_SUBDIV
+    cell = CODE_PS / co._GRID_SUBDIV
 
-    width, window = dt._snap_binning(71.0e-12, 10e-9, cell * 1e-12)
+    width, window = co._snap_binning(71.0e-12, 10e-9, cell * 1e-12)
 
     assert width * 1e12 / cell == pytest.approx(9.0)
     assert window / width == pytest.approx(round(window / width))
@@ -398,12 +398,12 @@ def test_snapping_picks_an_odd_cell_count_and_a_whole_window(capsys):
 
 
 def test_snapping_moves_an_even_request_off_the_even_count():
-    width, _ = dt._snap_binning(10 * 7.7e-12, 1000.0e-12, 7.7e-12)
+    width, _ = co._snap_binning(10 * 7.7e-12, 1000.0e-12, 7.7e-12)
     assert round(width / 7.7e-12) % 2 == 1
 
 
 def test_snapping_never_returns_a_zero_width():
-    width, window = dt._snap_binning(0.1e-12, 1.0e-12, 7.7e-12)
+    width, window = co._snap_binning(0.1e-12, 1.0e-12, 7.7e-12)
     assert width == pytest.approx(7.7e-12)
     assert window > 0
 
@@ -439,7 +439,7 @@ def test_subtraction_recovers_the_injected_pairs(tmp_path):
     nframes, n_pairs, lags = 200_000, 400, [0, 1, 2, 3, 4]
     counts, centres = _injected(nframes, n_pairs, seed=7, lags=lags)
 
-    sub = dt._subtract_background(
+    sub = co._subtract_background(
         counts,
         centres,
         [nframes - k for k in lags],
@@ -462,7 +462,7 @@ def test_subtraction_recovers_the_injected_pairs(tmp_path):
 
 def test_a_lag_that_saw_fewer_frames_is_scaled_up_not_averaged_in():
     counts = np.array([[0, 0, 100, 0, 0], [0, 0, 50, 0, 0]])
-    out = dt._subtract(counts, np.arange(5.0) - 2, [1000, 500])
+    out = co._subtract(counts, np.arange(5.0) - 2, [1000, 500])
 
     assert out["background"][2] == pytest.approx(100.0)
     assert out["residual"][2] == pytest.approx(0.0)
@@ -473,7 +473,7 @@ def test_the_background_is_the_mean_of_the_lags_not_the_sum():
     counts = np.zeros((5, 3), dtype=np.int64)
     counts[0, 1] = 500
     counts[1:, 1] = 400
-    out = dt._subtract(counts, np.array([-1.0, 0.0, 1.0]), [1000] * 5)
+    out = co._subtract(counts, np.array([-1.0, 0.0, 1.0]), [1000] * 5)
 
     assert out["k"] == 4
     assert out["residual"][1] == pytest.approx(100.0)
@@ -488,7 +488,7 @@ def test_the_model_free_count_sums_the_window_and_adds_errors_in_quadrature(
     counts[1:] = 10
     centres = (np.arange(7) - 3) * 100.0  # -300..300 ps
 
-    sub = dt._subtract_background(
+    sub = co._subtract_background(
         counts,
         centres,
         [1000] * 3,
@@ -516,7 +516,7 @@ def test_the_model_free_count_sums_the_window_and_adds_errors_in_quadrature(
 
 def test_plot_returns_counts_centres_and_a_fit(bin_folder):
     _run(bin_folder)
-    counts, centres, fit = dt.plot_delta_t(
+    counts, centres, fit = co.plot_coincidences(
         bin_folder, bin_width_s=4 * CODE_S, plot_window_s=2400 * CODE_S, label="test"
     )
 
@@ -525,7 +525,7 @@ def test_plot_returns_counts_centres_and_a_fit(bin_folder):
     assert os.path.isfile(
         os.path.join(
             store.results_dir(bin_folder, "coincidences", create=False),
-            f"{os.path.basename(bin_folder)}_ort_test_delta_counts.png",
+            f"{os.path.basename(bin_folder)}_ort_test_coincidences.png",
         )
     )
     plt.close("all")
@@ -535,11 +535,11 @@ def test_plot_pools_only_the_requested_pairs(bin_folder, capsys):
     grid = np.load(_run(bin_folder))
     kwargs = dict(bin_width_s=3 * CODE_S, plot_window_s=300 * CODE_S, label="test")
 
-    every, _, _ = dt.plot_delta_t(bin_folder, **kwargs)
-    one, centres, _ = dt.plot_delta_t(bin_folder, pairs=[LABELS[0], "9,9-9,9"], **kwargs)
+    every, _, _ = co.plot_coincidences(bin_folder, **kwargs)
+    one, centres, _ = co.plot_coincidences(bin_folder, pairs=[LABELS[0], "9,9-9,9"], **kwargs)
     meta = store.read_meta(_counts_path(bin_folder))
     cells = (np.arange(grid.shape[1]) - meta["zero_index"]) * meta["grid_ps"]
-    want, _ = dt._rebin(grid[0], cells, 3 * CODE_S, 300 * CODE_S)
+    want, _ = co._rebin(grid[0], cells, 3 * CODE_S, 300 * CODE_S)
 
     np.testing.assert_array_equal(one, want)
     assert every.sum() >= one.sum()
@@ -552,11 +552,11 @@ def test_a_lagged_artifact_plots_lag_zero_without_a_subtraction(bin_folder):
     grid = np.load(_run(bin_folder, subtract_background=True, background_lags=(1, 2)))
     meta = store.read_meta(_counts_path(bin_folder))
 
-    counts, _, _ = dt.plot_delta_t(
+    counts, _, _ = co.plot_coincidences(
         bin_folder, bin_width_s=3 * CODE_S, plot_window_s=200 * CODE_S, label="test"
     )
     cells = (np.arange(grid.shape[-1]) - meta["zero_index"]) * meta["grid_ps"]
-    lag0, _ = dt._rebin(grid[0].sum(axis=0), cells, 3 * CODE_S, 200 * CODE_S)
+    lag0, _ = co._rebin(grid[0].sum(axis=0), cells, 3 * CODE_S, 200 * CODE_S)
 
     np.testing.assert_array_equal(counts, lag0)
     plt.close("all")
@@ -565,7 +565,7 @@ def test_a_lagged_artifact_plots_lag_zero_without_a_subtraction(bin_folder):
 def test_subtracting_needs_an_artifact_with_lag_planes(bin_folder):
     _run(bin_folder)
     with pytest.raises(ValueError, match="lag planes"):
-        dt.plot_delta_t(bin_folder, subtract_background=True, label="test")
+        co.plot_coincidences(bin_folder, subtract_background=True, label="test")
 
 
 def test_the_fit_model_follows_the_histogram_and_is_not_a_parameter(bin_folder):
@@ -573,13 +573,13 @@ def test_the_fit_model_follows_the_histogram_and_is_not_a_parameter(bin_folder):
     _run(bin_folder, subtract_background=True, background_lags=(1, 2))
     kwargs = dict(bin_width_s=4 * CODE_S, plot_window_s=200 * CODE_S, label="test")
 
-    _, _, raw = dt.plot_delta_t(bin_folder, **kwargs)
-    _, _, residual = dt.plot_delta_t(bin_folder, subtract_background=True, **kwargs)
+    _, _, raw = co.plot_coincidences(bin_folder, **kwargs)
+    _, _, residual = co.plot_coincidences(bin_folder, subtract_background=True, **kwargs)
 
     assert "half_base" in raw
     assert "half_base" not in residual
     assert "model_free" in residual
-    assert "background" not in inspect.signature(dt.plot_delta_t).parameters
+    assert "background" not in inspect.signature(co.plot_coincidences).parameters
     plt.close("all")
 
 
@@ -587,7 +587,7 @@ def test_the_subtracted_plot_returns_the_residual_and_writes_both_figures(
     bin_folder,
 ):
     _run(bin_folder, subtract_background=True, background_lags=(1, 2, 3))
-    counts, centres, fit = dt.plot_delta_t(
+    counts, centres, fit = co.plot_coincidences(
         bin_folder,
         bin_width_s=4 * CODE_S,
         plot_window_s=200 * CODE_S,
@@ -603,7 +603,7 @@ def test_the_subtracted_plot_returns_the_residual_and_writes_both_figures(
 
     results = store.results_dir(bin_folder, "coincidences", create=False)
     name = os.path.basename(bin_folder)
-    assert os.path.isfile(os.path.join(results, f"{name}_ort_test_delta_counts_sub.png"))
+    assert os.path.isfile(os.path.join(results, f"{name}_ort_test_coincidences_sub.png"))
     assert os.path.isfile(
         os.path.join(results, f"{name}_ort_test_background_subtraction.png")
     )
@@ -618,7 +618,7 @@ def test_a_gaussian_on_a_triangle_is_recovered():
     y = y + truth["bkg"] * np.clip(1 - np.abs(x) / truth["hb"], 0, None)
     y = np.random.default_rng(5).poisson(y).astype(float)
 
-    fit = dt._fit_peak(x, y, half_base=95_000.0)
+    fit = co._fit_peak(x, y, half_base=95_000.0)
 
     assert fit["ok"]
     assert fit["sigma"] == pytest.approx(truth["sigma"], rel=0.1)
@@ -630,5 +630,5 @@ def test_a_flat_fit_that_cannot_determine_a_width_says_so():
     """No curve is drawn for a failed fit, so it must warn rather than go quiet."""
     x = np.arange(-50.0, 51.0)
     with pytest.warns(RuntimeWarning, match="did not converge"):
-        fit = dt._fit_peak(x, np.zeros_like(x), fit_window=20.0)
+        fit = co._fit_peak(x, np.zeros_like(x), fit_window=20.0)
     assert not fit["ok"]

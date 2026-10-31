@@ -112,8 +112,7 @@ def map_file_name(dataset: str, kind: str, tag: str = "") -> str:
         Analysis name (e.g. ``'dcr'``, ``'hitmap'``, ``'crosstalk'``).
     tag : str, optional
         Readout/quadrant tag distinguishing artifacts of the same kind. The
-        default is "". Lower-cased, with the quadrant wildcard ``*`` written as
-        ``x`` (``'S*C'`` -> ``'sxc'``) since no file system takes a ``*``.
+        default is "". Lower-cased, so ``'ORT'`` and ``'ort'`` are one file.
 
     Returns
     -------
@@ -121,7 +120,7 @@ def map_file_name(dataset: str, kind: str, tag: str = "") -> str:
         ``'<dataset>_<tag>_<kind>.npy'``, or ``'<dataset>_<kind>.npy'`` when
         no tag is given.
     """
-    tag = tag.lower().replace("*", "x").strip("_")
+    tag = tag.lower().strip("_")
     parts = [dataset, tag, kind] if tag else [dataset, kind]
     return "_".join(parts) + ".npy"
 

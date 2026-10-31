@@ -6,11 +6,11 @@ The four SPADs of a macropixel are indexed CLOCKWISE, not row-major::
     S3 (1,0)   S2 (1,1)
 
 so S1 is S0's horizontal neighbour, S3 its vertical neighbour, and S2 its
-diagonal one. This is encoded once, in 'core.reduce.SPAD_LAYOUT', which both
-the (64, 64) quadrant assembly and the cross-talk directions read. A swap of S2
-and S3 is silent - the arrays keep their shape and the plots still render, but
-vertical and diagonal cross-talk get each other's labels and cells - so the
-layout is pinned here against an independent spelling of it.
+diagonal one. This is encoded once, in 'core.reduce.SPAD_LAYOUT', which the
+cross-talk directions read. A swap of S2 and S3 is silent - the arrays keep
+their shape and the plots still render, but vertical and diagonal cross-talk
+get each other's labels and cells - so the layout is pinned here against an
+independent spelling of it.
 """
 
 from __future__ import annotations

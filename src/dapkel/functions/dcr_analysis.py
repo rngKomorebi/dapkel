@@ -10,7 +10,6 @@ collecting. That live time is NOT the frame period: under the current
 
 What a count is follows from the tag ('core.reduce'): the photon counter for
 ``...C`` programs, frames carrying a valid timestamp for ``...T`` ones.
-``'S*C'`` / ``'S*T'`` assemble the four quadrants into the (64, 64) sensor.
 In timestamp mode only the *first* dark count of a frame is recorded, so the
 rate saturates at one per ``open_shutter_time_s`` (125 kcps at an 8 µs window)
 and under-reports below it; ``pileup_correct=True`` inverts that censoring
@@ -54,8 +53,7 @@ def process_dcr(
     nframes : int
         Frames the acquisition recorded per '.bin' file.
     tag : str
-        File tag: ``'S0C'``... ``'S3C'``, ``'S0T'``..., ``'ORT'`` - or
-        ``'S*C'`` / ``'S*T'`` for the full (64, 64) sensor.
+        File tag: ``'S0C'``... ``'S3C'``, ``'S0T'``..., ``'ORC'``, ``'ORT'``.
     pileup_correct : bool, optional
         Timestamp tags only. Each frame is a Bernoulli trial - a frame fires
         with ``p = 1 - exp(-r * w)`` because only the first count is recorded -
@@ -73,7 +71,7 @@ def process_dcr(
         Exposure requested of ``'long_exposure'`` firmware, in seconds. The
         default is None.
     max_files : int | None, optional
-        Use at most this many files (per quadrant). The default is None (all).
+        Use at most this many files. The default is None (all).
 
     Returns
     -------

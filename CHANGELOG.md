@@ -14,9 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   saves its artifact under `processed/`; `plot_<x>(path, tag, ...)` loads it and
   writes the figures. Everything else is private, and code no pipeline used is
   moved, verbatim, to `archive/` at the repository root (reference only, not
-  packaged or tested). `tests/test_api_surface.py` now enforces the pair, and
-  caps each module at ten private functions. Entries further down this section
-  describe the pre-restructure API.
+  packaged or tested). `delta_t` is renamed `coincidences`. Entries further
+  down this section describe the pre-restructure API.
 
   | module | was | is |
   | --- | --- | --- |
@@ -25,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `crosstalk_analysis` | `compute_crosstalk`, `compute_and_save_crosstalk`, `collect_and_plot_crosstalk`, `combine_directional_crosstalk`, 4 × `plot_ct_*` | `process_crosstalk`, `plot_crosstalk` |
   | `data_quality` | `collect_time_mat`, `plot_time_code_histogram` | `process_time_codes`, `plot_time_codes` |
   | `tdc_calibration` | 12 functions over two calibration models | `process_tdc_calibration`, `plot_tdc_calibration` |
-  | `delta_t` | 15 functions over two stage-1 paths | `process_delta_t`, `plot_delta_t` |
+  | `delta_t` → `coincidences` | 15 functions over two stage-1 paths | `process_coincidences`, `plot_coincidences` |
 
   Details worth knowing when porting a script:
 
@@ -33,18 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     programs count frames carrying a timestamp, `...C` programs sum the photon
     counter. The `mode` parameter is gone, and with it the tag/mode mismatch that
     inflated a timestamp-mode DCR ~50x. A tag ending in neither letter raises.
-  - **32 or 64 is the tag, not a second function**: `'S*C'` / `'S*T'` assemble
-    the four quadrants into the (64, 64) map (saved as `..._sxc_...`). The
-    quadrants are cut to a common file count, so all pixels share one exposure,
-    and a missing quadrant is NaN rather than zero.
-  - **`process_delta_t(path, nframes, pixels, ...)`** - `nframes` is now the
-    second positional argument, as in every `process_*`. `plot_delta_t(path,
-    tag)` finds the grid from the tag; `counts_path`, `npy_path` and `reuse`
-    are gone. Verified on 30 files of the 2026.09.14 SPDC run: the new grid is
+  - **Every map is (32, 32)**, one program per tag (`ORT`, `ORC`, `S<n>T`,
+    `S<n>C`). The `_32` / `_64` variants are gone; the (64, 64) quadrant
+    assembly is archived (`archive/core/reduce.py`).
+  - **`delta_t` is now `coincidences`**: `process_coincidences(path, nframes,
+    pixels, ...)` - `nframes` is the second positional argument, as in every
+    `process_*` - and `plot_coincidences(path, tag)`, which finds the grid from
+    the tag; `counts_path`, `npy_path` and `reuse` are gone. The grid is saved
+    as `<name>_<tag>_coincidences.npy` (was `_delta_counts.npy`) and the
+    figures as `<name>_<tag>_<label>_coincidences[_sub].png`. Verified on 30 files of the 2026.09.14 SPDC run: the new grid is
     bin-for-bin identical to `calculate_and_save_delta_counts` (5 lag planes x
     81 pairs, raw and calibrated), and the fits and model-free count match to
     every printed digit.
-  - **`plot_hitmap` returns the rate map** (Hz) rather than the counts.
+  - **`plot_hitmap` returns `(counts, rate)`** and saves both maps.
   - **`process_crosstalk` on a parent folder** processes each pairing
     sub-folder and saves the combined (64, 64) directional map; `plot_crosstalk`
     draws whichever was saved. The artifact is named by the batch prefix
@@ -52,7 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **`data_quality` saves** the (32, 32, n_codes) per-pixel code histogram,
     so any pixel can be inspected without re-reading the run.
   - **Background subtraction is unchanged in behaviour** but no longer a
-    module: it is private to `delta_t`, still driven by `subtract_background`.
+    module: it is private to `coincidences`, still driven by
+    `subtract_background`.
 - **BREAKING: the TDC calibration is the compact 8-tap form only.** One
   (32, 32, 8) table per SPAD serves every clock, and is applied by the new
   `core.calibration.codes_to_ps` straight from the tap widths - there is no LUT
@@ -80,7 +81,9 @@ Moved to `archive/` (code and its tests, verbatim from commit 6b49a4b):
   `archive/calibration_data/`.
 - the **two-Gaussian peak model** (`two_gaussians_on_triangle`,
   `fit_two_gaussians_on_triangle`), which no pipeline called.
-- `calc_diff` (within-frame differencing is the lag-0 case of `delta_t`'s
+- the **(64, 64) full-sensor assembly** of the four quadrant programs
+  (`archive/core/reduce.py:count_map_64`); every program reads 32 x 32.
+- `calc_diff` (within-frame differencing is the lag-0 case of `coincidences`'
   frame-shifted differencing), `core.timing.resolve_cycle_time`,
   `resolve_frame_time`, `CLK_PERIOD`, `MAX_DELTA_S`, `core.pairs.pair_labels`
   and `core.io.frames_in_file`.

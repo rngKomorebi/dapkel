@@ -13,7 +13,7 @@ None open at the moment. Three items used to sit here and under *Known and not f
 stage 1 should keep its feather parts, the combined feather or both; the ~9×
 disk cost of `subtract_background` on the feather path; and the feather path's
 under-filled outermost bins. All three were about the per-event feather path,
-which is now retired to `archive/`; `process_delta_t`'s counts grid has none of
+which is now retired to `archive/`; `process_coincidences`'s counts grid has none of
 them — its checkpoint *is* its artifact, a lag costs one small grid plane, and
 its bins are centred on zero whatever the window.
 
@@ -60,6 +60,6 @@ and one Gaussian returns the area-weighted average of the two.
 Before reading anything into a two-component fit, rule out the mundane
 explanation: `all_pairs` pools pairs whose true delay differs, so a spread in
 per-pair `mu` would broaden the pooled peak on its own. Fit the pairs
-separately first (`plot_delta_t(..., pairs=[...])`) and compare their centres.
+separately first (`plot_coincidences(..., pairs=[...])`) and compare their centres.
 The package's two-Gaussian (narrow core on broad tails) fit is retired to
-`archive/`; fit the `counts` and `centers` `plot_delta_t` returns by hand.
+`archive/`; fit the `counts` and `centers` `plot_coincidences` returns by hand.

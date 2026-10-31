@@ -4,7 +4,7 @@ The ORT accidental background is a **triangle** filling ± one TDC full scale
 (one reference-clock period: 20 ns at 50 MHz, 100 ns at 10 MHz, 500 ns at
 2 MHz), and it sits
 directly under the coincidence peak — [why](../ort_triangle_background.md).
-Fitting it is possible — it is what [`plot_delta_t`][dapkel.functions.delta_t.plot_delta_t]
+Fitting it is possible — it is what [`plot_coincidences`][dapkel.functions.coincidences.plot_coincidences]
 does on a raw histogram — but then the coincidence count you report depends on a
 model: on the triangle really being a triangle, on the peak really being a
 Gaussian, and on the fitter separating the two.
@@ -12,8 +12,8 @@ Gaussian, and on the fitter separating the two.
 Background subtraction measures the background instead of modelling it. It is
 part of the [delta-t pipeline](coincidences.md), switched on with one parameter,
 `subtract_background=True`, on each of its two functions:
-[`process_delta_t`][dapkel.functions.delta_t.process_delta_t] histograms the
-shifted frames, `plot_delta_t` subtracts them.
+[`process_coincidences`][dapkel.functions.coincidences.process_coincidences] histograms the
+shifted frames, `plot_coincidences` subtracts them.
 
 ## The idea
 
@@ -30,13 +30,13 @@ the lag-0 histogram can hold a true pair. Subtract, and the triangle cancels
 bin-for-bin.
 
 ```python
-from dapkel.functions import delta_t as dt
+from dapkel.functions import coincidences as co
 
 signal = [(6, 10), (6, 11), (7, 10), (7, 11)]     # blobs off the hitmap
 idler  = [(21, 22), (21, 23), (22, 22), (22, 23)]
 
 # Stage 1: one pass over the '.bin' files, histogramming lag 0 and lags 1..8.
-dt.process_delta_t(
+co.process_coincidences(
     path, 10_000, [signal, idler],
     tag="S0T",
     apply_TDC_calibration=False,
@@ -44,7 +44,7 @@ dt.process_delta_t(
 )
 
 # Stage 2: subtract, fit the residual, plot both figures.
-counts, centers, fit = dt.plot_delta_t(
+counts, centers, fit = co.plot_coincidences(
     path,
     tag="S0T",
     subtract_background=True,
@@ -75,7 +75,7 @@ path also supported it, at one column set per lag; it is in the repository's
 With it True the artifact grows a leading lag axis, and plane 0 is bin-for-bin
 identical to what the plain run writes. That identity is a test, not a claim
 (`test_lag_zero_plane_is_the_unsubtracted_histogram`). So one artifact answers
-both questions: `plot_delta_t` on it without `subtract_background` fits lag 0
+both questions: `plot_coincidences` on it without `subtract_background` fits lag 0
 exactly as before, and switching the parameter on cannot change the unsubtracted
 number you already reported.
 
@@ -103,7 +103,7 @@ period — not by the analysis. Nothing downstream of the camera can change it.
   it separates *"too many accidentals"* (a rate problem, fix the optics or the
   frame length) from *"a systematic"* (a detector or decoding problem).
 
-That middle check is why `plot_delta_t` writes a **three-panel** figure whose
+That middle check is why `plot_coincidences` writes a **three-panel** figure whose
 middle panel is the residual over the plotted window — the whole support unless
 you narrow `plot_window_s` — rather than just around the peak,
 and why it prints the check whether or not you look at the figure:
@@ -157,10 +157,10 @@ not appear in `background_lags`.
 
 ```
 processed/
-  <dataset>_<tag>_delta_counts.npy   <- (n_lags, n_pairs, n_bins) int64, lag 0 first
-  <dataset>_<tag>_delta_counts.meta.json <- lags, frames_used, labels, progress
+  <dataset>_<tag>_coincidences.npy   <- (n_lags, n_pairs, n_bins) int64, lag 0 first
+  <dataset>_<tag>_coincidences.meta.json <- lags, frames_used, labels, progress
 results/coincidences/
-  <dataset>_<tag>_<label>_delta_counts_sub.png         <- the fitted residual
+  <dataset>_<tag>_<label>_coincidences_sub.png         <- the fitted residual
   <dataset>_<tag>_<label>_background_subtraction.png   <- the three-panel diagnostic
 ```
 
@@ -217,6 +217,6 @@ whole-support integral is not a second, independent estimate of the same number.
 ## API
 
 Both switches are parameters of the delta-t functions —
-[`process_delta_t`][dapkel.functions.delta_t.process_delta_t] and
-[`plot_delta_t`][dapkel.functions.delta_t.plot_delta_t]; see
+[`process_coincidences`][dapkel.functions.coincidences.process_coincidences] and
+[`plot_coincidences`][dapkel.functions.coincidences.plot_coincidences]; see
 [Coincidences](coincidences.md#api).

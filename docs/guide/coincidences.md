@@ -5,23 +5,23 @@ A daplis-style pipeline for coincidence / timing-jitter analysis of the Kelpie
 
 1. [`unpack`](unpack.md) decodes each `.bin` file into the per-frame, per-pixel
    TDC code (`time_series`, the MATLAB `time_mat`).
-2. [`process_delta_t`][dapkel.functions.delta_t.process_delta_t] converts the
+2. [`process_coincidences`][dapkel.functions.coincidences.process_coincidences] converts the
    codes of the chosen pixels to picoseconds, differences every pixel pair frame
    by frame, and bins the differences onto a fixed native grid as it finds them,
    saving only the counts to `processed/`.
-3. [`plot_delta_t`][dapkel.functions.delta_t.plot_delta_t] rebins that grid in
+3. [`plot_coincidences`][dapkel.functions.coincidences.plot_coincidences] rebins that grid in
    memory, fits the coincidence peak and saves the figure to
    `results/coincidences/`.
 
 ```python
-from dapkel.functions import delta_t as dt
+from dapkel.functions import coincidences as co
 
 signal = [(6, 10), (6, 11), (7, 10)]     # blobs read off the hitmap
 idler = [(21, 22), (21, 23), (22, 22)]
 
-dt.process_delta_t(path, 10_000, [signal, idler],
+co.process_coincidences(path, 10_000, [signal, idler],
                    daughterboard_number="D0", motherboard_number="M0")
-counts, centers, fit = dt.plot_delta_t(path)
+counts, centers, fit = co.plot_coincidences(path)
 ```
 
 `pixels` is two groups `[group_a, group_b]`; a bare `(row, col)` is a one-pixel
@@ -100,7 +100,7 @@ counter. Fitting a Gaussian on a *flat* background over a wide window therefore
 inflates the fitted sigma — you measure the background's slope as if it were
 jitter.
 
-**`plot_delta_t` picks the model for you, and takes no `background`
+**`plot_coincidences` picks the model for you, and takes no `background`
 argument.** The pedestal is either still in the histogram, and then it is the
 triangle, or `subtract_background=True` has measured it away and the residual is
 flat about zero — one decision, not two:
@@ -114,7 +114,7 @@ A fit that fails — including one whose sigma the covariance cannot tell from
 zero, which a wrong background model produces — comes back with `fit["ok"]`
 False and a `RuntimeWarning`, so a plot without a curve always says why.
 
-`plot_delta_t` returns `(counts, centers, fit)`: the fitted histogram, the bin
+`plot_coincidences` returns `(counts, centers, fit)`: the fitted histogram, the bin
 centres in picoseconds and a dict of `amp`, `mu`, `sigma`, `fwhm`,
 `jitter_per_detector` (sigma / √2), each with its `_err`, the background level
 `bkg`, `car` (peak-to-background, raw histogram only), `n` and `ok` — enough to
@@ -137,13 +137,13 @@ peak-shaped histogram — it is simply meaningless. See
 
 ## Stage 1: histogram straight off the `.bin`
 
-`process_delta_t` bins the differences onto a fixed native grid as it finds
+`process_coincidences` bins the differences onto a fixed native grid as it finds
 them and keeps only the counts:
 
 ```
 processed/
-  <dataset>_<tag>_delta_counts.npy       <- (n_pairs, n_cells) int64, tag lower-cased
-  <dataset>_<tag>_delta_counts.meta.json <- grid, pair labels, totals, progress
+  <dataset>_<tag>_coincidences.npy       <- (n_pairs, n_cells) int64, tag lower-cased
+  <dataset>_<tag>_coincidences.meta.json <- grid, pair labels, totals, progress
 ```
 
 The size is set by the **grid**, not by the data. A 256-pair run on the default
@@ -176,7 +176,7 @@ under-sized grid announces itself instead of quietly clipping the triangle.
 nothing is read but the one saved array:
 
 ```python
-dt.plot_delta_t(
+co.plot_coincidences(
     path,
     pairs=["6,10-21,22"],
     bin_width_s=71e-12,
@@ -201,7 +201,7 @@ cosmetic:
 So this is not an approximation of a histogram of the raw differences — it is
 the same histogram, in every bin.
 
-The figure is `results/coincidences/<dataset>_<tag>_<label>_delta_counts.png`,
+The figure is `results/coincidences/<dataset>_<tag>_<label>_coincidences.png`,
 `label` (default `"spdc"`) also heading the title.
 
 ### What you give up
@@ -219,7 +219,7 @@ a parameter — checkpoint cadence cannot change the numbers), so a run that die
 leaves a valid artifact covering everything up to its last checkpoint, and the
 next call resumes from it (`resume=True`, the default) when it was computed from
 the same inputs — files, pairs, mode, grid, calibration and lags. There is only
-ever one file, so two runs cannot interleave. `plot_delta_t` on an incomplete
+ever one file, so two runs cannot interleave. `plot_coincidences` on an incomplete
 artifact plots what is there and says how many files it covers.
 
 The sidecar records `files_done` and `total_in_grid`. The array is moved into
@@ -229,7 +229,7 @@ the total. The resume path checks the array against `total_in_grid` and starts
 over rather than continue from something inconsistent.
 
 A *complete* artifact, or one computed from different inputs, is never touched
-without `rewrite=True` — `process_delta_t` raises `FileExistsError` instead.
+without `rewrite=True` — `process_coincidences` raises `FileExistsError` instead.
 
 ### Measuring the background instead of fitting it
 
@@ -240,10 +240,10 @@ subtracted bin-for-bin rather than fitted — see
 
 ```python
 # the lags cost one small grid plane each; the .bin decoding is paid once
-dt.process_delta_t(path, 10_000, [signal, idler],
+co.process_coincidences(path, 10_000, [signal, idler],
                    daughterboard_number="D0", motherboard_number="M0",
                    subtract_background=True)
-counts, centers, fit = dt.plot_delta_t(
+counts, centers, fit = co.plot_coincidences(
     path, subtract_background=True, fit_window_s=2e-9)
 ```
 
@@ -257,7 +257,7 @@ proceeding:
 
 ```
 !!  rewrite=True - the following data WILL BE OVERWRITTEN:
-!!    .../processed/SPDC_ort_delta_counts.npy  (106.0 MB, written 2026-07-30 02:11)
+!!    .../processed/SPDC_ort_coincidences.npy  (106.0 MB, written 2026-07-30 02:11)
 !!  Press Ctrl-C within 5 s to abort and copy it somewhere safe.
 ```
 
@@ -269,4 +269,4 @@ pipeline that has its own guard.
 
 ## API
 
-::: dapkel.functions.delta_t
+::: dapkel.functions.coincidences
