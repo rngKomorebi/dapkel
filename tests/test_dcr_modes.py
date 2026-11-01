@@ -1,12 +1,11 @@
-"""Guards on the counting/timestamping split in 'dcr_analysis'.
+"""Guards on the counting/timestamping split, and the DCR built on it.
 
 Under the ``S*T``/``ORT`` timestamping programs there is no photon counter -
 'unpack' returns the low bits of the coarse timestamp in that slot. Summing it
 as if it were a count inflates the DCR by ~40-50x, and the resulting map still
-looks like a plausible DCR map, so nothing downstream catches it. These tests
-pin the three things that keep it caught: the extraction is chosen by ``mode``,
-a tag whose letter contradicts ``mode`` is rejected, and the pile-up inversion
-is the exact inverse of the one-hit-per-frame censoring.
+looks plausible, so nothing downstream catches it. The count mode is therefore
+not a parameter at all: it is read off the tag ('core.reduce.readout_mode').
+These tests pin that, and the pile-up inversion being the exact inverse of the one-hit-per-frame censoring.
 """
 
 from __future__ import annotations
@@ -14,176 +13,115 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from dapkel.core import reduce, store
 from dapkel.functions import dcr_analysis
 
 # --------------------------------------------------------------------------
-# mode <-> tag agreement
+# the tag decides what a count is
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("tag", ["S0T", "S3T", "ORT", "s0t"])
-def test_timestamp_tag_rejects_count_mode(tag):
-    """The mistake this whole module exists to prevent."""
-    with pytest.raises(ValueError, match="timestamp-mode"):
-        dcr_analysis._check_mode("count", tag)
+@pytest.mark.parametrize("tag", ["S0T", "S3T", "ORT", "s0t", "ORT_2"])
+def test_timestamping_tags_count_frames(tag):
+    assert reduce.readout_mode(tag) == "timestamp"
 
 
 @pytest.mark.parametrize("tag", ["S0C", "S3C", "ORC"])
-def test_count_tag_rejects_timestamp_mode(tag):
-    with pytest.raises(ValueError, match="count-mode"):
-        dcr_analysis._check_mode("timestamp", tag)
+def test_counting_tags_sum_the_counter(tag):
+    assert reduce.readout_mode(tag) == "count"
 
 
-@pytest.mark.parametrize(
-    "mode, tag",
-    [
-        ("count", "S0C"),
-        ("count", "ORC"),
-        ("count", ""),  # '' matches every file: nothing to contradict
-        ("timestamp", "S0T"),
-        ("timestamp", "ORT"),
-        ("timestamp", ""),
-        ("count", "SPAD0"),  # tag with no mode letter at all
-    ],
-)
-def test_consistent_combinations_pass(mode, tag):
-    dcr_analysis._check_mode(mode, tag)
-
-
-def test_unknown_mode_is_rejected():
-    with pytest.raises(ValueError, match="'timestamp' or 'count'"):
-        dcr_analysis._check_mode("counts")
-
-
-def test_quadrant_tag_respells_the_layout_keys():
-    """'_SPAD_LAYOUT' is keyed by the counting tags; 'T' data is the same grid."""
-    assert dcr_analysis._quadrant_tag("S2C", "timestamp") == "S2T"
-    assert dcr_analysis._quadrant_tag("S2C", "count") == "S2C"
+@pytest.mark.parametrize("tag", ["", "SPAD0_S0", "run"])
+def test_a_tag_without_a_program_letter_is_refused(tag):
+    """Guessing here is exactly the ~50x mistake, so it is an error."""
+    with pytest.raises(ValueError, match="neither a timestamping"):
+        reduce.readout_mode(tag)
 
 
 # --------------------------------------------------------------------------
-# which field each mode reads
+# which field each mode reads - through the real 'process_dcr'
 # --------------------------------------------------------------------------
 
+NFRAMES = 8
+WINDOW_S = 1e-6
 
-def _fake_frames(nframes=8):
-    """One pixel fires in half the frames; the counter field is timestamp junk.
 
-    Shaped like 'unpack' output: ``(32, 32, nframes)`` timestamps and counts.
+def _fake_unpack(monkeypatch, fires=range(0, NFRAMES, 2)):
+    """One pixel fires in the given frames; its counter field is timestamp junk.
+
+    Patched where 'core.reduce' looks it up, so the analyses run unmodified.
     """
-    ts = np.zeros((32, 32, nframes))
-    pc = np.zeros((32, 32, nframes))
-    fired = np.arange(0, nframes, 2)
+    ts = np.zeros((32, 32, NFRAMES))
+    pc = np.zeros((32, 32, NFRAMES))
+    fired = list(fires)
     ts[5, 7, fired] = 900.0  # a valid, late timestamp
     pc[5, 7, fired] = 450.0  # what those same bits look like as a "count"
-    return ts, pc
-
-
-def test_modes_read_different_fields(monkeypatch):
-    nframes, frame_time = 8, 1e-6
-    ts, pc = _fake_frames(nframes)
     monkeypatch.setattr(
-        "dapkel.core.reduce.unpack",
-        lambda fp, n, compute_time_series=True: (ts, pc),
+        "dapkel.core.reduce.unpack", lambda fp, n, compute_time_series=True: (ts, pc)
     )
 
-    live = nframes * frame_time
-    timestamped = dcr_analysis._accumulate_dcr(
-        ["fake.bin"], nframes, frame_time, mode="timestamp"
+
+def _dcr(tmp_path, tag, n_files=1, **kwargs):
+    for i in range(n_files):
+        (tmp_path / f"run_{tag}_{i}.bin").write_bytes(b"")
+    dcr_analysis.process_dcr(
+        str(tmp_path), NFRAMES, tag, open_shutter_time_s=WINDOW_S, **kwargs
     )
-    counted = dcr_analysis._accumulate_dcr(
-        ["fake.bin"], nframes, frame_time, mode="count"
-    )
-
-    # timestamp mode counts frames that fired: 4 of them
-    assert timestamped[5, 7] == pytest.approx(4 / live)
-    # count mode sums the raw field: 4 x 450, i.e. 450x too high here
-    assert counted[5, 7] == pytest.approx(4 * 450 / live)
-    assert counted[5, 7] > 100 * timestamped[5, 7]
-    # every other pixel is dark in both
-    assert timestamped.sum() == pytest.approx(timestamped[5, 7])
+    return store.load_map(str(tmp_path), kind="dcr", tag=tag)
 
 
-def test_timestamp_mode_cannot_exceed_one_count_per_frame(monkeypatch):
-    """The physical ceiling that the count-mode bug blows straight past."""
-    nframes, frame_time = 8, 1e-6
-    ts, pc = _fake_frames(nframes)
-    monkeypatch.setattr(
-        "dapkel.core.reduce.unpack",
-        lambda fp, n, compute_time_series=True: (ts, pc),
-    )
-    dcr = dcr_analysis._accumulate_dcr(
-        ["a.bin", "b.bin"], nframes, frame_time, mode="timestamp"
-    )
-    assert dcr.max() <= 1.0 / frame_time
+def test_modes_read_different_fields(tmp_path, monkeypatch):
+    _fake_unpack(monkeypatch)
+    live = NFRAMES * WINDOW_S
+
+    timestamped, meta_t = _dcr(tmp_path, "S0T")
+    counted, meta_c = _dcr(tmp_path, "S0C")
+
+    assert timestamped[5, 7] == pytest.approx(4 / live)  # 4 photons
+    assert counted[5, 7] == pytest.approx(4 * 450 / live)  # 4 x the raw field
+    assert np.nansum(timestamped) == pytest.approx(timestamped[5, 7])
+    assert (meta_t["mode"], meta_c["mode"]) == ("timestamp", "count")
 
 
-# --------------------------------------------------------------------------
-# pile-up inversion
-# --------------------------------------------------------------------------
+def test_timestamp_mode_cannot_exceed_one_count_per_frame(tmp_path, monkeypatch):
+    _fake_unpack(monkeypatch, fires=range(NFRAMES))
+    dcr, _ = _dcr(tmp_path, "S0T", n_files=2)
+    assert dcr.max() <= 1.0 / WINDOW_S
 
 
-@pytest.mark.parametrize("rate", [1e3, 5e3, 5e4, 1.2e5])
-def test_pileup_correction_recovers_the_true_rate(rate):
-    """Feed in the occupancy a Poisson source of known rate would produce."""
-    nframes, window = 100_000, 8e-6
-    occupancy = np.array([[(1 - np.exp(-rate * window)) * nframes]])
+@pytest.mark.parametrize("k", [1, 4, 7])
+def test_pileup_correction_is_the_poisson_inverse(tmp_path, monkeypatch, k):
+    """Turn the occupancy p = k/N into the MLE rate -ln(1 - p) / window."""
+    _fake_unpack(monkeypatch, fires=range(k))
 
-    raw = occupancy / (nframes * window)
-    corrected = dcr_analysis._pileup_correct(occupancy, nframes) / (
-        nframes * window
-    )
+    raw, _ = _dcr(tmp_path, "S0T")
+    corrected, meta = _dcr(tmp_path, "S0T", pileup_correct=True)
 
-    assert corrected[0, 0] == pytest.approx(rate, rel=1e-9)
-    assert raw[0, 0] <= corrected[0, 0]  # censoring can only under-report
-
-
-def test_pileup_correction_is_a_no_op_at_zero():
-    assert dcr_analysis._pileup_correct(np.zeros((2, 2)), 1000).tolist() == [
-        [0.0, 0.0],
-        [0.0, 0.0],
-    ]
-
-
-def test_fully_saturated_pixel_stays_finite():
-    """A pixel with p = 1 has no MLE; it must clip, not go to 'inf'."""
-    nframes = 8192
-    out = dcr_analysis._pileup_correct(np.array([[float(nframes)]]), nframes)
-    assert np.isfinite(out).all()
-    assert out[0, 0] > nframes  # a lower bound above the raw occupancy
-
-
-def test_pileup_correct_is_ignored_in_count_mode(monkeypatch):
-    nframes, frame_time = 8, 1e-6
-    ts, pc = _fake_frames(nframes)
-    monkeypatch.setattr(
-        "dapkel.core.reduce.unpack",
-        lambda fp, n, compute_time_series=True: (ts, pc),
-    )
-    plain = dcr_analysis._accumulate_dcr(
-        ["fake.bin"], nframes, frame_time, mode="count"
-    )
-    flagged = dcr_analysis._accumulate_dcr(
-        ["fake.bin"], nframes, frame_time, mode="count", pileup_correct=True
-    )
-    assert np.array_equal(plain, flagged)
-
-
-# --------------------------------------------------------------------------
-# the sidecar records which mode produced the map
-# --------------------------------------------------------------------------
-
-
-def test_meta_records_mode_and_correction():
-    meta = dcr_analysis._dcr_meta(
-        "path", 8192, "S0T", None, "short_window", 8e-6, "timestamp", True
-    )
-    assert meta["mode"] == "timestamp"
+    assert corrected[5, 7] == pytest.approx(-np.log1p(-k / NFRAMES) / WINDOW_S)
+    assert raw[5, 7] <= corrected[5, 7]  # censoring can only under-report
+    assert corrected[0, 0] == 0.0
     assert meta["pileup_correct"] is True
 
 
-def test_meta_never_claims_a_correction_in_count_mode():
-    meta = dcr_analysis._dcr_meta(
-        "path", 8192, "S0C", None, "short_window", 8e-6, "count", True
-    )
+def test_a_fully_saturated_pixel_stays_finite(tmp_path, monkeypatch):
+    """An occupancy of 1 has no MLE; it is clipped to the half-count level."""
+    _fake_unpack(monkeypatch, fires=range(NFRAMES))
+    dcr, _ = _dcr(tmp_path, "S0T", pileup_correct=True)
+
+    assert np.isfinite(dcr).all()
+    assert dcr[5, 7] > 1.0 / WINDOW_S  # a lower bound above the raw occupancy
+
+
+def test_pileup_correct_is_ignored_and_not_claimed_in_count_mode(tmp_path, monkeypatch):
+    _fake_unpack(monkeypatch)
+    plain, _ = _dcr(tmp_path, "S0C")
+    flagged, meta = _dcr(tmp_path, "S0C", pileup_correct=True)
+
+    np.testing.assert_array_equal(plain, flagged)
     assert meta["pileup_correct"] is False
+
+
+def test_short_exposure_without_a_shutter_time_is_refused(tmp_path):
+    (tmp_path / "run_S0C_0.bin").write_bytes(b"")
+    with pytest.raises(ValueError, match="open_shutter_time_s"):
+        dcr_analysis.process_dcr(str(tmp_path), NFRAMES, "S0C", open_shutter_time_s=None)

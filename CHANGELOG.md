@@ -5,6 +5,356 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-11-01
+
+### Changed
+
+- **BREAKING: every analysis is two functions, `process_<x>` and `plot_<x>`.**
+  `process_<x>(path, nframes, ...)` unpacks the raw '.bin' files and *always*
+  saves its artifact under `processed/`; `plot_<x>(path, tag, ...)` loads it and
+  writes the figures. Everything else is private, and code no pipeline used is
+  moved, verbatim, to `archive/` at the repository root (reference only, not
+  packaged or tested). `delta_t` is renamed `coincidences`. Entries further
+  down this section describe the pre-restructure API.
+
+  | module | was | is |
+  | --- | --- | --- |
+  | `hitmap_analysis` | `compute_hitmap(_64)`, `compute_and_save_hitmap(_64)`, `collect_and_plot_hitmap`, `plot_hitmap(array)` | `process_hitmap`, `plot_hitmap(path, tag)` |
+  | `dcr_analysis` | `compute_dcr_32/64`, `compute_and_save_dcr_32/64`, `collect_and_plot_dcr_32/64`, `plot_heatmap`, `plot_distribution` | `process_dcr`, `plot_dcr` |
+  | `crosstalk_analysis` | `compute_crosstalk`, `compute_and_save_crosstalk`, `collect_and_plot_crosstalk`, `combine_directional_crosstalk`, 4 × `plot_ct_*` | `process_crosstalk`, `plot_crosstalk` |
+  | `data_quality` | `collect_time_mat`, `plot_time_code_histogram` | `process_time_codes`, `plot_time_codes` |
+  | `tdc_calibration` | 12 functions over two calibration models | `process_tdc_calibration`, `plot_tdc_calibration` |
+  | `delta_t` → `coincidences` | 15 functions over two stage-1 paths | `process_coincidences`, `plot_coincidences` |
+
+  Details worth knowing when porting a script:
+
+  - **The tag decides what a count is** (`core.reduce.readout_mode`): `...T`
+    programs count frames carrying a timestamp, `...C` programs sum the photon
+    counter. The `mode` parameter is gone, and with it the tag/mode mismatch that
+    inflated a timestamp-mode DCR ~50x. A tag ending in neither letter raises.
+  - **Every map is (32, 32)**, one program per tag (`ORT`, `ORC`, `S<n>T`,
+    `S<n>C`). The `_32` / `_64` variants are gone; the (64, 64) quadrant
+    assembly is archived (`archive/core/reduce.py`).
+  - **`delta_t` is now `coincidences`**: `process_coincidences(path, nframes,
+    pixels, ...)` - `nframes` is the second positional argument, as in every
+    `process_*` - and `plot_coincidences(path, tag)`, which finds the grid from
+    the tag; `counts_path`, `npy_path` and `reuse` are gone. The grid is saved
+    as `<name>_<tag>_coincidences.npy` (was `_delta_counts.npy`) and the
+    figures as `<name>_<tag>_<label>_coincidences[_sub].png`. Verified on 30 files of the 2026.09.14 SPDC run: the new grid is
+    bin-for-bin identical to `calculate_and_save_delta_counts` (5 lag planes x
+    81 pairs, raw and calibrated), and the fits and model-free count match to
+    every printed digit.
+  - **`plot_hitmap` returns `(counts, rate)`** and saves both maps.
+  - **The hitmap rate is per frame cycle, not per open shutter**:
+    `hits / (nframes * n_files * max(live_per_frame, 9 µs))`, so a `...T`
+    pixel tops out at ~111 kHz whatever the shutter. It was `hits / (... *
+    open_shutter_time_s)`, which read 18x higher at a 500 ns shutter. Computed
+    in `plot_hitmap` from the sidecar, so saved hitmaps need no reprocessing.
+    The colorbar label is "photons" (was "frames fired") and the titles no
+    longer carry the map size. DCR is still normalised by the live time.
+  - **The coincidence figure has a residuals panel** (data - fit) under the
+    histogram, and its legend reads FWHM, σ and σ_detector (= σ / √2).
+  - **The subtracted fit holds its baseline at zero** instead of fitting a
+    constant, and `fit_window_s` defaults to 5 ns (was 1 ns). On a window
+    narrower than the peak's ~3 ns tails the free constant climbed onto them
+    (668 counts on 2026.10.30 ORT) and shrank sigma from 723 to 536 ps. The
+    fit curve and residuals are drawn over the fitted range only; `fit` gains
+    `fit_range`.
+  - **Plots no longer override the house style**: the coincidence figures
+    dropped their hard-coded red fit, black zero lines, thin linewidths and
+    frameless legends, and every module dropped its grid linewidth/alpha, so
+    the active komorebi_mpl style (dapkel by default) sets all of it.
+  - **`process_crosstalk` on a parent folder** processes each pairing
+    sub-folder and saves the combined (64, 64) directional map; `plot_crosstalk`
+    draws whichever was saved. The artifact is named by the batch prefix
+    (`<name>_ct_crosstalk.npy`), the pairing goes in the sidecar.
+  - **`data_quality` saves** the (32, 32, n_codes) per-pixel code histogram,
+    so any pixel can be inspected without re-reading the run.
+  - **Background subtraction is unchanged in behaviour** but no longer a
+    module: it is private to `coincidences`, still driven by
+    `subtract_background`.
+- **BREAKING: the TDC calibration is the compact 8-tap form only.** One
+  (32, 32, 8) table per SPAD serves every clock, and is applied by the new
+  `core.calibration.codes_to_ps` straight from the tap widths - there is no LUT
+  to expand, so no code range to cover, no per-clock file to pick and no
+  overflow warning. `lut_clock` and `tdc_model` are gone. `plot_tdc_calibration`
+  draws each SPAD's tap DNL against the array and its ring-period spread. The
+  packaged tables are to be rebuilt after this restructure.
+- `core.timing.resolve_live_time(firmware_version, *, open_shutter_time_s,
+  exp_time_s)` drops its unused `nframes` and raises when `short_exposure` has no
+  shutter time, instead of returning None for every caller to check.
+- **BREAKING: `process_tdc_calibration` selects files by program tag.** The
+  default `tags` are `('S0T', 'S1T', 'S2T', 'S3T')`, matched as
+  `*_<tag>*.bin`, since the program tag is the only part of a file name that is
+  the same in every data set; the old `SPADn_Sn` defaults found nothing in real
+  runs. Tables are saved as `TDC_COMPACT_S0T.npy`..., and a counting tag
+  (`S0C`, `ORC`) is refused, as it records no TDC codes. `board_taps` reads
+  packaged tables under either name (`..._S2T.npy` or `..._SPAD2_S2.npy`).
+
+### Removed
+
+Moved to `archive/` (code and its tests, verbatim from commit 6b49a4b):
+
+- the delta-t **feather path** - `calculate_and_save_timestamp_differences`,
+  `combine_delta_t_parts`, `combine_delta_t_feathers`,
+  `compute_and_save_delta_histogram`, `collect_and_plot_timestamp_differences`
+  and their part-file machinery. The binned-counts path gives the same
+  histogram without the 3-135 GB intermediate; per-event analyses are the one
+  thing it cannot do.
+- the **dense per-clock LUT** - `histogram_to_lut`, `compute_tdc_lut`,
+  `collect_and_save_luts`, `load_lut`, `load_board_lut`, `lut_full_scale_s` and
+  the clock-tag selection. The packaged per-clock tables move to the untracked
+  `archive/calibration_data/`.
+- the **two-Gaussian peak model** (`two_gaussians_on_triangle`,
+  `fit_two_gaussians_on_triangle`), which no pipeline called.
+- the **(64, 64) full-sensor assembly** of the four quadrant programs
+  (`archive/core/reduce.py:count_map_64`); every program reads 32 x 32.
+- `calc_diff` (within-frame differencing is the lag-0 case of `coincidences`'
+  frame-shifted differencing), `core.timing.resolve_cycle_time`,
+  `resolve_frame_time`, `CLK_PERIOD`, `MAX_DELTA_S`, `core.pairs.pair_labels`
+  and `core.io.frames_in_file`.
+
+### Added
+
+- **`clip_colorbar_to` sets the sensor-map colour-scale ceiling** — on
+  `core.plots.sensor_map`, `hitmap_analysis.plot_hitmap` and
+  `collect_and_plot_hitmap`. It is the percentile the scale stops at, `99` by
+  default (the behaviour so far), and `None` for an unclipped bar running to the
+  true maximum. The clip is why a bar can end well below the maximum quoted in
+  the title: the title always reports the real `max`, while the scale is held
+  down so a few hot pixels do not flatten the rest of the array into one shade.
+- **A compact TDC calibration: 8 ring taps per pixel, one table for every
+  clock.** `histogram_to_compact` reduces the density-test histogram to the
+  eight tap widths the hardware actually has — the coarse counter contributes no
+  non-linearity, so code `k` is always tap `k % 8` — and `compact_to_lut`
+  expands them onto whatever code range a run occupies. Built by
+  `collect_and_save_compact`, loaded by `load_board_compact`, and selected on
+  both `delta_t` entry points with `tdc_model="compact"` (`"table"`, the dense
+  per-clock LUT, stays the default for now).
+
+  It is better than the dense table on every axis, not just smaller. On the
+  2026.08.07 2 MHz SPDC run (227 k coincidences, 54 adjacent pairs) the pooled
+  crosstalk peak goes 2550 → **1250 ps** FWHM with the peak 1.6× higher, from
+  **64 KB** per SPAD instead of 27 MB. Three reasons: each tap is averaged over
+  every lap the run swept, cutting the density test's 569 ps/pixel CDF noise by
+  `sqrt(n_codes/8)`; the taps belong to the ring rather than the clock, so one
+  table serves all of them; and there is no flat tail, where a dense LUT pins
+  every code above a pixel's own range at the full scale (~4 % of the table, up
+  to 33 ns off).
+
+  Measured: ring period 599.7 ps (LSB 75.0 ps, the designers' nominal figure),
+  1.16 % spread across pixels, 5.06 ps rms tap pattern. Built independently at
+  2 MHz and 10 MHz the two agree to 0.05 % on the period and r = 0.992 on the
+  tap shape.
+- **TDC calibrations for 50, 10 and 2 MHz ship with the package.** Four SPADs
+  per clock, stored as `float32` in `dapkel/params/calibration_data` and named
+  `D0_M0_TDC_LUT_SPAD{n}_S{n}_{clock}.npy`. The 10 MHz set they supersede moved
+  to a subfolder: the loader reads only top-level `.npy` files and the package
+  data glob is non-recursive, so superseded calibrations stay in the repo
+  without shipping in a wheel. Provenance is the commit that added them.
+- **`clock` selects which calibration to load** — on
+  `tdc_calibration.load_lut` and `load_board_lut`, and as `lut_clock` on both
+  `delta_t` entry points. Not normally needed, since code coverage picks the
+  table whenever one calibration per clock is installed; it is what resolves two
+  calibrations of the *same* clock, which cover identically. The tag is what
+  follows the SPAD fragment in the file name; an exact match wins, so a plain
+  `clock="10MHz"` keeps meaning the table named exactly that, while a partial
+  tag resolves when one calibration answers to it.
+
+- **Every fitted width is reported with its 1 sigma error** — in the figure
+  legend, in the console summary and in the returned dict. `delta_t` now derives
+  `fwhm_err`, `jitter_per_detector_err` and, for `background="two_gaussians"`,
+  `fwhm_n_err` / `fwhm_b_err` alongside the values they belong to, so a number
+  read off a figure and the same number out of the dict cannot disagree. A fit
+  with no covariance prints the width alone rather than `+- nan`.
+
+### Fixed
+
+- **A fitted width the data does not determine was reported as a measurement.**
+  `curve_fit` converging is not the same as succeeding: point the flat model at
+  a stretch with no peak in it and amplitude, width and baseline trade against
+  each other freely, so it returns a width whose covariance says it is worth
+  nothing. On a Ne-lamp HBT run whose lag subtraction left a triangle behind,
+  that was `sigma = 39257 +/- 2665891 ps` — drawn as a curve, printed as a
+  number, and legended with its own 68x error. Both fitters now reject
+  `sigma_err >= sigma` the way they already reject a non-convergence, with the
+  `RuntimeWarning` naming the likely cause (the background model).
+
+- **The colour-bar label was cut off every sensor map.** `core.plots.sensor_map`
+  draws a square image in a square figure, so the bar sits against the right
+  edge of the canvas and its label - which hangs off the *outside* of the bar -
+  was drawn a few pixels beyond it. Every hitmap, DCR and cross-talk map written
+  since lost its unit. The figure now uses constrained layout, and
+  `tests/test_plots.py` asserts the label's bounding box stays inside the
+  canvas rather than trusting the eye: an unattended run writes its figures
+  once, and nobody is watching to notice.
+
+- **A lagged counts artifact plotted without a subtraction raised
+  `IndexError`.** `collect_and_plot_delta_counts(..., subtract_background=False)`
+  handed the whole `(n_lags, n_cells)` grid to `rebin_delta_counts`, which
+  ravels its input: the planes flattened into one array twice as long as the
+  cell centres it was binned against. It now takes lag 0 — the signal — exactly
+  as the feather path does by ignoring the `@lag` columns, so an artifact
+  written with lags plots either way. Had the mask not caught it, the histogram
+  would have been the signal plus a full copy of the accidentals. The rebinner
+  also names the mismatch now instead of failing inside a boolean index.
+
+- **The flat-background peak fit failed on background-subtracted data, and said
+  nothing.** `fit_gaussian_peak` seeds the flat level from the histogram tail
+  median but bounded it at zero from below. A lag-subtracted residual has a
+  zero-mean baseline, so that seed lands on or under its own bound, `curve_fit`
+  raises `x0 is infeasible`, and the `except (RuntimeError, ValueError)` returned
+  `ok=False` — leaving `collect_and_plot_timestamp_differences` to draw a
+  histogram with no fitted curve and no explanation. This hit exactly the
+  histograms `subtract_background=True` produces, and `'flat'` is the only model
+  that combination allows. The level may now go negative, seeds are clamped
+  strictly inside their bounds (as the triangle fitter already did), and **a fit
+  that does not converge raises a `RuntimeWarning` naming the reason** instead of
+  going quiet.
+- **A LUT from the wrong clock could be selected even when the right one was
+  installed.** Coverage narrowing only set a lower bound, so a 2 MHz table —
+  which covers a 10 MHz run five times over — stayed in the running and could be
+  applied, converting every code on the wrong scale. The loaders now keep the
+  *tightest* covering table.
+- **`spad="average"` failed on a real calibration set.** The four SPADs' code
+  counts differ by one or two, since whether a SPAD ever hit its last code is
+  chance, and `_average_luts` rejected any shape mismatch. Tables agreeing to
+  within the coverage tolerance are now padded to the longest with each one's own
+  full scale — the honest time for a code that SPAD never produced — while a
+  wider disagreement still raises. Averaging across *different calibrations* now
+  raises rather than silently blending them.
+
+### Changed
+
+- **BREAKING: the delta-t counts artifact carries its tag** —
+  `calculate_and_save_delta_counts` now writes
+  `processed/<dataset>_<tag>_delta_counts.npy` (tag lower-cased, as the hitmap
+  and DCR arrays), so several programs recorded into one folder (`ORT`, `S0T`,
+  ...) no longer overwrite each other. `load_delta_counts` and
+  `collect_and_plot_delta_counts` take a matching `tag="ORT"`, and the figures
+  pick the tag up too (`<dataset>_<tag>_<label>_delta_counts.png`). An existing
+  untagged `<dataset>_delta_counts.npy` is not found by `path` any more: load it
+  with `counts_path=`, or rename it.
+- **BREAKING: `spad` is gone from both `delta_t` stage-1 functions** — the file
+  `tag` already answers it. A timestamping run is read either through one
+  micropixel per macropixel (`S0T`...`S3T`), where that SPAD's own LUT is the
+  right one, or through all four at once (`ORT`), where the readout cannot say
+  which fired and the average is the only honest table. The acquisition program
+  writes the tag into the file name, so there was never a second choice to make
+  — only a way to state it wrongly. See `delta_t._spad_from_tag`;
+  `load_board_lut` and `load_board_compact`, which know nothing about a run,
+  still take `spad`.
+
+- **BREAKING: `background` is gone from both stage-2 drivers** — the fit model
+  follows the histogram. `collect_and_plot_timestamp_differences` and
+  `collect_and_plot_delta_counts` now fit `Gaussian + triangle` on a raw
+  histogram and `Gaussian + constant` on a subtracted residual, and take no
+  argument for it. The two were never independent choices: either the
+  accidental pedestal is still in the data, and on ORT that pedestal is a
+  *triangle*, or `subtract_background` has measured it away and what is left is
+  flat about zero. Naming the model separately could only restate that or
+  contradict it — and the contradiction was the old fixed `'flat'` default,
+  which on raw ORT data fits a constant to a slope and inflates sigma. The
+  combination that used to be refused at run time (`subtract_background=True`
+  with a triangle) is now unsayable, so `_check_subtraction_model` is gone too.
+
+  `'two_gaussians'` — a narrow core on broad tails — is a statement about the
+  *peak* rather than the pedestal, so it moves out of the drivers with the
+  parameter. Fit it on the `counts` and `centers` they return:
+  `fit_two_gaussians_on_triangle(centers, counts, half_base=fit["half_base"])`,
+  no disk read. The drivers no longer plot its two components.
+
+- **`collect_and_save_luts` names files by clock frequency, not period** —
+  `TDC_LUT_S0T_2MHz.npy`, not `TDC_LUT_S0T_500ns.npy`, so the name reads the way
+  the clock is set on the generator. Both spellings are still recognised when
+  loading, as is the older `D0_M0_500ns_TDC_LUT_...` layout.
+
+- **BREAKING: the TDC full scale is measured from the data, not stated.** It was
+  asked for three ways at once — `open_shutter_time_s`, `full_scale_s`,
+  `support_s` — and one of them was the wrong quantity: the open shutter time is
+  how long the SPAD waits for a photon, and an 8 µs shutter on a 10 MHz clock
+  still yields ~100 ns timestamps, because the free-running oscillator has no
+  cycle counter. The largest code a run produced *is* the range its TDC swept, so
+  `core.timing.full_scale_from_max_code` resolves it and
+  `resolve_tdc_full_scale_s` / `codes_for_full_scale` are gone.
+  `open_shutter_time_s` survives only where it was always correct: rate
+  normalisation in `dcr_analysis` and `hitmap_analysis`.
+- **BREAKING: one clock parameter, in one module.** `tdc_calibration` takes
+  `clock_period_s` (was `open_shutter_time_s`), because a density test fixes only
+  *relative* per-code widths and something has to set the absolute scale. That is
+  the only time the package now has to be told. Its loaders take `min_codes` —
+  the code range the data occupies, read off the run by the caller — and check the
+  LUT against that rather than against a restated frequency.
+- **BREAKING: delta-t artifacts are always in picoseconds.** `time_unit_s` and
+  the `delta_code` / raw-code path are gone from `delta_t`: a LUT maps a *code* to
+  a time, and a stored difference has lost both operands, so an uncalibrated
+  artifact could never have been calibrated afterwards — the documented reason for
+  keeping codes was not achievable. Uncalibrated runs are converted with the
+  nominal `CODE_S` on the way in. Feathers and counts artifacts written in
+  `'code'` are refused with a message rather than read as ps (a silent ~14×
+  error).
+- **BREAKING: the delta-t histogram covers the whole physical support.**
+  `compute_and_save_delta_histogram` no longer takes `plot_window_s`; it
+  histograms ±`timing.MAX_DELTA_S` (~586 ns, ~131 kB at one code per bin) and
+  reports the largest difference it saw as `support_s`. Every plot window is now a
+  slice of one cached histogram, so changing it costs a load rather than another
+  pass over the feather.
+- **BREAKING: both stage-1 paths share one histogram lattice.**
+  `_delta_hist_edges` uses the counts path's construction, so **zero is a bin
+  centre whatever the window is**. The old `arange(-W - w/2, ...)` centred a bin
+  on zero only when the window was a whole number of bins, and left the outermost
+  bin at each end half-filled by the `abs(delta) <= W` cut; the two paths now
+  agree in *every* bin, and `_whole_bins` is gone with the workaround it was.
+- **BREAKING: parameters that the data can answer, or that were synonyms, are
+  gone.** `delta_window_s` / `delta_window_native` (memory knob, default was
+  already "keep all"), `support_s`, `full_scale_s`, `time_unit_s`, `n_codes`,
+  `snap_to_grid` (the un-snapped path was documented as worse), `flush_every` and
+  `wide_rebin` (now module constants — cadence and cosmetics cannot change the
+  numbers). Renamed: `grid_s` → `bin_width_s`, `peak_window_s` → `fit_window_s`,
+  `cmap_title` → `title`, `folder` → `path`, `file_prefix` → `tag`,
+  `from_saved` → `reuse`. `collect_and_plot_timestamp_differences` goes from 17
+  parameters to 11, `collect_and_plot_delta_counts` from 16 to 10,
+  `calculate_and_save_delta_counts` from 19 to 15, `compute_code_histogram` from
+  5 to 3.
+- **BREAKING: one firmware vocabulary.** `firmware_version` takes
+  `'short_exposure'` / `'long_exposure'` (`core.timing.FIRMWARE_VERSIONS`)
+  everywhere. `'short_window'` / `'full_window'` are removed rather than aliased:
+  `resolve_cycle_time` accepted both spellings while `resolve_live_time` accepted
+  only the second pair, so the two functions disagreed about what was valid.
+- `plot_window_s` and `fit_window_s` now default sensibly instead of being
+  guessed at: `plot_window_s=None` means the measured full scale, which is what
+  the triangle models want, and `fit_window_s` is the peak's half-width for both
+  the flat fit and the model-free integration.
+- `data_quality.plot_time_code_histogram` drops `time_unit_s` and always plots raw
+  codes — the code range is the evidence it exists to show — and reports the span
+  as a full scale in ns in the title.
+- `compute_code_histogram` allocates the widest code axis the frame format can
+  express and trims it to what the data populated, so nothing can overflow it and
+  the dropped-codes warning is gone with the failure mode.
+- **The short-exposure shutter range was documented far too narrow.**
+  `core.timing.FIRMWARE_VERSIONS`, `resolve_live_time`, `hitmap_analysis`, and the
+  hitmap and DCR guides all said the exposure inside the 9 µs `short_exposure`
+  cycle is "50–500 ns, typically 100 ns". It is settable from ~50 ns up to the
+  full 9 µs, and both ends are in use — 100 ns for DCR and crosstalk work, 8 µs
+  for the 2026.08.10 Ne 703 nm HBT run, whose acquisition metadata records
+  `open_shutter_clks = 1600`. The narrow claim was wrong in two ways that matter:
+  it made `open_shutter_time_s` look guessable when a wrong guess is a rate error
+  of up to two decades, and it hid the fact that an exposure much longer than the
+  TDC full scale wraps the timestamps and dilutes any coincidence peak by
+  `open_shutter_time_s / full_scale` (84× for that run: 8 µs over a 95 ns full
+  scale). `resolve_cycle_time`'s note on the frame-rate counter dropped the stale
+  range too. Released changelog entries are left as they were written.
+
+### Added
+
+- `core.timing.full_scale_from_max_code`, `core.timing.MAX_DELTA_S` and
+  `core.timing.FIRMWARE_VERSIONS`.
+- `tests/test_timing_and_calibration.py`: the measured full scale against the
+  2026-08-07 rate-vs-clock set, the one firmware vocabulary, and LUT coverage
+  checked against a run rather than a stated clock.
+- `docs/adding_an_analysis.md` now states the shared parameter vocabulary and the
+  rule behind it: if the data can answer it, it is not a parameter.
+
 ## [0.3.0] - 2026-08-09
 
 ### Changed

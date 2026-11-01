@@ -47,9 +47,11 @@ reverse of what a row-major reading gives. Vertical and diagonal cross-talk are
 physically different magnitudes (diagonal SPADs sit further apart), so swapping
 them silently mislabels two real measurements.
 
-This layout is asserted in `tests/test_spad_geometry.py`, which ties
-`crosstalk_analysis._DIRECTIONS` to the `_SPAD_LAYOUT` used by
-[DCR](dcr.md) and [hitmap](hitmap.md) for their (64, 64) assembly, so the three
+The layout is encoded once, in
+`core.reduce.SPAD_LAYOUT` (see [`core.reduce`][dapkel.core.reduce]), which both the
+(64, 64) quadrant assembly of [DCR](dcr.md) and [hitmap](hitmap.md) and the
+cross-talk directions read. `tests/test_spad_geometry.py` pins it, and
+`crosstalk_analysis._DIRECTIONS`, against an independent spelling of it, so the
 encodings cannot drift apart.
 
 ## Data layout
@@ -59,15 +61,42 @@ many repeated `.bin` acquisitions per counter, named like
 `CT_coincS0S1<n>.bin` / `CT_ORS0S1<n>.bin`; the counts are summed across every
 acquisition for statistics.
 
+The coinc and OR files are told apart by their counter token, case sensitively:
+coinc files carry `coinc`, OR files `OR`. The pairing (`S0S1`...) is read from
+the file names.
+
 The `01` preliminary batches use a `CT01_` / `CT02_` prefix and are excluded by
-the default `file_prefix="CT_"`, so the two acquisitions are never silently
+the default `tag="CT_"`, so the two acquisitions are never silently
 mixed.
+
+## Processing and plotting
+
+Pointed at a folder holding one pairing's coinc/OR files,
+[`process_crosstalk`][dapkel.functions.crosstalk_analysis.process_crosstalk]
+saves its (32, 32) macropixel map as `processed/<name>_ct_crosstalk.npy` — the
+tag, not the pair, is in the file name; the pair is in the sidecar.
+[`plot_crosstalk`][dapkel.functions.crosstalk_analysis.plot_crosstalk] loads it
+and saves a heatmap and a sorted distribution, in percent, to
+`results/crosstalk/`.
+
+```python
+from dapkel.functions import crosstalk_analysis as ct
+
+ct.process_crosstalk("path/to/S0S1", nframes=1000)
+ct.plot_crosstalk("path/to/S0S1")
+
+# a parent of S0S1 / S0S3 / S0S2: each pairing, then the combined map
+ct.process_crosstalk("path/to/crosstalk", nframes=1000)
+ct.plot_crosstalk("path/to/crosstalk")
+```
 
 ## The combined 64×64 map
 
-`combine_directional_crosstalk` scans a parent folder holding one sub-folder per
-pairing, computes each (32, 32) directional map, and lays them onto a single
-(64, 64) micropixel grid. Within each 2×2 block the neighbour cells carry S0's
+Pointed at a *parent* folder holding one sub-folder per pairing instead,
+`process_crosstalk` processes and saves each sub-folder the same way, then lays
+the (32, 32) directional maps onto a single (64, 64) micropixel grid, saved in
+the parent. Sub-folders that are not S0-based pairings are skipped, and a
+missing direction is reported. Within each 2×2 block the neighbour cells carry S0's
 cross-talk in that direction, and the S0 cell carries the mean of the available
 directions:
 
@@ -75,6 +104,9 @@ directions:
 mean   | horizontal
 vertical | diagonal
 ```
+
+`plot_crosstalk` on the parent draws that (64, 64) map and a bar chart of the
+median cross-talk per direction (`..._direction_summary.png`).
 
 ## API
 

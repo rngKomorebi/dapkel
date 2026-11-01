@@ -5,8 +5,10 @@
 > clock**, so it is 20 ns at 50 MHz, 200 ns at 5 MHz and 500 ns at 2 MHz, and the
 > triangle's base, the CAR penalty `T/P` and the number of folded cycles all move
 > with it. Every formula below is in terms of `P`; only the numbers assume
-> 100 ns. In code, pass `open_shutter_time_s` (or `full_scale_s`) — nothing
-> assumes 100 ns any more.
+> 100 ns. In code you pass nothing at all: `P` is measured from the largest TDC
+> code the run produced
+> ([`core.timing.full_scale_from_max_code`][dapkel.core.timing.full_scale_from_max_code]),
+> which is the range the oscillator swept.
 
 **TL;DR** — The Kelpie ORT timestamp records only *where in a 100 ns oscillator
 cycle* a photon arrived, not *which* cycle inside the ~9 µs frame. That single
@@ -218,5 +220,6 @@ Only recovering absolute time, or shrinking the fold:
 The triangle explains the background **shape** and the **contrast**, but not the
 peak **width** (~500 ps measured vs ~100 ps expected). That is a timing‑
 resolution question — code→time calibration (the flat ~71.6 ps/code is only an
-average; the density‑test LUT gives per‑code widths) and detector jitter — and
-is independent of everything in this document.
+average; the density‑test [tap calibration](guide/tdc_calibration.md) gives the
+ring's actual tap widths) and detector jitter — and is independent of everything
+in this document.

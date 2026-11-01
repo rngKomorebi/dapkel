@@ -13,12 +13,12 @@ where the reusable code lives:
 | stage | what it does | where the code lives |
 |---|---|---|
 | **0. raw** | camera writes `.bin`; dapkel decodes it | `dapkel.functions.unpack`, `dapkel.core.io` — never reimplement |
-| **1. process** | fold frames into an array, scale to physical units, **save** | your `compute_*` + `dapkel.core.reduce`, `dapkel.core.store` |
-| **2. plot** | load the saved array, render figures | your `plot_*` + `dapkel.core.plots` |
+| **1. process** | fold frames into an array, scale to physical units, **save** | your `process_<x>` + `dapkel.core.reduce`, `dapkel.core.store` |
+| **2. plot** | load the saved array, render figures | your `plot_<x>` + `dapkel.core.plots` |
 
-> **Status.** All of `core.io`, `core.timing`, `core.pairs`, `core.reduce`,
-> `core.plots` and `core.store` exist, and every analysis writes stage-1
-> artifacts to `processed/` and figures to `results/<kind>/`. This page
+> **Status.** All of `core.io`, `core.timing`, `core.calibration`, `core.pairs`,
+> `core.reduce`, `core.plots` and `core.store` exist, and every analysis writes
+> stage-1 artifacts to `processed/` and figures to `results/<kind>/`. This page
 > describes the code as it is.
 
 ## Figure sizing
@@ -65,12 +65,20 @@ Only the parts that are genuinely specific to your measurement:
 Every item here already exists in `dapkel.core`. Reimplementing any of it will
 fail `tests/test_api_surface.py`:
 
-- file discovery or `.bin` frame counting → `core.io.find_bin_files`, `core.io.frames_in_file`
+- file discovery → `core.io.find_bin_files` (the frame count is never read off
+  a file's size — it is the caller's `nframes`)
 - the accumulate-over-frames loop → `core.reduce.accumulate_frames`
-- assembling four `S*C` quadrants into a (64, 64) map → `core.reduce.assemble_64`
-- frame period / live time resolution → `core.timing`
+- the (32, 32) per-pixel count map of one tag → `core.reduce.count_map`; what
+  a count *is* for a tag
+  → `core.reduce.readout_mode`; the SPAD offsets inside a macropixel →
+  `core.reduce.SPAD_LAYOUT`
+- the per-pixel TDC-code histogram → `core.reduce.code_histogram`
+- live time resolution, units and the measured TDC full scale → `core.timing`
+  (`resolve_live_time`, `to_ps` / `to_s`, `full_scale_from_max_code`)
+- converting TDC codes to picoseconds with the tap calibration →
+  `core.calibration` (`board_taps`, `codes_to_ps`)
 - enumerating pixel pairs, and the `"ra,ca-rb,cb"` label every coincidence
-  artifact is indexed by → `core.pairs.pair_labels`, `core.pairs.pair_list`
+  artifact is indexed by → `core.pairs.pair_list`, `core.pairs.pair_label`
 - the sensor heatmap figure → `core.plots.sensor_map`
 - the sorted-percentile distribution figure → `core.plots.sorted_distribution`
 - saving/loading arrays with metadata, and saving figures → `core.store`
@@ -90,20 +98,51 @@ function with a parameter** rather than writing a variant next to it. Variants
 are how the existing three heatmap plotters drifted into three different figure
 sizes and two different NaN policies.
 
-## Naming convention
+## Two public functions, always save
 
-The package is consistent about this, and `__all__` groups follow it:
+An analysis module has **two public functions**, and its `__all__` lists
+them:
 
-| prefix | signature | I/O |
+| function | signature | I/O |
 |---|---|---|
-| `compute_*` | raw files or an array in → array out | none |
-| `plot_*` | array in → `plt.Figure` out | none |
-| `compute_and_save_*` | raw files in → path to a stage-1 artifact | writes `processed/` |
-| `collect_and_*` | folder in → paths to figures | reads `processed/`, writes `results/` |
-| `load_*` | path in → array out | reads |
+| `process_<x>` | `(path, nframes, ...)`: raw `.bin` in → path to the saved stage-1 artifact | reads `.bin`, **always** writes `processed/<name>_<tag>_<kind>.npy` + `.meta.json` |
+| `plot_<x>` | `(path, tag, ...)`: data folder in → the data it plotted | reads `processed/`, writes `results/<kind>/` |
 
-Keeping `plot_*` free of I/O is what lets you iterate on a figure in a notebook
-without touching disk.
+`process_<x>` always saves — there is no in-memory-only variant and no `reuse=`
+switch, because stage 2 reads the artifact and nothing else. A caller who only
+wants the figures makes the two calls in a row; one who wants the array takes
+it from `plot_<x>` (which returns it) or from `core.store.load_map`.
+
+Everything else in the module is private (`_helper`), and there are at most
+**ten** private top-level functions per module. A module that needs more is
+doing several jobs, or has helpers that belong in `dapkel.core`. Code that is
+retired rather than refactored moves to the repository's `archive/` folder,
+which is kept for reference only and not maintained.
+
+### Parameter names are shared, not per-module
+
+One concept, one name, everywhere. A new analysis picks from this list rather
+than inventing a synonym — `folder`, `file_prefix`, `from_saved`, `grid_s` and
+`cmap_title` were all synonyms of entries in it, and every one of them made a
+caller stop and check which module they were in.
+
+| name | meaning |
+|---|---|
+| `path` | the data folder (never `folder`) |
+| `tag` | filename fragment selecting the files (never `file_prefix`) |
+| `nframes` | frames per `.bin`, as the acquisition was set |
+| `max_files` | process at most this many files |
+| `exp_time_s`, `open_shutter_time_s`, `firmware_version` | the live-time trio, for rate normalisation **only** |
+| `bin_width_s`, `plot_window_s`, `fit_window_s` | histogram/fit ranges |
+| `rewrite`, `resume`, `quiet` | housekeeping (never `from_saved`) |
+| `label`, `title`, `cmap` | figure text and colours (never `cmap_title`) |
+
+And the harder rule: **if the data can answer it, do not add a parameter.** The
+TDC full scale used to be asked for three ways at once; it is now measured from
+the largest code a run produced. Ask yourself whether the caller could get the
+number wrong — if so, they will, and the code should read it instead. The one
+survivor is `clock_period_s` in `tdc_calibration`, because a density test fixes
+only *relative* code widths and something has to set the absolute scale.
 
 ## Docstrings
 
@@ -119,8 +158,9 @@ the two halves stay side by side for readers.
 
 ## Checklist
 
-- [ ] Public functions follow the `compute_*` / `plot_*` / `collect_and_*` / `load_*` convention
-- [ ] `__all__` declared, grouped by stage, listing every public name
+- [ ] Two public functions, `process_<x>` and `plot_<x>`, for the same `<x>`, in `__all__`
+- [ ] Private helpers combined where they can be, not one per step
+- [ ] Module added to `ANALYSIS_MODULES` in `tests/test_api_surface.py`
 - [ ] Module added to `dapkel/functions/__init__.py` and to its `__all__`
 - [ ] No file discovery, accumulate loop, or figure skeleton reimplemented
 - [ ] No import of another analysis module's `_private` names
@@ -134,94 +174,106 @@ the two halves stay side by side for readers.
 A minimal analysis, end to end. Note how little of it is not measurement-specific.
 
 ```python
-"""Per-pixel afterpulsing probability map."""
+"""Per-pixel afterpulsing probability map.
+
+    process_afterpulsing   raw '.bin' -> processed/<name>_<tag>_afterpulsing.npy
+    plot_afterpulsing      that array -> results/afterpulsing/ figures
+"""
 
 from __future__ import annotations
 
+import os
+
+import matplotlib.pyplot as plt
 import numpy as np
 
 from dapkel.core import io, plots, reduce, store
 
-__all__ = [
-    # stage 1
-    "compute_afterpulsing",
-    "compute_and_save_afterpulsing",
-    # stage 2
-    "plot_afterpulsing",
-    # driver
-    "collect_and_plot_afterpulsing",
-]
+__all__ = ["process_afterpulsing", "plot_afterpulsing"]
 
-KIND = "afterpulsing"
-_UNIT = "%"
+#: Analysis name: the stage-1 file stem and the results sub-folder.
+_KIND = "afterpulsing"
 
 
-def compute_afterpulsing(folder: str, nframes: int, tag: str = "AP") -> np.ndarray:
-    """Compute the (32, 32) afterpulsing probability map.
+def process_afterpulsing(path: str, nframes: int, tag: str = "AP") -> str:
+    """Unpack the '.bin' files, compute the afterpulsing map and save it.
 
     Parameters
     ----------
-    folder : str
+    path : str
         Data folder holding the '.bin' files.
     nframes : int
-        Number of frames stored in each '.bin' file.
-    tag : str
+        Frames the acquisition recorded per '.bin' file.
+    tag : str, optional
         Filename fragment selecting the files. The default is ``'AP'``.
 
     Returns
     -------
-    np.ndarray
-        (32, 32) afterpulsing probability in percent.
+    str
+        Path to the saved '.npy'.
     """
-    files = io.find_bin_files(folder, tag)
+    files = io.find_bin_files(path, tag)
     counts = reduce.accumulate_frames(
         files, lambda ts, pc: pc.sum(axis=2), nframes=nframes
     )
-    total = reduce.accumulate_frames(
-        files, lambda ts, pc: np.full((32, 32), pc.shape[2]), nframes=nframes
-    )
-    return 100.0 * counts / np.where(total > 0, total, np.nan)
-
-
-def compute_and_save_afterpulsing(
-    folder: str, nframes: int, tag: str = "AP"
-) -> str:
-    """Compute the map and save it under ``processed/``; return the path."""
-    ap = compute_afterpulsing(folder, nframes, tag)
-    return store.save_map(ap, folder, kind=KIND, tag=tag, unit=_UNIT)
-
-
-def plot_afterpulsing(ap: np.ndarray, cmap: str | None = None):
-    """Render an afterpulsing map. Returns the Figure; writes nothing."""
-    return plots.sensor_map(
-        ap, title="Afterpulsing", clabel=f"AP ({_UNIT})", fmt=".2f", cmap=cmap
+    ap = 100.0 * counts / (nframes * len(files))
+    return store.save_map(
+        ap,
+        path,
+        kind=_KIND,
+        tag=tag,
+        meta={"n_files": len(files), "nframes": int(nframes), "unit": "%"},
     )
 
 
-def collect_and_plot_afterpulsing(folder: str, tag: str = "AP") -> list[str]:
-    """Load the saved map and write its figures to ``results/afterpulsing``."""
-    ap, meta = store.load_map(folder, kind=KIND, tag=tag)
-    return [
-        store.save_figure(plot_afterpulsing(ap), folder, KIND, f"{tag}_heatmap.png"),
-        store.save_figure(
-            plots.sorted_distribution(ap, ylabel=f"AP ({_UNIT})"),
-            folder,
-            KIND,
-            f"{tag}_distribution.png",
-        ),
-    ]
+def plot_afterpulsing(
+    path: str, tag: str = "AP", *, cmap: str | None = None
+) -> np.ndarray:
+    """Load the saved map and write its figures to ``results/afterpulsing``.
+
+    Parameters
+    ----------
+    path : str
+        Data folder that 'process_afterpulsing' was run on.
+    tag : str, optional
+        The tag it was run with. The default is ``'AP'``.
+    cmap : str | None, optional
+        Matplotlib colormap name. The default is None - the active style's.
+
+    Returns
+    -------
+    np.ndarray
+        The afterpulsing map, in percent.
+    """
+    ap, _ = store.load_map(path, kind=_KIND, tag=tag)
+    name = store.map_file_name(
+        os.path.basename(os.path.normpath(path)), _KIND, tag
+    ).removesuffix(".npy")
+    results_dir = store.results_dir(path, _KIND)
+
+    fig = plots.sensor_map(ap, title="Afterpulsing", clabel="AP (%)", cmap=cmap)
+    store.save_figure(fig, results_dir, f"{name}_heatmap.png")
+    plt.close(fig)
+
+    fig = plots.sorted_distribution(
+        ap, ylabel="AP (%)", title="Sorted afterpulsing", fmt=".2f", unit="%"
+    )
+    store.save_figure(fig, results_dir, f"{name}_distribution.png")
+    plt.close(fig)
+    return ap
 ```
 
 ## Why the tests matter
 
-`tests/test_api_surface.py` enforces the two rules most likely to be broken
-under time pressure:
+`tests/test_api_surface.py` enforces the rules most likely to be broken under
+time pressure:
 
 - `__all__` matches the module's actual public names
 - no function name is defined in two analysis modules
+- no module imports another dapkel module's `_private` names
+- artifact paths come from `core.store`, never hand-built `os.path.join`s
 
-The second is the anti-copy-paste guard. It is the reason this contract is more
-than a suggestion — a checklist CI checks is a different object from a style
-note. Two of its assertions are currently `xfail(strict=True)`, tracking the
-pending `dapkel.core` extraction; when that lands they start passing, the strict
-marker turns them red, and the marker gets deleted.
+The second is the anti-copy-paste guard. Together they are the reason this
+contract is more than a suggestion — a checklist CI checks is a different object
+from a style note. They only apply to a module listed in `ANALYSIS_MODULES` in
+that test, so add yours there.

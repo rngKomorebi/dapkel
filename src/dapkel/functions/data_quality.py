@@ -1,147 +1,129 @@
-"""Data-quality checks to run on a fresh Kelpie acquisition.
+"""Data-quality check to run on a fresh Kelpie acquisition.
 
-Nothing here contributes to a physics result - these answer one question before
+    process_time_codes   raw '.bin' -> processed/<name>_<tag>_time_codes.npy
+    plot_time_codes      that array -> results/data_quality/ one pixel's codes
+
+Nothing here contributes to a physics result - it answers one question before
 you spend time on analysis: did the TDC actually record timing?
 
 The failure mode is silent. When the TDC never stops, 'unpack' still returns a
 full array of plausible integers and every downstream analysis still runs on
-meaningless data. Healthy codes spread over the full code range of the clock in use
-(~279 codes at 50 MHz, ~1397 at 10 MHz, ~6985 at 2 MHz);
-a broken run collapses onto a handful of values.
+meaningless data. Healthy codes spread over the full code range of the clock in
+use (~279 codes at 50 MHz, ~1397 at 10 MHz, ~6985 at 2 MHz); a broken run
+collapses onto a handful of values.
 
 See ``docs/guide/data_quality.md``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import os
 
 import matplotlib.pyplot as plt
 import numpy as np
-from tqdm import tqdm
 
-from dapkel.core import io
-from dapkel.functions import calc_diff as cd
-from dapkel.functions.calc_diff import Pixel
-from dapkel.functions.unpack import unpack
+from dapkel.core import io, reduce, store, timing
+from dapkel.core.pairs import Pixel
 
-__all__ = [
-    # gather raw TDC codes
-    "collect_time_mat",
-    # plot
-    "plot_time_code_histogram",
-]
+__all__ = ["process_time_codes", "plot_time_codes"]
+
+#: Analysis name: the stage-1 file stem and results sub-folder.
+_KIND = "time_codes"
 
 
-def collect_time_mat(
-    folder: str,
-    pixels: Pixel | Sequence[Pixel],
-    *,
+def process_time_codes(
+    path: str,
     nframes: int,
     tag: str = "ORT",
+    *,
     max_files: int | None = None,
-) -> dict[Pixel, np.ndarray]:
-    """Collect the per-frame TDC codes (``time_mat``) for given pixels.
+) -> str:
+    """Histogram every pixel's TDC codes over all frames and save it.
 
-    Returns, per requested pixel, the stack of its per-frame TDC codes over
-    every file, keeping only frames with a valid timestamp - 'unpack' leaves
-    non-fired slots at ``<= 0``, so that is ``time_series > 0``.
+    Saves the (32, 32, n_codes) per-pixel code histogram, which is a few tens
+    of MB at the slowest clock - so any pixel can then be inspected without
+    re-reading the run.
 
     Parameters
     ----------
-    folder : str
-        Path to the folder with the '.bin' data files.
-    pixels : tuple[int, int] | Sequence[tuple[int, int]]
-        A single ``(row, col)`` pixel or a sequence of them.
+    path : str
+        Folder with the '.bin' data files.
     nframes : int
-        Number of frames stored in each '.bin' file.
+        Frames the acquisition recorded per '.bin' file.
     tag : str, optional
-        Filename fragment selecting the files. The default is ``'ORT'``.
+        File tag of a timestamping program. The default is ``'ORT'``.
     max_files : int | None, optional
-        Process at most this many files. The default is None.
+        Use at most this many files - a handful is enough to see whether the
+        timing is populated. The default is None (all).
 
     Returns
     -------
-    dict[tuple[int, int], np.ndarray]
-        Mapping ``(row, col) -> 1D array`` of valid TDC codes.
+    str
+        Path to the saved '.npy'.
     """
-    pix = cd.as_pixel_list(pixels)
-    files = io.find_bin_files(folder, tag)
-    if max_files is not None:
-        files = files[:max_files]
-
-    chunks: dict[Pixel, list[np.ndarray]] = {p: [] for p in pix}
-    for fp in tqdm(files, desc=tag or "time_mat"):
-        ts, _ = unpack(fp, nframes, compute_time_series=True)
-        for r, c in pix:
-            code = ts[r, c]
-            chunks[(r, c)].append(code[code > 0])
-
-    return {
-        p: (np.concatenate(v) if v else np.empty(0, dtype=np.float64))
-        for p, v in chunks.items()
-    }
-
-
-def plot_time_code_histogram(
-    folder: str,
-    pixel: Pixel,
-    *,
-    nframes: int,
-    tag: str = "ORT",
-    bins: int | np.ndarray = 256,
-    time_unit_s: float | None = None,
-    max_files: int | None = None,
-) -> tuple[plt.Figure, np.ndarray]:
-    """Histogram one pixel's TDC codes over all frames (QA / jitter view).
-
-    Mirrors the ``Kelpie_run.m`` timestamp inspection. Useful to confirm, on a
-    fresh acquisition, that the timing is populated (codes should span the full
-    full code range for the reference clock in use - ~279 codes at 50 MHz,
-    ~1397 at 10 MHz, ~6985 at 2 MHz - not collapse onto a few values).
-
-    Parameters
-    ----------
-    folder : str
-        Path to the folder with the '.bin' data files.
-    pixel : tuple[int, int]
-        The ``(row, col)`` pixel to inspect.
-    nframes : int
-        Number of frames stored in each '.bin' file.
-    tag : str, optional
-        Filename fragment selecting the files. The default is ``'ORT'``.
-    bins : int | np.ndarray, optional
-        Bins for ``np.histogram``. The default is 256.
-    time_unit_s : float | None, optional
-        Seconds per code for the x-axis (the axis itself is drawn in ps); None
-        (default) keeps raw codes.
-    max_files : int | None, optional
-        Process at most this many files. The default is None.
-
-    Returns
-    -------
-    fig : plt.Figure
-        The generated figure.
-    codes : np.ndarray
-        The pixel's valid TDC codes over all frames.
-    """
-    r, c = int(pixel[0]), int(pixel[1])
-    codes = collect_time_mat(
-        folder, (r, c), nframes=nframes, tag=tag, max_files=max_files
-    )[(r, c)]
-
-    scale = time_unit_s * 1e12 if time_unit_s else 1.0
-    unit = "ps" if time_unit_s else "TDC code"
-
-    fig, ax = plt.subplots()
-    if codes.size:
-        ax.hist(codes * scale, bins=bins, alpha=0.75)
-    ax.set_xlabel(f"Timestamp  ({unit})")
-    ax.set_ylabel("Counts")
-    ax.set_title(
-        f"Pixel ({r},{c})  time codes  (n={codes.size}, "
-        f"{np.unique(codes).size} unique)"
+    files = io.find_bin_files(path, tag)[:max_files]
+    counts = reduce.code_histogram(files, nframes=nframes, label=tag)
+    return store.save_map(
+        counts,
+        path,
+        kind=_KIND,
+        tag=tag,
+        meta={"n_files": len(files), "nframes": int(nframes)},
     )
-    ax.grid(True, linewidth=0.5, alpha=0.6)
+
+
+def plot_time_codes(
+    path: str, pixel: Pixel = (16, 16), tag: str = "ORT"
+) -> np.ndarray:
+    """Plot one pixel's TDC-code histogram from the saved per-pixel histogram.
+
+    Mirrors the ``Kelpie_run.m`` timestamp inspection: the codes should span
+    the whole code range of the reference clock and not collapse onto a few
+    values. The title gives the span as a full scale in ns, the same
+    measurement every other analysis takes off the data
+    ('core.timing.full_scale_from_max_code').
+
+    Parameters
+    ----------
+    path : str
+        Data folder that 'process_time_codes' was run on.
+    pixel : tuple[int, int], optional
+        The ``(row, col)`` pixel to inspect. The default is ``(16, 16)``.
+    tag : str, optional
+        The tag it was run with. The default is ``'ORT'``.
+
+    Returns
+    -------
+    np.ndarray
+        The pixel's counts per code.
+    """
+    counts, _ = store.load_map(path, kind=_KIND, tag=tag)
+    r, c = int(pixel[0]), int(pixel[1])
+    hist = counts[r, c]
+    used = np.nonzero(hist)[0]
+
+    # The x axis stays in raw codes: whether the codes span the TDC's range is
+    # the question, and the code range is the evidence.
+    fig, ax = plt.subplots()
+    ax.step(np.arange(hist.size), hist, where="mid")
+    ax.set_xlabel("Timestamp  (TDC code)")
+    ax.set_ylabel("Counts")
+    span = (
+        f"{timing.full_scale_from_max_code(int(used[-1])) * 1e9:.1f} ns"
+        if used.size
+        else "nothing"
+    )
+    ax.set_title(
+        f"Pixel ({r},{c})  time codes  (n={hist.sum()}, {used.size} unique, "
+        f"spanning {span})"
+    )
+    ax.grid(True)
     fig.tight_layout()
-    return fig, codes
+
+    name = os.path.basename(os.path.normpath(path))
+    store.save_figure(
+        fig,
+        store.results_dir(path, "data_quality"),
+        f"{store.map_file_name(name, _KIND, tag).removesuffix('.npy')}_{r}_{c}.png",
+    )
+    return hist

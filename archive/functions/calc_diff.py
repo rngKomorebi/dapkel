@@ -1,16 +1,26 @@
-"""Per-window timestamp differences for pairs of pixels.
+"""ARCHIVED from dapkel.functions.calc_diff (branch modules-restructure, 2026-10-31).
 
-The low-level, daplis-style counterpart of ``daplis.functions.calc_diff``: it
-takes an already-structured mapping of per-pixel, per-frame timestamps and
-returns the differences for the requested pixel pairs. Unpacking, structuring
-and saving are handled one level up in 'dapkel.functions.delta_t'.
+The whole module. Within-frame differencing is now the lag-0 case of
+delta_t's frame-shifted differencing, and the pixel helpers moved to
+'dapkel.core.pairs'.
 
-A coincidence is a *within-window* event: in a frame where both pixels of a pair
-hold a valid TDC code, the difference of their codes is one entry of the delta-t
-distribution. Correlated pairs (e.g. SPDC signal/idler) pile up at delta = 0.
-
-See ``docs/guide/coincidences.md``.
+Reference only: not packaged, not tested, not maintained. Copied verbatim
+from commit 6b49a4b; the original module docstring follows.
 """
+
+# """Per-window timestamp differences for pairs of pixels.
+# 
+# The low-level, daplis-style counterpart of ``daplis.functions.calc_diff``: it
+# takes an already-structured mapping of per-pixel, per-frame timestamps and
+# returns the differences for the requested pixel pairs. Unpacking, structuring
+# and saving are handled one level up in 'dapkel.functions.delta_t'.
+# 
+# A coincidence is a *within-window* event: in a frame where both pixels of a pair
+# hold a valid TDC code, the difference of their codes is one entry of the delta-t
+# distribution. Correlated pairs (e.g. SPDC signal/idler) pile up at delta = 0.
+# 
+# See ``docs/guide/coincidences.md``.
+# """
 
 from __future__ import annotations
 
@@ -55,7 +65,6 @@ def as_pixel_list(group: Pixel | Sequence[Pixel]) -> list[Pixel]:
 def calculate_differences(
     pixel_timestamps: dict[Pixel, np.ndarray],
     pixels: Sequence[Sequence[Pixel]],
-    delta_window_native: float | None = None,
     mode: str = "all_pairs",
 ) -> dict[str, np.ndarray]:
     """Compute per-window timestamp differences for pairs of pixels.
@@ -70,21 +79,13 @@ def calculate_differences(
     ----------
     pixel_timestamps : dict[tuple[int, int], np.ndarray]
         Mapping ``(row, col) -> 1D array`` of that pixel's per-frame
-        timestamps (in TDC code units), with NaN where the pixel did not
+        timestamps in **picoseconds**, with NaN where the pixel did not
         register a photon in that frame. All arrays share the same length
         (the number of frames).
     pixels : Sequence[Sequence[tuple[int, int]]]
         Two groups ``[group_a, group_b]``, each a sequence of
         ``(row, col)`` pixels (e.g. the signal and idler blobs read off the
         hitmap). A single ``(row, col)`` is accepted for a one-pixel group.
-    delta_window_native : float | None, optional
-        If given, keep only differences with
-        ``abs(delta) <= delta_window_native``. **In the same units as
-        ``pixel_timestamps``** - picoseconds when a calibration LUT has been
-        applied upstream, raw TDC codes when it has not - which is why this one
-        parameter is not in seconds like the rest of the package: the unit is
-        the caller's to know. 'delta_t' converts a ``delta_window_s`` for you.
-        The default is None (keep all).
     mode : str, optional
         ``'all_pairs'`` (default) forms the full cross product of
         ``group_a`` x ``group_b`` — use this for SPDC/HBT when it is not
@@ -124,9 +125,6 @@ def calculate_differences(
         ta = pixel_timestamps[a]
         tb = pixel_timestamps[b]
         both = ~np.isnan(ta) & ~np.isnan(tb)
-        d = tb[both] - ta[both]
-        if delta_window_native is not None:
-            d = d[np.abs(d) <= delta_window_native]
-        deltas_all[f"{a[0]},{a[1]}-{b[0]},{b[1]}"] = d
+        deltas_all[f"{a[0]},{a[1]}-{b[0]},{b[1]}"] = tb[both] - ta[both]
 
     return deltas_all

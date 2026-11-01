@@ -4,13 +4,10 @@ These tests do not check any physics - they check that the *shape* of the
 package holds as it grows. Two failure modes are guarded:
 
     1. A public function gets added (or renamed) without being declared in the
-       module's ``__all__``, so the declared surface silently drifts from the
-       real one.
+       module's ``__all__``, so the declared surface silently drifts.
 
     2. The same helper gets copy-pasted into a second analysis module instead
-       of being lifted into the shared core. This is how the package ended up
-       with four copies of '_frames_in_file' and three copies of the heatmap
-       plotting skeleton; the test makes the regression loud.
+       of being lifted into the shared core.
 
 See 'docs/adding_an_analysis.md' for the contract these enforce.
 """
@@ -26,17 +23,15 @@ FUNCTIONS_DIR = (
     pathlib.Path(__file__).resolve().parents[1] / "src" / "dapkel" / "functions"
 )
 
-# The analysis modules, in stage order. 'unpack' is stage 0 and shared by all
-# of them, so it is excluded from the duplicate-name check below.
+# The analysis modules. 'unpack' is stage 0 and shared by all of them, so it is
+# excluded from the checks that only make sense for an analysis.
 ANALYSIS_MODULES = [
-    "calc_diff",
     "data_quality",
+    "hitmap_analysis",
     "dcr_analysis",
     "crosstalk_analysis",
-    "hitmap_analysis",
     "tdc_calibration",
-    "background_subtraction",
-    "delta_t",
+    "coincidences",
 ]
 
 ALL_MODULES = ["unpack", *ANALYSIS_MODULES]

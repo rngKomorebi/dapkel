@@ -75,11 +75,15 @@ def sensor_map(
     scale: float = 1.0,
     xlabel: str = "Column",
     ylabel: str = "Row",
+    clip_colorbar_to: float | None = _VMAX_PERCENTILE,
 ) -> plt.Figure:
     """Render a sensor map as a square 2D image with a colour bar.
 
-    The colour scale is clipped at the 99th percentile so a handful of hot
-    pixels cannot wash out the rest of the array.
+    By default the colour scale is clipped at the 99th percentile so a handful
+    of hot pixels cannot wash out the rest of the array. The clip only affects
+    the colour scale - callers title their figures from 'map_stats', which
+    always reports the true maximum, so a clipped bar ending below the titled
+    max is expected.
 
     Parameters
     ----------
@@ -97,6 +101,11 @@ def sensor_map(
         Multiplied into the data before drawing. The default is 1.0.
     xlabel, ylabel : str, optional
         Axis labels. The defaults are ``'Column'`` and ``'Row'``.
+    clip_colorbar_to : float | None, optional
+        Percentile (0-100) used as the colour-scale ceiling. The default is
+        99 - the historical behaviour. Pass None to let the scale run to the
+        true maximum, which shows the hot pixels at the cost of compressing
+        everything else.
 
     Returns
     -------
@@ -105,19 +114,33 @@ def sensor_map(
     """
     scaled = data * scale
     vmax = (
-        float(np.nanpercentile(scaled, _VMAX_PERCENTILE))
-        if np.any(np.isfinite(scaled))
+        float(np.nanpercentile(scaled, clip_colorbar_to))
+        if clip_colorbar_to is not None and np.any(np.isfinite(scaled))
         else None
     )
 
     # Square figure for the sensor map (kept explicit, per the package rule);
     # fonts and colormap come from the active matplotlib style.
-    fig, ax = plt.subplots(figsize=SENSOR_MAP_FIGSIZE)
+    #
+    # Constrained layout, because a square image inside a non-square figure
+    # leaves the colour bar sitting against the right edge of the canvas: its
+    # label was drawn *outside* and every saved map lost it. Constrained rather
+    # than 'tight_layout' because the bar is the case tight layout handles
+    # worst - it measures the axes it knows about and the bar is added after -
+    # and it sizes the figure once here rather than at save time, so the
+    # written '.png' is the size this module asked for.
+    fig, ax = plt.subplots(
+        figsize=SENSOR_MAP_FIGSIZE, layout="constrained"
+    )
 
     im = ax.imshow(
         scaled, cmap=cmap, aspect="equal", vmax=vmax, origin="lower"
     )
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=clabel)
+    # 'fraction' is what keeps the bar proportional to the image rather than to
+    # the figure; the label then needs 'labelpad' to clear the tick numbers.
+    bar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    if clabel:
+        bar.set_label(clabel, labelpad=10)
 
     ax.set_title(title)
     ax.set_xlabel(xlabel)
@@ -202,6 +225,6 @@ def sorted_distribution(
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
-    ax.grid(True, which="both", linewidth=0.5, alpha=0.6)
+    ax.grid(True, which="both")
     fig.tight_layout()
     return fig
