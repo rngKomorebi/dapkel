@@ -41,16 +41,19 @@ the (64, 64) micropixel grid is archived (`archive/core/reduce.py`).
 
 ## Photon rate
 
-The raw map is counts (or occupancy). The rate is that divided by the total
-**live** (shutter-open) time of the acquisition, the same way in both modes:
+The raw map is photon counts. The rate is that divided by the acquisition's
+wall-clock time, the same way in both modes:
 
 ```
-hits / (nframes * n_files * live_per_frame)
+hits / (nframes * n_files * frame_s),   frame_s = max(live_per_frame, 9 µs)
 ```
 
-in Hz. Only the open shutter is photon-sensitive, so this is the flux actually
-seen during the exposure. Normalising by the whole ~9 µs frame instead would
-dilute the rate by the frame/window ratio — 90× for 9 µs / 100 ns.
+in Hz. Under `short_exposure` firmware `frame_s` is the 9 µs cycle
+(`core.timing.FREE_RUNNING_US`), whatever the shutter: the shutter can be made
+shorter, but each frame still takes a full cycle, so a `...T` pixel — one
+photon per frame at most — tops out at ~111 kHz per macropixel. Under
+`long_exposure` the whole, longer cycle is live and is used as is. The shutter
+is still recorded in the sidecar; it no longer enters the rate.
 
 ### The live time depends on the firmware
 
@@ -97,9 +100,9 @@ accepts.
 ### What the number means
 
 In timestamp mode only the *first* photon of a frame is timestamped, so the map
-saturates at one firing per `open_shutter_time_s` — 2 MHz at a 500 ns window —
-and under-reports as it approaches that. It is a firing rate, not a corrected
-photon flux.
+saturates at one photon per frame — ~111 kHz at the nominal 9 µs cycle — and
+under-reports as it approaches that. It is a detection rate per second of
+acquisition, not a corrected photon flux during the open shutter.
 
 ### `nframes` is yours to supply, not the file's
 

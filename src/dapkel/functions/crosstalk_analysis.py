@@ -237,7 +237,7 @@ def plot_crosstalk(
         ax.bar_label(bars, fmt="%.2f")
         ax.set_ylabel("Median CT  (%)")
         ax.set_title("Cross-talk by direction")
-        ax.grid(True, axis="y", linewidth=0.5, alpha=0.6)
+        ax.grid(True, axis="y")
         fig.tight_layout()
         store.save_figure(fig, results_dir, f"{name}_direction_summary.png")
         plt.close(fig)

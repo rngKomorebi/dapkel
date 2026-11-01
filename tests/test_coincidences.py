@@ -626,6 +626,21 @@ def test_a_gaussian_on_a_triangle_is_recovered():
     assert fit["fwhm"] == pytest.approx(2.355 * fit["sigma"])
 
 
+def test_the_subtracted_fit_holds_the_baseline_at_zero():
+    """A free constant would climb onto the tails of a window narrower than them."""
+    x = np.arange(-10_000.0, 10_001.0, 150.0)
+    core = 3600 * np.exp(-(x**2) / (2 * 450.0**2))
+    tails = 600 * np.exp(-(x**2) / (2 * 1500.0**2))
+    y = core + tails + np.random.default_rng(3).normal(0.0, 30.0, x.size)
+
+    fit = co._fit_peak(x, y, fit_window=1000.0)
+
+    assert fit["ok"]
+    assert fit["bkg"] == 0.0
+    assert fit["fit_range"][0] >= -1000.0 - 150.0
+    assert fit["fit_range"][1] <= 1000.0 + 150.0
+
+
 def test_a_flat_fit_that_cannot_determine_a_width_says_so():
     """No curve is drawn for a failed fit, so it must warn rather than go quiet."""
     x = np.arange(-50.0, 51.0)

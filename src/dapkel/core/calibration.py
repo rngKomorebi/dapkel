@@ -40,8 +40,10 @@ def board_taps(
 ) -> np.ndarray:
     """Load the packaged tap widths a run with this file tag should use.
 
-    Reads ``{daughterboard}_{motherboard}_TDC_COMPACT_SPAD{n}_S{n}.npy`` from
-    ``dapkel/params/calibration_data``. A single-micropixel tag (``'S2T'``)
+    Reads ``{daughterboard}_{motherboard}_TDC_COMPACT_*.npy`` from
+    ``dapkel/params/calibration_data``; a SPAD's table is named after its
+    program (``..._S2T.npy``) or in the older form ``..._SPAD2_S2.npy``. A
+    single-micropixel tag (``'S2T'``)
     gets that SPAD's table; anything else (``'ORT'``) the mean of the four - as
     does a single-SPAD tag whose table is missing, with a note.
 
@@ -82,7 +84,12 @@ def board_taps(
 
     spad = _SPAD_TAG.search(tag or "")
     if spad:
-        mine = [n for n in tables if f"SPAD{spad.group(1)}_" in n]
+        n = spad.group(1)
+        mine = [
+            name
+            for name in tables
+            if re.search(rf"_(SPAD{n}_S{n}|S{n}T)\.npy$", name, re.IGNORECASE)
+        ]
         if len(mine) == 1:
             return tables[mine[0]]
         print(

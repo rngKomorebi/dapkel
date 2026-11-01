@@ -1,6 +1,6 @@
 """Per-pixel TDC calibration: the ring's 8 tap widths, valid at every clock.
 
-    process_tdc_calibration   density-test '.bin' -> processed/TDC_COMPACT_<spad>.npy
+    process_tdc_calibration   density-test '.bin' -> processed/TDC_COMPACT_<tag>.npy
     plot_tdc_calibration      those tables -> results/tdc_calibration/ QA figures
 
 The ring-oscillator TDC has non-uniform bin widths (DNL), so a flat
@@ -19,7 +19,7 @@ relative widths only, so a known duration sets the absolute scale. Every other
 timescale downstream is measured from the data.
 
 Copy the tables into ``dapkel/params/calibration_data`` as
-``<daughterboard>_<motherboard>_TDC_COMPACT_<spad>.npy`` to ship them.
+``<daughterboard>_<motherboard>_TDC_COMPACT_<tag>.npy`` to ship them.
 See ``docs/guide/tdc_calibration.md``.
 """
 
@@ -39,8 +39,10 @@ __all__ = ["process_tdc_calibration", "plot_tdc_calibration"]
 #: Analysis name: the results sub-folder for the QA plots.
 _KIND = "tdc_calibration"
 
-# The four SPAD (micropixel) density-test tags, one per 2x2 macropixel corner.
-_SPAD_TAGS = ("SPAD0_S0", "SPAD1_S1", "SPAD2_S2", "SPAD3_S3")
+# The four single-micropixel timestamping programs, one per 2x2 macropixel
+# corner. Only the program tag is fixed in a file name; the rest of it varies
+# from data set to data set.
+_SPAD_TAGS = ("S0T", "S1T", "S2T", "S3T")
 
 
 def _histogram_to_taps(counts: np.ndarray, clock_period_s: float) -> np.ndarray:
@@ -111,8 +113,10 @@ def process_tdc_calibration(
         frame and so measures the ring period best; the tap shape comes out the
         same at any clock.
     tags : tuple[str, ...], optional
-        SPAD file tags to process. The default is the four Kelpie micropixels,
-        ``('SPAD0_S0', 'SPAD1_S1', 'SPAD2_S2', 'SPAD3_S3')``.
+        Program tags to process, matched as ``*_<tag>*.bin`` whatever the rest
+        of the file name is. The default is the four single-micropixel
+        timestamping programs, ``('S0T', 'S1T', 'S2T', 'S3T')``. ``'ORT'``
+        works too, but mixes the four micropixels into one table.
     max_files : int | None, optional
         Use at most this many files per tag. The default is None (all).
 
@@ -123,13 +127,22 @@ def process_tdc_calibration(
 
     Raises
     ------
+    ValueError
+        Raised when a tag is not a timestamping (``...T``) program: counting
+        programs record no TDC codes.
     FileNotFoundError
         Raised when no files match any of ``tags``.
     """
+    for tag in tags:
+        if reduce.readout_mode(tag) != "timestamp":
+            raise ValueError(
+                f"tag {tag!r} is a counting program, which records no TDC "
+                "codes. The density test needs a timestamping one ('S0T', 'ORT')."
+            )
     saved = []
     for tag in tags:
         try:
-            files = io.find_bin_files(path, tag)[:max_files]
+            files = io.find_bin_files(path, tag, require_separator=True)[:max_files]
         except FileNotFoundError:
             print(f"  (no files for tag '{tag}', skipping)")
             continue
@@ -165,7 +178,9 @@ def process_tdc_calibration(
             )
         )
     if not saved:
-        raise FileNotFoundError(f"No '.bin' files matching any of {tags} in:\n  {path}")
+        raise FileNotFoundError(
+            f"No '.bin' files matching '*_<tag>*.bin' for any of {tags} in:\n  {path}"
+        )
     return saved
 
 
@@ -218,7 +233,11 @@ def plot_tdc_calibration(
         ax0.fill_between(x, lo, hi, step="mid", alpha=0.3, label="array 5-95 %")
         ax0.step(x, mid, where="mid", label="array median")
         ax0.plot(x, dnl[r, c], "o-", label=f"pixel ({r},{c})")
-        ax0.axhline(0, color="k", linewidth=0.5)
+        ax0.axhline(
+            0,
+            color=plt.rcParams["axes.edgecolor"],
+            linewidth=plt.rcParams["axes.linewidth"],
+        )
         ax0.set_xlabel("Tap")
         ax0.set_ylabel("DNL  (LSB)")
         ax0.set_title(f"{tag}  tap widths, mean {taps.mean():.1f} ps")
@@ -232,7 +251,7 @@ def plot_tdc_calibration(
             f"{lap.std() / lap.mean() * 100:.2f} % rms"
         )
         for ax in (ax0, ax1):
-            ax.grid(True, linewidth=0.5, alpha=0.6)
+            ax.grid(True)
         fig.tight_layout()
         store.save_figure(
             fig, store.results_dir(path, _KIND), f"TDC_COMPACT_{tag}_qa.png"

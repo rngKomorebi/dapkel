@@ -8,10 +8,11 @@ The tag says what a count is ('core.reduce'): ``...T`` programs (``ORT``,
 pixel per frame - and ``...C`` programs (``ORC``, ``S0C``) sum the photon
 counter.
 
-The rate divides by the total *live* (shutter-open) time of the acquisition,
-``nframes * n_files * open_shutter_time_s`` - not the full ~9 us frame period.
-Only the open shutter is photon-sensitive; normalising by the whole frame would
-dilute the rate by the frame/window ratio. See ``docs/guide/hitmap.md``.
+The rate divides by the acquisition's wall-clock time, ``nframes * n_files *
+frame_s``, where ``frame_s`` is the 9 us frame cycle (or the live time, if
+longer, under ``long_exposure`` firmware) - not the open shutter. A ``...T``
+pixel records at most one photon per frame, so the rate tops out at one per
+cycle (~111 kHz) whatever the shutter. See ``docs/guide/hitmap.md``.
 """
 
 from __future__ import annotations
@@ -41,8 +42,8 @@ def process_hitmap(
 ) -> str:
     """Unpack the '.bin' files, accumulate the hitmap and save it.
 
-    Writes ``processed/<name>_<tag>_hitmap.npy`` (counts, or frames fired for a
-    ``...T`` tag) with a ``.meta.json`` sidecar recording the frame count and
+    Writes ``processed/<name>_<tag>_hitmap.npy`` (photons; at most one per pixel
+    per frame for a ``...T`` tag) with a ``.meta.json`` sidecar recording the frame count and
     the live time, which is everything 'plot_hitmap' needs for the rate map.
 
     Parameters
@@ -51,7 +52,7 @@ def process_hitmap(
         Folder with the '.bin' data files.
     nframes : int
         Frames the acquisition recorded per '.bin' file. Sets the rate's
-        denominator, ``nframes * n_files * open_shutter_time_s``. Do not infer
+        denominator, ``nframes * n_files * frame_s``. Do not infer
         it from the file size - the exe dumps a fixed, larger DDR3 region.
     tag : str, optional
         File tag: ``'ORT'``, ``'ORC'``, ``'S0C'``, ``'S2T'``... The default is
@@ -119,14 +120,16 @@ def plot_hitmap(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Load a saved hitmap and save its counts and photon-rate maps.
 
-    Writes two figures to ``results/hitmap``: the counts (frames fired) map and
-    the photon-rate map, ``hits / (nframes * n_files * open_shutter_time_s)``
-    in Hz, both normalisation inputs read from the sidecar. Derivation:
-    ``docs/guide/hitmap.md``.
+    Writes two figures to ``results/hitmap``: the photon counts map and
+    the photon-rate map, ``hits / (nframes * n_files * frame_s)`` in Hz.
+    ``frame_s`` is the 9 µs frame cycle ('core.timing.FREE_RUNNING_US'), or
+    the sidecar's live time per frame when that is longer (``long_exposure``
+    firmware). The shutter does not enter: it can be shorter, but a frame still
+    takes a cycle. Derivation: ``docs/guide/hitmap.md``.
 
     In timestamp mode only the *first* photon of a frame is timestamped, so the
-    rate saturates at one per ``open_shutter_time_s`` - 2 MHz at a 500 ns
-    window - and under-reports as it approaches that.
+    rate saturates at one per cycle - ~111 kHz per macropixel - and
+    under-reports as it approaches that.
 
     Parameters
     ----------
@@ -144,8 +147,8 @@ def plot_hitmap(
     Returns
     -------
     counts : np.ndarray
-        The (32, 32) counts map - frames fired for a ``...T`` tag, photon
-        counts for a ``...C`` one.
+        The (32, 32) photon counts map - first photons for a ``...T`` tag,
+        the photon counter for a ``...C`` one.
     rate : np.ndarray
         The (32, 32) photon-rate map, in Hz.
 
@@ -155,15 +158,16 @@ def plot_hitmap(
         Raised when no saved hitmap exists for ``tag``.
     """
     hitmap, meta = store.load_map(path, kind=_KIND, tag=tag)
-    rate = hitmap / meta["live_time_s"]
+    # A frame takes at least one 9 µs cycle, however short its shutter.
+    frame_s = max(meta["frame_live_s"], timing.FREE_RUNNING_US * 1e-6)
+    rate = hitmap / (meta["total_frames"] * frame_s)
     name = store.map_file_name(
         os.path.basename(os.path.normpath(path)), _KIND, tag
     ).removesuffix(".npy")
     results_dir = store.results_dir(path, _KIND)
 
-    counts_label = "photon counts" if meta["mode"] == "count" else "frames fired"
     for data, clabel, title, suffix in (
-        (hitmap, counts_label, "Hitmap", ""),
+        (hitmap, "photons", "Hitmap", ""),
         (rate, "Hz", "Photon rate", "_rate"),
     ):
         median, maximum, total = plots.map_stats(data)
@@ -172,7 +176,7 @@ def plot_hitmap(
             stats += f"  total {total:.3g}"
         fig = plots.sensor_map(
             data,
-            title=f"{title}  {data.shape[0]}×{data.shape[1]}\n{stats}  [{clabel}]",
+            title=f"{title}\n{stats}  [{clabel}]",
             clabel=clabel,
             cmap=cmap,
             clip_colorbar_to=clip_colorbar_to,
@@ -181,8 +185,8 @@ def plot_hitmap(
         plt.close(fig)
 
     print(
-        f"  {meta['total_frames']} frames x {meta['frame_live_s'] * 1e9:.0f} ns "
-        f"live = {meta['live_time_s'] * 1e3:.3f} ms;  rate median "
+        f"  {meta['total_frames']} frames x {frame_s * 1e6:.3g} us "
+        f"= {meta['total_frames'] * frame_s * 1e3:.3f} ms;  rate median "
         f"{np.nanmedian(rate):.3g}  max {np.nanmax(rate):.3g} Hz"
     )
     return hitmap, rate

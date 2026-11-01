@@ -77,7 +77,7 @@ def test_modes_read_different_fields(tmp_path, monkeypatch):
     timestamped, meta_t = _dcr(tmp_path, "S0T")
     counted, meta_c = _dcr(tmp_path, "S0C")
 
-    assert timestamped[5, 7] == pytest.approx(4 / live)  # 4 frames fired
+    assert timestamped[5, 7] == pytest.approx(4 / live)  # 4 photons
     assert counted[5, 7] == pytest.approx(4 * 450 / live)  # 4 x the raw field
     assert np.nansum(timestamped) == pytest.approx(timestamped[5, 7])
     assert (meta_t["mode"], meta_c["mode"]) == ("timestamp", "count")

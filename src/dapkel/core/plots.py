@@ -225,6 +225,6 @@ def sorted_distribution(
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
-    ax.grid(True, which="both", linewidth=0.5, alpha=0.6)
+    ax.grid(True, which="both")
     fig.tight_layout()
     return fig

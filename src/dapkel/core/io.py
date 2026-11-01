@@ -33,7 +33,7 @@ def find_bin_files(
         Path to the folder with the '.bin' data files.
     tag : str
         Filename fragment selecting the files (e.g. ``'ORT'``, ``'S0C'``,
-        ``'SPAD0_S0'``), or ``''`` to match every '.bin' file in the path.
+        ``'S2T'``), or ``''`` to match every '.bin' file in the path.
     require_separator : bool, optional
         When True the tag must be preceded by an underscore (pattern
         ``'*_<tag>*.bin'`` instead of ``'*<tag>*.bin'``). The DCR quadrant

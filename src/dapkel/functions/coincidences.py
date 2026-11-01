@@ -510,6 +510,13 @@ def _subtract(
     }
 
 
+def _zero_line(ax: plt.Axes) -> None:
+    """Draw y = 0 like the axes frame, so the line follows the style."""
+    ax.axhline(
+        0, color=plt.rcParams["axes.edgecolor"], linewidth=plt.rcParams["axes.linewidth"]
+    )
+
+
 def _subtraction_figure(
     sub: dict, full: dict | None, *, name: str, label: str, window_s: float
 ) -> plt.Figure:
@@ -533,11 +540,10 @@ def _subtraction_figure(
     fig, axes = plt.subplots(3, 1)
     x = wide["centers"] / 1000.0
     per = f"{wide['bin_width_s'] * 1e12:.0f} ps"
-    axes[0].plot(x, wide["signal"], lw=1.2, label="same frame (lag 0)")
+    axes[0].plot(x, wide["signal"], label="same frame (lag 0)")
     axes[0].plot(
         x,
         wide["background"],
-        lw=1.2,
         label=f"shifted frames (mean of {wide['k']} lags)",
     )
     axes[0].set_ylabel(f"per {per}")
@@ -545,19 +551,19 @@ def _subtraction_figure(
     axes[1].fill_between(
         x, -wide["error"], wide["error"], alpha=0.35, label="+/- 1 sigma"
     )
-    axes[1].plot(x, wide["residual"], lw=1.0, label="lag 0 - accidentals")
+    axes[1].plot(x, wide["residual"], label="lag 0 - accidentals")
     axes[1].set_ylabel(f"excess / {per}")
     axes[1].set_title("Residual over the plotted window")
     xz = zoom["centers"] / 1000.0
     axes[2].fill_between(
         xz, -zoom["error"], zoom["error"], alpha=0.35, label="+/- 1 sigma"
     )
-    axes[2].step(xz, zoom["residual"], where="mid", lw=1.0, label="subtracted")
+    axes[2].step(xz, zoom["residual"], where="mid", label="subtracted")
     axes[2].set_ylabel(f"excess / {zoom['bin_width_s'] * 1e12:.0f} ps")
     axes[2].set_title("Coincidence peak on a zero baseline")
     for i, ax in enumerate(axes):
         if i:
-            ax.axhline(0, color="k", lw=0.8)
+            _zero_line(ax)
         # Outside, top-aligned: at the house font size these captions cover the
         # peak wherever they sit inside a panel. 'tight_layout' measures them,
         # so the column they need is reserved without a 'rect'.
@@ -565,11 +571,7 @@ def _subtraction_figure(
             loc="upper left",
             bbox_to_anchor=(1.02, 1.0),
             borderaxespad=0.0,
-            frameon=False,
-            handlelength=1.4,
-            labelspacing=0.5,
         )
-        ax.grid(True, lw=0.5, alpha=0.6)
         ax.set_xlabel("Timestamp difference  (ns)")
         ax.set_xlim(-window_s * 1e9, window_s * 1e9)
     fig.tight_layout()
@@ -659,12 +661,13 @@ def _fit_peak(
     half_base: float | None = None,
     fit_window: float | None = None,
 ) -> dict:
-    """Fit a Gaussian peak on a triangle (``half_base`` given) or a constant.
+    """Fit a Gaussian peak on a triangle (``half_base`` given) or on zero.
 
     Triangle: the raw ORT histogram, fitted over all of it, with ``half_base``
-    (the measured full scale, in ps) seeding a free parameter. Constant: a
-    lag-subtracted residual, fitted within ``fit_window`` ps of the tallest bin;
-    its level is unbounded below because that baseline is zero-mean noise.
+    (the measured full scale, in ps) seeding a free parameter. Zero: a
+    lag-subtracted residual, fitted within ``fit_window`` ps of the tallest bin.
+    Its baseline is held at 0, not fitted: the subtraction already removed the
+    accidentals, and a free constant only lifts itself onto the peak's tails.
 
     A fit that fails - including one whose sigma the covariance cannot tell from
     zero, which a wrong background model produces - comes back ``ok=False`` with
@@ -673,9 +676,10 @@ def _fit_peak(
     Returns
     -------
     dict
-        ``amp``, ``mu``, ``sigma``, ``sigma_err``, ``bkg`` (constant or triangle
+        ``amp``, ``mu``, ``sigma``, ``sigma_err``, ``bkg`` (0, or the triangle
         apex), ``half_base`` (triangle), ``fwhm``, ``fwhm_err``,
-        ``jitter_per_detector`` (sigma / sqrt 2), its ``_err``, and ``ok``.
+        ``jitter_per_detector`` (sigma / sqrt 2), its ``_err``, ``fit_range``
+        (the first and last fitted bin centre, ps) and ``ok``.
     """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -702,25 +706,23 @@ def _fit_peak(
         return result
 
     if half_base is None:
-        tail = np.r_[y[: len(y) // 3], y[-(len(y) // 3) :]]
-        bkg0 = float(np.median(tail)) if tail.size else 0.0
         if fit_window is not None:
             sel = np.abs(x - x[np.argmax(y)]) <= fit_window
             x, y = x[sel], y[sel]
         if len(x) < 4:
             return _give_up(f"only {len(x)} bins in the fit window")
-        w = np.clip(y - bkg0, 0.0, None)
+        w = np.clip(y, 0.0, None)
         if w.sum() <= 0:
             return _give_up("no counts above the background level")
         mu0 = float(np.sum(w * x) / w.sum())
         sigma0 = float(np.sqrt(np.sum(w * (x - mu0) ** 2) / w.sum())) or x[1] - x[0]
 
-        def model(x, amp, mu, sigma, bkg):
-            return amp * np.exp(-((x - mu) ** 2) / (2.0 * sigma**2)) + bkg
+        def model(x, amp, mu, sigma):
+            return amp * np.exp(-((x - mu) ** 2) / (2.0 * sigma**2))
 
-        p0 = [float(y.max() - bkg0), mu0, sigma0, bkg0]
-        lo = [0.0, float(x.min()), 0.0, -np.inf]
-        hi = [np.inf, float(x.max()), np.inf, np.inf]
+        p0 = [float(y.max()), mu0, sigma0]
+        lo = [0.0, float(x.min()), 0.0]
+        hi = [np.inf, float(x.max()), np.inf]
     else:
         if len(x) < 6:
             return _give_up(f"only {len(x)} bins")
@@ -765,7 +767,8 @@ def _fit_peak(
     except (RuntimeError, ValueError) as exc:
         return _give_up(str(exc).strip().splitlines()[0])
 
-    amp, mu, sigma, bkg = popt[:4]
+    amp, mu, sigma = popt[:3]
+    bkg = 0.0 if half_base is None else popt[3]
     if amp <= 0 or not np.isfinite(sigma) or sigma <= 0:
         return _give_up(f"fit returned amp={amp:.3g}, sigma={sigma:.3g}")
     sigma_err = float(np.sqrt(pcov[2, 2])) if np.all(np.isfinite(pcov)) else np.nan
@@ -788,6 +791,7 @@ def _fit_peak(
         fwhm_err=2.355 * sigma_err,
         jitter_per_detector=sigma / np.sqrt(2),
         jitter_per_detector_err=sigma_err / np.sqrt(2),
+        fit_range=(float(x.min()), float(x.max())),
         ok=True,
     )
     if half_base is not None:
@@ -808,7 +812,7 @@ def plot_coincidences(
     *,
     bin_width_s: float = timing.CODE_S,
     plot_window_s: float | None = None,
-    fit_window_s: float | None = 1e-9,
+    fit_window_s: float | None = 5e-9,
     pairs: Sequence[str] | None = None,
     label: str = "spdc",
     title: str | None = None,
@@ -823,8 +827,9 @@ def plot_coincidences(
 
     The fit model is not a parameter: on the raw histogram it is ``Gaussian +
     triangle`` with the measured full scale seeding the half-base; with
-    ``subtract_background`` it is ``Gaussian + constant`` within
-    ``fit_window_s`` of the peak, there being no triangle left.
+    ``subtract_background`` it is a Gaussian on a zero baseline within
+    ``fit_window_s`` of the peak, there being no background left. The curve
+    and the residual panel cover only the fitted range.
 
     Parameters
     ----------
@@ -838,9 +843,10 @@ def plot_coincidences(
         Half-range around zero, in seconds. The default is None: the measured
         TDC full scale, the whole support the triangle fit wants.
     fit_window_s : float | None, optional
-        Half-range around the peak, in seconds - the flat fit's range and the
-        window the model-free coincidence count is summed over. Ignored by the
-        triangle fit. The default is ``1e-9``.
+        Half-range around the peak, in seconds - the subtracted fit's range and
+        the window the model-free coincidence count is summed over. Wide enough
+        to reach past the peak's diffusion tails (~3 ns), so the fit sees them
+        end. Ignored by the triangle fit. The default is ``5e-9``.
     pairs : Sequence[str] | None, optional
         Pool only these pixel-pair labels (``"ra,ca-rb,cb"``). The default is
         None (every pair).
@@ -956,44 +962,65 @@ def plot_coincidences(
         fit["car"] = (fit["amp"] + fit["bkg"]) / fit["bkg"] if fit["bkg"] else np.inf
     fit["n"] = n
 
-    fig, ax = plt.subplots()
-    ax.bar(centers, counts, width=timing.to_ps(bin_width_s), label=f"data ({n} pairs)")
+    fig, (ax, ax_res) = plt.subplots(
+        2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 1]}
+    )
+    width_ps = timing.to_ps(bin_width_s)
+    ax.bar(centers, counts, width=width_ps, label=f"data ({n} pairs)")
     if fit["ok"]:
-        window_ps = timing.to_ps(plot_window_s)
-        xs = np.linspace(-window_ps, window_ps, 4000)
-        shape = (
-            np.clip(1.0 - np.abs(xs) / fit["half_base"], 0.0, None)
-            if "half_base" in fit
-            else 1.0
-        )
-        jitter = _pm(fit["jitter_per_detector"], fit["jitter_per_detector_err"])
+
+        def model(x: np.ndarray) -> np.ndarray:
+            shape = (
+                np.clip(1.0 - np.abs(x) / fit["half_base"], 0.0, None)
+                if "half_base" in fit
+                else 1.0
+            )
+            gauss = np.exp(-((x - fit["mu"]) ** 2) / (2.0 * fit["sigma"] ** 2))
+            return fit["amp"] * gauss + fit["bkg"] * shape
+
+        # Only where it was fitted: drawn further out, the model claims a
+        # baseline nothing constrained.
+        start, stop = fit["fit_range"]
+        xs = np.linspace(start, stop, 4000)
         ax.plot(
             xs,
-            fit["amp"] * np.exp(-((xs - fit["mu"]) ** 2) / (2.0 * fit["sigma"] ** 2))
-            + fit["bkg"] * shape,
-            "r-",
-            linewidth=2,
+            model(xs),
+            color="C1",
             label=(
-                f"sigma = {_pm(fit['sigma'], fit['sigma_err'])}\n"
                 f"FWHM = {_pm(fit['fwhm'], fit['fwhm_err'])}\n"
-                f"per-detector = {jitter}"
+                rf"$\sigma$ = {_pm(fit['sigma'], fit['sigma_err'])}"
+                "\n"
+                r"$\sigma_\mathrm{detector}$ = "
+                f"{_pm(fit['jitter_per_detector'], fit['jitter_per_detector_err'])}"
             ),
         )
-    ax.set_xlabel("Timestamp difference  (ps)")
+        fitted = (centers >= start) & (centers <= stop)
+        ax_res.bar(
+            centers[fitted],
+            counts[fitted] - model(centers[fitted]),
+            width=width_ps,
+        )
+    else:
+        ax_res.text(
+            0.5, 0.5, "no fit", ha="center", va="center", transform=ax_res.transAxes
+        )
+    _zero_line(ax_res)
+    ax_res.set_xlabel("Timestamp difference  (ps)")
+    ax_res.set_ylabel("Data - fit")
     ax.set_ylabel(
         "Coincidences - accidentals" if subtract_background else "Coincidences"
     )
     ax.set_title(title or f"{label.upper()} coincidence peak  ({name})")
-    ax.grid(True, linewidth=0.5, alpha=0.6)
     ax.legend()
+    fig.tight_layout()
     stem = "coincidences_sub" if subtract_background else "coincidences"
     store.save_figure(fig, results_dir, f"{name}_{label}_{stem}.png")
 
     if fit["ok"]:
         print(
-            f"  peak: mu {fit['mu']:.0f} ps  sigma "
-            f"{_pm(fit['sigma'], fit['sigma_err'], ' +- ')}  FWHM "
-            f"{_pm(fit['fwhm'], fit['fwhm_err'], ' +- ')}  per-detector "
+            f"  peak: mu {fit['mu']:.0f} ps  FWHM "
+            f"{_pm(fit['fwhm'], fit['fwhm_err'], ' +- ')}  sigma "
+            f"{_pm(fit['sigma'], fit['sigma_err'], ' +- ')}  sigma_detector "
             f"{_pm(fit['jitter_per_detector'], fit['jitter_per_detector_err'], ' +- ')}"
             + ("" if subtract_background else f"  peak/bkg {fit['car']:.2f}")
         )

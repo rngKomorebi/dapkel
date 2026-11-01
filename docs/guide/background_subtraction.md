@@ -119,10 +119,13 @@ Read that line before quoting anything from the peak.
 Once the triangle has been subtracted there is no triangle left to fit — which
 is why the model is not a parameter. `subtract_background` settles it: flat on
 the residual, triangular on a raw histogram. The residual sits on a zero
-baseline, which is precisely the case a Gaussian on a constant is valid for —
-and unlike on raw data, the flat background is not an approximation over a
-narrow window, it is the truth over the whole support. The fit runs within
-`fit_window_s` of the peak.
+baseline, and it is not an approximation over a narrow window: it is the
+truth over the whole support. So the baseline is held at zero rather than
+fitted. A free constant has nothing to pin it but the peak's own diffusion
+tails, and on a window narrower than those (~3 ns) it climbs onto them — on
+2026.10.30 ORT, ±1 ns gave a "background" of 668 under a 3600-count peak and
+shrank sigma from 723 to 536 ps. The fit runs within `fit_window_s` (default
+5 ns) of the peak, and the curve and residuals are drawn over that range only.
 
 Two numbers come out, and they answer different questions:
 

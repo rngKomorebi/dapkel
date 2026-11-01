@@ -181,18 +181,24 @@ def test_process_and_plot_the_calibration(tmp_path):
 
     rng = np.random.default_rng(4)
     for i in range(2):
-        (tmp_path / f"SPAD0_S0_{i}.bin").write_bytes(
+        (tmp_path / f"density_test_S0T{i}.bin").write_bytes(
             rng.bytes(io.BYTES_PER_FRAME * 20)
         )
 
     saved = tc.process_tdc_calibration(str(tmp_path), 20, 100e-9)
     tables = tc.plot_tdc_calibration(str(tmp_path))
 
-    assert [os.path.basename(p) for p in saved] == ["TDC_COMPACT_SPAD0_S0.npy"]
-    assert tables["SPAD0_S0"].shape == (32, 32, calibration.TAPS_PER_LAP)
+    assert [os.path.basename(p) for p in saved] == ["TDC_COMPACT_S0T.npy"]
+    assert tables["S0T"].shape == (32, 32, calibration.TAPS_PER_LAP)
     assert store.read_meta(saved[0])["measured_at_clock_period_s"] == 100e-9
     assert os.path.isfile(
         os.path.join(store.results_dir(str(tmp_path), "tdc_calibration"),
-                     "TDC_COMPACT_SPAD0_S0_qa.png")
+                     "TDC_COMPACT_S0T_qa.png")
     )
     plt.close("all")
+
+
+@pytest.mark.parametrize("tag", ["S0C", "ORC"])
+def test_a_counting_tag_has_no_codes_to_calibrate(tmp_path, tag):
+    with pytest.raises(ValueError, match="counting program"):
+        tc.process_tdc_calibration(str(tmp_path), 20, 100e-9, tags=(tag,))

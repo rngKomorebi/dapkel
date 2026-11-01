@@ -108,7 +108,7 @@ flat about zero — one decision, not two:
 | histogram | model | fitted over |
 |---|---|---|
 | raw (default) | Gaussian on a triangular background, the measured full scale seeding the half-base | the whole plotted window |
-| lag-subtracted residual | Gaussian on a constant | `fit_window_s` (default 1 ns) around the peak |
+| lag-subtracted residual | Gaussian on a zero baseline (not fitted) | `fit_window_s` (default 5 ns) around the peak |
 
 A fit that fails — including one whose sigma the covariance cannot tell from
 zero, which a wrong background model produces — comes back with `fit["ok"]`
@@ -117,7 +117,7 @@ False and a `RuntimeWarning`, so a plot without a curve always says why.
 `plot_coincidences` returns `(counts, centers, fit)`: the fitted histogram, the bin
 centres in picoseconds and a dict of `amp`, `mu`, `sigma`, `fwhm`,
 `jitter_per_detector` (sigma / √2), each with its `_err`, the background level
-`bkg`, `car` (peak-to-background, raw histogram only), `n` and `ok` — enough to
+`bkg` (0 on a residual), `fit_range`, `car` (peak-to-background, raw histogram only), `n` and `ok` — enough to
 re-fit by hand with any model without touching disk. The fit models themselves
 are private, and the two-Gaussian (narrow core on broad tails) model is retired
 to the repository's `archive/` folder.

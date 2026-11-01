@@ -142,9 +142,13 @@ meaningless. 2 MHz already uses 85 % of it.
 
 ## Per-SPAD tables
 
-The calibration data are recorded per micropixel — one `SPADn_Sn` tag per SPAD
-of the 2×2 macropixel, the default `tags` of `process_tdc_calibration` — so a
-separate `(32, 32, 8)` table is produced for each of the four SPADs.
+The calibration data are recorded per micropixel — one `S0T`...`S3T`
+timestamping run per SPAD of the 2×2 macropixel, the default `tags` of
+`process_tdc_calibration` — so a separate `(32, 32, 8)` table is produced for
+each of the four SPADs. Only the program tag is fixed in a file name, so files
+are matched as `*_<tag>*.bin` whatever the rest of the name is
+(`density_test_S2T12.bin`). A counting tag (`S0C`, `ORC`) is refused: those
+programs record no TDC codes.
 
 Because ORT does not record *which* of the four micropixels fired, the average of
 the four is the only honest table for an `ORT` run — while an `S0T`...`S3T` run
@@ -182,8 +186,9 @@ median and 5–95 % band, and the ring period across all pixels — the per-pixe
 time-base gain the table carries.
 
 To ship a calibration, copy the tables into `dapkel/params/calibration_data` as
-`<daughterboard>_<motherboard>_TDC_COMPACT_<spad>.npy` — currently
-`D0_M0_TDC_COMPACT_SPAD{n}_S{n}.npy`, n = 0..3.
+`<daughterboard>_<motherboard>_TDC_COMPACT_<tag>.npy`, e.g.
+`D0_M0_TDC_COMPACT_S2T.npy`. The packaged tables still use the older
+`D0_M0_TDC_COMPACT_SPAD{n}_S{n}.npy` names; `board_taps` reads both.
 [`board_taps`][dapkel.core.calibration.board_taps] reads them by daughterboard /
 motherboard number, resolved via `importlib.resources` so it works from a pip
 install, and [the coincidence pipeline](coincidences.md) applies them with

@@ -62,7 +62,7 @@ def test_hitmap_round_trip(tmp_path):
     saved_counts, meta = store.load_map(npy_path=saved)
     assert meta["total_frames"] == 3 * NFRAMES
     np.testing.assert_array_equal(counts, saved_counts)
-    np.testing.assert_allclose(rate, counts / (3 * NFRAMES * 500e-9))
+    np.testing.assert_allclose(rate, counts / (3 * NFRAMES * 9e-6))
     name = os.path.basename(path)
     assert _figures(path, "hitmap") == [
         f"{name}_ort_hitmap.png",

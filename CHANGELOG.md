@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0] - 2026-11-01
 
 ### Changed
 
@@ -45,6 +45,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     81 pairs, raw and calibrated), and the fits and model-free count match to
     every printed digit.
   - **`plot_hitmap` returns `(counts, rate)`** and saves both maps.
+  - **The hitmap rate is per frame cycle, not per open shutter**:
+    `hits / (nframes * n_files * max(live_per_frame, 9 µs))`, so a `...T`
+    pixel tops out at ~111 kHz whatever the shutter. It was `hits / (... *
+    open_shutter_time_s)`, which read 18x higher at a 500 ns shutter. Computed
+    in `plot_hitmap` from the sidecar, so saved hitmaps need no reprocessing.
+    The colorbar label is "photons" (was "frames fired") and the titles no
+    longer carry the map size. DCR is still normalised by the live time.
+  - **The coincidence figure has a residuals panel** (data - fit) under the
+    histogram, and its legend reads FWHM, σ and σ_detector (= σ / √2).
+  - **The subtracted fit holds its baseline at zero** instead of fitting a
+    constant, and `fit_window_s` defaults to 5 ns (was 1 ns). On a window
+    narrower than the peak's ~3 ns tails the free constant climbed onto them
+    (668 counts on 2026.10.30 ORT) and shrank sigma from 723 to 536 ps. The
+    fit curve and residuals are drawn over the fitted range only; `fit` gains
+    `fit_range`.
+  - **Plots no longer override the house style**: the coincidence figures
+    dropped their hard-coded red fit, black zero lines, thin linewidths and
+    frameless legends, and every module dropped its grid linewidth/alpha, so
+    the active komorebi_mpl style (dapkel by default) sets all of it.
   - **`process_crosstalk` on a parent folder** processes each pairing
     sub-folder and saves the combined (64, 64) directional map; `plot_crosstalk`
     draws whichever was saved. The artifact is named by the batch prefix
@@ -64,6 +83,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `core.timing.resolve_live_time(firmware_version, *, open_shutter_time_s,
   exp_time_s)` drops its unused `nframes` and raises when `short_exposure` has no
   shutter time, instead of returning None for every caller to check.
+- **BREAKING: `process_tdc_calibration` selects files by program tag.** The
+  default `tags` are `('S0T', 'S1T', 'S2T', 'S3T')`, matched as
+  `*_<tag>*.bin`, since the program tag is the only part of a file name that is
+  the same in every data set; the old `SPADn_Sn` defaults found nothing in real
+  runs. Tables are saved as `TDC_COMPACT_S0T.npy`..., and a counting tag
+  (`S0C`, `ORC`) is refused, as it records no TDC codes. `board_taps` reads
+  packaged tables under either name (`..._S2T.npy` or `..._SPAD2_S2.npy`).
 
 ### Removed
 

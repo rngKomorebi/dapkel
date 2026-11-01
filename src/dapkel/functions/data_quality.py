@@ -117,7 +117,7 @@ def plot_time_codes(
         f"Pixel ({r},{c})  time codes  (n={hist.sum()}, {used.size} unique, "
         f"spanning {span})"
     )
-    ax.grid(True, linewidth=0.5, alpha=0.6)
+    ax.grid(True)
     fig.tight_layout()
 
     name = os.path.basename(os.path.normpath(path))

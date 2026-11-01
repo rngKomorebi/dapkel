@@ -363,10 +363,10 @@ def confirm_rewrite(
 
     remaining = wait
     while remaining > 0:
-        print(f"  overwriting in {remaining:.0f} s ... ", end="", flush=True)
+        print(f"  overwriting in {remaining:.0f} s ...", flush=True)
         step = min(1.0, remaining)
         time.sleep(step)
         remaining -= step
     if wait > 0:
-        print("\n  overwriting now.\n")
+        print("  overwriting now.\n")
     return True
