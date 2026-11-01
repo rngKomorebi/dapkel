@@ -568,16 +568,31 @@ def test_subtracting_needs_an_artifact_with_lag_planes(bin_folder):
         co.plot_coincidences(bin_folder, subtract_background=True, label="test")
 
 
-def test_the_fit_model_follows_the_histogram_and_is_not_a_parameter(bin_folder):
-    """Triangle on raw data, flat on a residual - without being told."""
+def test_the_fit_model_follows_the_histogram_and_is_not_a_parameter(
+    bin_folder, monkeypatch
+):
+    """Triangle on raw data, flat on a residual - without being told.
+
+    The model is read off the call, not off the fit result: the fixture is
+    random bytes with no peak, and whether a fit to noise converges is down to
+    the platform's floating point (it did not on ubuntu / py3.11).
+    """
     _run(bin_folder, subtract_background=True, background_lags=(1, 2))
     kwargs = dict(bin_width_s=4 * CODE_S, plot_window_s=200 * CODE_S, label="test")
+    half_bases = []
+    real_fit = co._fit_peak
 
-    _, _, raw = co.plot_coincidences(bin_folder, **kwargs)
+    def spy(x, y, *, half_base=None, **kw):
+        half_bases.append(half_base)
+        return real_fit(x, y, half_base=half_base, **kw)
+
+    monkeypatch.setattr(co, "_fit_peak", spy)
+
+    co.plot_coincidences(bin_folder, **kwargs)
     _, _, residual = co.plot_coincidences(bin_folder, subtract_background=True, **kwargs)
 
-    assert "half_base" in raw
-    assert "half_base" not in residual
+    assert half_bases[0] is not None  # raw: the triangle
+    assert all(hb is None for hb in half_bases[1:])  # residual: zero baseline
     assert "model_free" in residual
     assert "background" not in inspect.signature(co.plot_coincidences).parameters
     plt.close("all")
