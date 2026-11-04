@@ -31,6 +31,9 @@ A fresh virtual environment is recommended
 pip install dapkel
 ```
 
+Python 3.10 to 3.15; the test suite runs on every one of them, on Windows and
+Ubuntu, on every push.
+
 To work on the package itself, clone the repo and install it in editable mode
 with the test and documentation extras:
 

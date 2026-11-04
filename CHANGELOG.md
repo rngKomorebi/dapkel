@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-11-04
+
+### Changed
+
+- **Dependencies are capped below their next major version** in both
+  `pyproject.toml` and `requirements.txt` (`numpy>=1.24,<3`,
+  `matplotlib>=3.8,<4`, `scipy>=1.10,<2`, `tqdm>=4.60,<5`,
+  `komorebi_mpl>=0.0.5,<1`). A lower bound alone let pip install whatever the
+  newest release was, including a major nobody had run the code on. Caps
+  rather than pins because one pin cannot serve every supported Python.
+- The Tests workflow runs on every push to every branch (was `main` and
+  `develop` only) and on Python 3.10 through 3.15, on Windows and Ubuntu.
+  Classifiers list 3.14 and 3.15.
+- The JSON metadata sidecars are read and written as UTF-8 explicitly. Python
+  3.15 makes UTF-8 the default everywhere; earlier Pythons on Windows used the
+  ANSI code page, so a bare `open()` could decode a sidecar differently across
+  the matrix.
+
+### Removed
+
+- `pandas` and `pyarrow` from the dependencies. Only the feather delta-t path
+  used them, and that has lived in `archive/` since 1.0.0.
+
+### Added
+
+- `tests/test_packaging.py`: `requirements.txt` must match pyproject's
+  dependencies, every dependency must be a bounded range, the CI Python matrix
+  must equal the classifiers and start at `requires-python`, every module must
+  import, and every text-mode `open()` in `src/` must name its encoding.
+
 ## [1.0.0] - 2026-11-01
 
 ### Changed
@@ -895,7 +925,7 @@ Initial commit.
 
 - Functions for unpacking raw, binary data and analyzing dark count rate.
 
-[Unreleased]: https://github.com/rngKomorebi/dapkel/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rngKomorebi/dapkel/compare/v1.0.0...HEAD
 [0.2.0]: https://github.com/rngKomorebi/dapkel/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/rngKomorebi/dapkel/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/rngKomorebi/dapkel/compare/v0.1.2...v0.1.3

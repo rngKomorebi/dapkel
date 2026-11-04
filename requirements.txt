@@ -1,14 +1,16 @@
-# Runtime dependencies, mirroring [project.dependencies] in pyproject.toml.
-# pyproject.toml is the source of truth; this file exists only for the
-# "clone the repo, then pip install -r" path. Prefer:
+# Runtime dependencies. Must match [project.dependencies] in pyproject.toml
+# exactly; tests/test_packaging.py fails when the two drift. pyproject.toml is
+# the source of truth; this file exists only for the "clone the repo, then
+# pip install -r requirements.txt" path. Prefer:
 #
 #     pip install -e ".[dev,docs]"
 #
 # which installs these plus the test and documentation tooling.
-komorebi_mpl>=0.0.5
-matplotlib>=3.8
-numpy>=1.24
-pandas>=2.0
-pyarrow>=14
-scipy>=1.10
-tqdm>=4.60
+#
+# Each entry is capped below its next major version, where APIs get removed,
+# rather than pinned: one pin cannot serve every Python in requires-python.
+komorebi_mpl>=0.0.5,<1
+matplotlib>=3.8,<4
+numpy>=1.24,<3
+scipy>=1.10,<2
+tqdm>=4.60,<5

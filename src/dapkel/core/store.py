@@ -147,7 +147,7 @@ def read_meta(npy_path: str) -> dict:
     path = meta_path(npy_path)
     if os.path.isfile(path):
         try:
-            with open(path) as fh:
+            with open(path, encoding="utf-8") as fh:
                 return json.load(fh)
         except (OSError, ValueError):
             pass
@@ -197,7 +197,7 @@ def save_map(
     out_path = os.path.join(out_dir, name)
 
     np.save(out_path, data)
-    with open(meta_path(out_path), "w") as fh:
+    with open(meta_path(out_path), "w", encoding="utf-8") as fh:
         json.dump({"kind": kind, "tag": tag, **(meta or {})}, fh, indent=2)
 
     if not quiet:
