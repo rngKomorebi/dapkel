@@ -31,18 +31,25 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Physics",
     "Typing :: Typed",
 ]
+# Every dependency has a lower bound and a cap below its next major version,
+# where APIs get removed (numpy 2.0 dropped np.float_, np.NaN, np.product).
+# Caps rather than '==' pins: one pin cannot serve every Python in
+# requires-python (numpy 2.5 needs >=3.12; the last numpy for 3.10 is 2.2).
+# requirements.txt must list exactly these specifiers; tests/test_packaging.py
+# fails when the two drift. Raise a cap only after the tests pass on the new
+# major, and raise it in both files.
 dependencies = [
-    "numpy>=1.24",
-    "matplotlib>=3.8",
-    "komorebi_mpl>=0.0.5",
-    "pandas>=2.0",
-    "pyarrow>=14",
-    "scipy>=1.10",
-    "tqdm>=4.60",
+    "numpy>=1.24,<3",
+    "matplotlib>=3.8,<4",
+    "komorebi_mpl>=0.0.5,<1",
+    "scipy>=1.10,<2",
+    "tqdm>=4.60,<5",
 ]
 
 [project.optional-dependencies]
